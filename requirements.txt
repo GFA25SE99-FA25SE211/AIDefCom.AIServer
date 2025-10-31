@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+azure-cognitiveservices-speech
+python-dotenv
+python-multipart
+requests
+pyaudio
+torch
+torchaudio
+speechbrain
+soundfile
+huggingface_hub
+numpy
