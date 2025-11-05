@@ -25,6 +25,18 @@ app.add_middleware(
     allow_headers=Config.CORS_ALLOW_HEADERS,
 )
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Preload models and services on startup."""
+    print("🚀 Preloading models and services...")
+    from api.dependencies import get_speech_service, get_voice_service
+    # Force initialize services and load models
+    _ = get_speech_service()
+    _ = get_voice_service()
+    print("✅ Models loaded successfully")
+
+
 # Include routers
 app.include_router(speech_router.router)
 app.include_router(voice_router.router)

@@ -11,3 +11,5 @@ speechbrain
 soundfile
 huggingface_hub
 numpy
+redis[hiredis]>=5.0.0
+xxhash

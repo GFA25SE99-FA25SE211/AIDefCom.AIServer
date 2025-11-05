@@ -15,9 +15,17 @@ class Config:
     # Azure Speech Service
     AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
     AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "")
+
+    # Azure Cache for Redis
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    REDIS_SSL: bool = os.getenv("REDIS_SSL", "false").lower() == "true"
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    REDIS_TTL_SECONDS: int = int(os.getenv("REDIS_TTL_SECONDS", "3600"))  # 1 hour default
     
     # Application
-    APP_TITLE: str = "Speech Services API"
+    APP_TITLE: str = "AIDefCom AI Service"
     APP_DESCRIPTION: str = "Speech-to-Text + Voice Authentication"
     APP_VERSION: str = "3.0.0"
     
