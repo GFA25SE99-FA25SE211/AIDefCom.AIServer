@@ -30,7 +30,7 @@ ANGLE_CAP_DEG = 45.0
 @dataclass
 class QualityThresholds:
     """Audio quality thresholds for enrollment and verification."""
-    min_duration: float = 5.0
+    min_duration: float = 2.0  # Lowered from 5.0 for streaming compatibility
     min_enroll_duration: float = 10.0
     rms_floor_ecapa: float = 0.012
     rms_floor_xvector: float = 0.015

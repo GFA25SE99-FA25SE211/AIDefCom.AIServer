@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from repositories.azure_speech_repository import AzureSpeechRepository
 from services.audio_processing.audio_utils import NoiseFilter, pcm_to_wav
+from services.redis_service import get_redis_service
 
 if TYPE_CHECKING:
     from services.voice_service import VoiceService
@@ -21,10 +22,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Constants
-IDENTIFY_MIN_SECONDS = 1.0  # Đủ nhanh để nhận diện nhưng vẫn đảm bảo chất lượng
-IDENTIFY_WINDOW_SECONDS = 3.0
-HISTORY_SECONDS = 4.0
-IDENTIFY_INTERVAL_SECONDS = 0.45  # Kiểm tra thường xuyên để phát hiện chuyển loa
+IDENTIFY_MIN_SECONDS = 1.2  # Min audio length for identification
+IDENTIFY_WINDOW_SECONDS = 2.5  # Window of audio to analyze
+HISTORY_SECONDS = 4.0  # Keep 4s of audio history
+IDENTIFY_INTERVAL_SECONDS = 0.6  # Check every 0.6s for speaker changes
 
 
 def _normalize_speaker_label(name: str | None) -> str:
@@ -57,8 +58,9 @@ class SpeechService:
         self.voice_service = voice_service
         self.noise_filter = NoiseFilter()
         self.sample_rate = azure_speech_repo.sample_rate
+        self.redis_service = get_redis_service()
         
-        logger.info("Speech Service initialized")
+        logger.info("Speech Service initialized with Redis caching")
     
     def _score_to_confidence(self, score: Optional[float]) -> Optional[str]:
         """Map cosine similarity scores to human-readable confidence levels."""
@@ -70,19 +72,38 @@ class SpeechService:
         if score >= threshold + 0.05:
             return "Medium"
         return "Low"
+    
+    @staticmethod
+    def _colorize(event_type: str, text: str) -> str:
+        """Colorize text based on event type."""
+        color_map = {
+            "partial": "#3498db",
+            "result": "#2ecc71",
+            "nomatch": "#e67e22",
+            "error": "#e74c3c",
+        }
+        color = color_map.get(event_type, "#bdc3c7")
+        return f"<span style=\"color:{color}\">{text}</span>"
+    
+    @staticmethod
+    def _create_tracked_task(background_tasks: set, coro) -> None:
+        """Create background task with automatic cleanup to prevent leak."""
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
-    async def recognize_stream(
+    async def recognize_stream_from_queue(
         self,
-        websocket: WebSocket,
+        audio_queue: asyncio.Queue[bytes | None],
         speaker_label: str = "Đang xác định",
         extra_phrases: Iterable[str] | None = None,
         apply_noise_filter: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Stream speech recognition with speaker identification.
+        Stream speech recognition from audio queue (instead of WebSocket).
         
         Args:
-            websocket: WebSocket connection
+            audio_queue: Queue receiving audio bytes (None signals end)
             speaker_label: Initial speaker label
             extra_phrases: Additional phrase hints
             apply_noise_filter: Whether to apply noise filtering
@@ -90,10 +111,16 @@ class SpeechService:
         Yields:
             Recognition events
         """
+        logger.info(f"🎙️  Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
         loop = asyncio.get_running_loop()
 
         current_speaker = _normalize_speaker_label(speaker_label)
         current_user_id: Optional[str] = None
+        
+        # Generate session ID for caching
+        import hashlib
+        import time
+        session_id = hashlib.md5(f"{time.time()}_{id(audio_queue)}".encode()).hexdigest()[:16]
 
         audio_history = bytearray()
         history_lock = asyncio.Lock()
@@ -113,11 +140,19 @@ class SpeechService:
         pending_user_id: Optional[str] = None
         pending_hits = 0
         pending_top_score = 0.0
+        # Track stability/decay of current speaker lock
+        current_confidence_score: float = 0.0
+        last_reinforce_ts: float = 0.0
+        last_switch_ts: float = 0.0
+        
+        # Track background tasks to prevent memory leak
+        background_tasks: set[asyncio.Task] = set()
 
         async def resolve_speaker_from_history() -> None:
             """Identify speaker using the buffered audio history."""
             nonlocal current_speaker, current_user_id
             nonlocal pending_candidate, pending_user_id, pending_hits, pending_top_score
+            nonlocal current_confidence_score, last_reinforce_ts, last_switch_ts
 
             if self.voice_service is None:
                 return
@@ -134,16 +169,33 @@ class SpeechService:
             if samples.size > window_samples:
                 samples = samples[-window_samples:]
             wav_bytes = pcm_to_wav(samples.tobytes(), sample_rate=self.sample_rate)
-
+            
+            # Check cache first - use xxhash for speed
             try:
-                result = await loop.run_in_executor(
-                    None,
-                    self.voice_service.identify_speaker,
-                    wav_bytes,
-                )
-            except Exception as exc:
-                logger.warning(f"Voice identification failed: {exc}")
-                return
+                import xxhash
+                audio_hash = xxhash.xxh64(wav_bytes[:2000]).hexdigest()[:12]
+            except ImportError:
+                import hashlib
+                audio_hash = hashlib.md5(wav_bytes[:2000]).hexdigest()[:12]
+            
+            cache_key = f"speaker:id:{audio_hash}"
+            
+            cached_result = await self.redis_service.get(cache_key)
+            if cached_result:
+                logger.debug(f"✅ Cache hit: {audio_hash}")
+                result = cached_result
+            else:
+                try:
+                    result = await loop.run_in_executor(
+                        None,
+                        self.voice_service.identify_speaker,
+                        wav_bytes,
+                    )
+                    # Cache 2 min (giảm từ 5 min)
+                    await self.redis_service.set(cache_key, result, ttl=120)
+                except Exception as exc:
+                    logger.warning(f"Voice identification failed: {exc}")
+                    return
 
             forced = False
             confidence_score: Optional[float] = None
@@ -153,6 +205,12 @@ class SpeechService:
             margin: Optional[float] = None
 
             candidates = result.get("candidates") or []
+            
+            # Debug logging for identification
+            logger.info(f"🔍 Identify result: identified={result.get('identified')} | candidates={len(candidates)}")
+            if candidates:
+                top = candidates[0]
+                logger.info(f"   Top: {top.get('name')} | cosine={top.get('cosine'):.3f}")
 
             if result.get("identified"):
                 new_name = _normalize_speaker_label(result.get("speaker")) or current_speaker
@@ -179,9 +237,11 @@ class SpeechService:
                         if isinstance(second_score_raw, (int, float)):
                             margin = (confidence_score or 0.0) - float(second_score_raw)
                     forced = True
+                    logger.info(f"   ⚠️  Using top candidate (forced): {new_name} | score={confidence_score:.3f}")
                 else:
                     new_name = "Khách"
                     new_user = None
+                    logger.info(f"   ❌ No candidates, defaulting to Khách")
 
             if not new_name:
                 new_name = "Khách"
@@ -189,33 +249,80 @@ class SpeechService:
             if new_name == "Khách":
                 new_user = None
 
-            if new_name == current_speaker and (new_user or None) == current_user_id:
+            score_for_decision = confidence_score or 0.0
+            cosine_threshold = getattr(self.voice_service, "cosine_threshold", 0.75)
+
+            # Speaker lock decay to avoid sticking forever
+            now_ts = loop.time()
+            DECAY_SECONDS = 2.8
+            if last_reinforce_ts and (now_ts - last_reinforce_ts) > DECAY_SECONDS:
+                if current_speaker != "Khách":
+                    logger.info(f"⌛ Speaker lock decayed after {now_ts - last_reinforce_ts:.2f}s; relaxing to Đang xác định")
+                current_speaker = "Khách"
+                current_user_id = None
+                current_confidence_score = 0.0
                 pending_candidate = None
                 pending_user_id = None
                 pending_hits = 0
                 pending_top_score = 0.0
-                return
 
-            score_for_decision = confidence_score or 0.0
-            cosine_threshold = getattr(self.voice_service, "cosine_threshold", 0.75)
+            # If same speaker, only short-circuit when confidence is strong
+            if new_name == current_speaker and (new_user or None) == current_user_id:
+                if (margin is not None and margin >= 0.03) or (score_for_decision >= cosine_threshold + 0.02):
+                    # Reinforce current speaker
+                    last_reinforce_ts = now_ts
+                    current_confidence_score = score_for_decision
+                    pending_candidate = None
+                    pending_user_id = None
+                    pending_hits = 0
+                    pending_top_score = 0.0
+                    return
+                # Otherwise fall through to allow potential switch if evidence builds
+
+            explicit_identified = bool(result.get("identified"))
+            
+            margin_str = f"{margin:.3f}" if margin is not None else "N/A"
+            logger.info(f"🎯 Decision params: name={new_name} | score={score_for_decision:.3f} | threshold={cosine_threshold:.3f} | identified={explicit_identified} | forced={forced} | margin={margin_str}")
             high_score_required = cosine_threshold + 0.06
             medium_score_required = cosine_threshold + 0.02
-            baseline_required = cosine_threshold + 0.015
-            margin_strong = margin is not None and margin >= 0.04
-            margin_ok = margin is not None and margin >= 0.025
-            explicit_identified = bool(result.get("identified"))
+            baseline_required = cosine_threshold - 0.02  # Balanced for accuracy
+            margin_strong = margin is not None and margin >= 0.05
+            margin_ok = margin is not None and margin >= 0.03
+            margin_weak = margin is not None and margin >= 0.015  # Lowered from 0.025
             high_score = score_for_decision >= high_score_required
             medium_score = score_for_decision >= medium_score_required
             baseline_score = score_for_decision >= baseline_required
 
             should_switch = False
+            switch_reason = ""
 
-            if forced and (score_for_decision >= cosine_threshold or margin is not None and margin > 0.0):
+            # Immediate switch rule for strong evidence of a different speaker
+            if new_name != current_speaker:
+                if score_for_decision >= (cosine_threshold + 0.03) and (margin is not None and margin >= 0.04):
+                    should_switch = True
+                    switch_reason = "immediate_strong_evidence"
+                elif pending_candidate == new_name:
+                    # Evidence-based switching after repeated hits
+                    if pending_hits + 1 >= 2 and (baseline_score and (margin is None or margin >= 0.02)):
+                        should_switch = True
+                        switch_reason = "two_hits_with_baseline"
+            
+            # Improved logic: balance accuracy and recognition rate
+            if explicit_identified and high_score:
                 should_switch = True
-            elif explicit_identified and (high_score or (medium_score and (margin_strong or forced)) or (baseline_score and margin_ok)):
+                switch_reason = switch_reason or "explicit_high"
+            elif explicit_identified and medium_score and margin_strong:
                 should_switch = True
-            elif high_score and (margin_strong or forced):
+                switch_reason = switch_reason or "explicit_medium_strong_margin"
+            elif explicit_identified and baseline_score and margin_strong:
                 should_switch = True
+                switch_reason = switch_reason or "explicit_baseline_strong_margin"
+            elif score_for_decision >= cosine_threshold and margin_ok:
+                should_switch = True
+                switch_reason = switch_reason or "threshold_margin"
+            elif forced and score_for_decision >= baseline_required and margin_strong:
+                should_switch = True
+                switch_reason = switch_reason or "forced_baseline_strong_margin"
             else:
                 if pending_candidate == new_name and pending_user_id == new_user:
                     pending_hits += 1
@@ -226,11 +333,17 @@ class SpeechService:
                     pending_hits = 1
                     pending_top_score = score_for_decision
 
-                if pending_hits >= 2 and (medium_score or margin_ok):
+                # margin_str = f"{margin:.3f}" if margin is not None else "N/A"
+                # logger.debug(f"📊 Pending: {new_name} hits={pending_hits} score={pending_top_score:.3f} margin={margin_str}")
+
+                if pending_hits >= 2 and baseline_score and margin_weak:
                     should_switch = True
+                    switch_reason = switch_reason or "two_hits_baseline_margin"
                 elif pending_hits >= 3 and baseline_score:
                     should_switch = True
+                    switch_reason = switch_reason or "three_hits_baseline"
                 else:
+                    logger.debug(f"⏳ Waiting for more evidence: {new_name} (need {3-pending_hits} more hits or better score/margin)")
                     return
 
             current_speaker = new_name
@@ -239,6 +352,11 @@ class SpeechService:
             pending_user_id = None
             pending_hits = 0
             pending_top_score = 0.0
+            # Update reinforcement timers
+            last_reinforce_ts = now_ts
+            last_switch_ts = now_ts
+            current_confidence_score = score_for_decision
+            logger.info(f"✅ Switch speaker → {current_speaker} (reason={switch_reason}, score={score_for_decision:.3f}{', margin='+format(margin, '.3f') if margin is not None else ''})")
 
             async with history_lock:
                 if len(audio_history) > history_limit_bytes * 1.5:
@@ -305,16 +423,20 @@ class SpeechService:
             if blocking:
                 with contextlib.suppress(Exception):
                     await identify_task
+        
+        # Use class-level tracked task helper to avoid duplicating logic
+        # background_tasks is captured from outer scope
 
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
-            """Read audio from websocket, buffer for identification, and yield for Azure."""
+            """Read audio from queue, buffer for identification, and yield for Azure."""
             nonlocal frame_buffer
 
             try:
                 while True:
-                    try:
-                        audio_data = await websocket.receive_bytes()
-                    except WebSocketDisconnect:
+                    audio_data = await audio_queue.get()
+                    
+                    # None signals end of stream
+                    if audio_data is None:
                         break
 
                     if not audio_data:
@@ -338,20 +460,17 @@ class SpeechService:
                                 del audio_history[:overflow]
                             history_len = len(audio_history)
 
-                        needs_force = (
-                            history_len >= min_identify_bytes
-                            and (current_user_id is None or current_speaker == "Khách")
-                        )
-
-                        if needs_force:
-                            blocking_now = current_user_id is None
-                            asyncio.create_task(
-                                schedule_identification(force=True, blocking=blocking_now)
-                            )
-                        else:
-                            asyncio.create_task(
-                                schedule_identification(force=False, blocking=False)
-                            )
+                            # Always schedule identification if we have enough audio
+                            # This ensures we detect speaker changes quickly
+                            if history_len >= min_identify_bytes:
+                                # Force more often if:
+                                # 1. No speaker identified yet
+                                # 2. Current speaker is "Khách" (uncertain)
+                                force_identify = (current_user_id is None or current_speaker == "Khách")
+                                self._create_tracked_task(background_tasks, schedule_identification(force=force_identify, blocking=False))
+                            else:
+                                # Not enough audio yet, just schedule with throttle
+                                self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
 
                         yield chunk
 
@@ -365,9 +484,8 @@ class SpeechService:
                             if len(audio_history) > history_limit_bytes:
                                 overflow = len(audio_history) - history_limit_bytes
                                 del audio_history[:overflow]
-                        asyncio.create_task(
-                            schedule_identification(force=True, blocking=current_user_id is None)
-                        )
+                        # Don't block - run in background
+                        self._create_tracked_task(background_tasks, schedule_identification(force=True, blocking=False))
                         yield chunk
 
             except asyncio.CancelledError:
@@ -375,32 +493,25 @@ class SpeechService:
             except Exception as exc:
                 logger.warning(f"Audio stream interrupted: {exc}")
 
-        def _colorize(event_type: str, text: str) -> str:
-            color_map = {
-                "partial": "#3498db",
-                "result": "#2ecc71",
-                "nomatch": "#e67e22",
-                "error": "#e74c3c",
-            }
-            color = color_map.get(event_type, "#bdc3c7")
-            return f"<span style=\"color:{color}\">{text}</span>"
+        # Use class-level _colorize helper
 
         async def process_azure_events(azure_events: AsyncGenerator) -> None:
             """Merge Azure results with speaker information and queue them for clients."""
+            result_count = 0
             try:
                 async for event in azure_events:
                     event_type = event.get("type")
 
                     if event_type == "result":
                         await schedule_identification(force=True, blocking=True)
+                        result_count += 1
+                        # Log background tasks every 10 results
+                        if result_count % 10 == 0:
+                            logger.info(f"[Performance] Active tasks: {len(background_tasks)}, Results: {result_count}")
                     elif event_type == "partial":
-                        asyncio.create_task(
-                            schedule_identification(force=False, blocking=False)
-                        )
+                        self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
                     else:
-                        asyncio.create_task(
-                            schedule_identification(force=False, blocking=False)
-                        )
+                        self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
 
                     event["speaker"] = current_speaker
                     if current_user_id:
@@ -409,7 +520,17 @@ class SpeechService:
                     if event.get("text"):
                         display_plain = f"{current_speaker}: {event['text']}"
                         event["display"] = display_plain
-                        event["display_colored"] = _colorize(event_type or "", display_plain)
+                        event["display_colored"] = self._colorize(event_type or "", display_plain)
+                        
+                        # Cache recognition results in Redis
+                        if event_type == "result":
+                            cache_key = f"recognition:session:{session_id}:result:{result_count}"
+                            self._create_tracked_task(background_tasks, self.redis_service.set(cache_key, {
+                                "text": event.get("text"),
+                                "speaker": current_speaker,
+                                "user_id": current_user_id,
+                                "timestamp": loop.time(),
+                            }, ttl=3600))  # Cache for 1 hour
 
                     try:
                         result_queue.put_nowait(event)
@@ -455,5 +576,66 @@ class SpeechService:
                 identify_task.cancel()
                 with contextlib.suppress(Exception):
                     await identify_task
+            
+            # Cancel all background tasks
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+                background_tasks.clear()
 
             logger.info("Recognition stream ended")
+
+    async def recognize_stream(
+        self,
+        websocket: WebSocket,
+        speaker_label: str = "Đang xác định",
+        extra_phrases: Iterable[str] | None = None,
+        apply_noise_filter: bool = True,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream speech recognition with speaker identification.
+        
+        Args:
+            websocket: WebSocket connection
+            speaker_label: Initial speaker label
+            extra_phrases: Additional phrase hints
+            apply_noise_filter: Whether to apply noise filtering
+        
+        Yields:
+            Recognition events
+        """
+        # Wrapper implementation: translate websocket bytes into a queue and
+        # delegate the real work to `recognize_stream_from_queue` to avoid
+        # duplicating the whole recognition pipeline.
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def _reader() -> None:
+            try:
+                while True:
+                    try:
+                        chunk = await websocket.receive_bytes()
+                    except WebSocketDisconnect:
+                        break
+                    # None or empty? keep consistent with queue API
+                    await audio_queue.put(chunk if chunk else b"")
+            finally:
+                # Signal end of stream
+                await audio_queue.put(None)
+
+        reader_task = asyncio.create_task(_reader())
+
+        try:
+            async for event in self.recognize_stream_from_queue(
+                audio_queue,
+                speaker_label=speaker_label,
+                extra_phrases=extra_phrases,
+                apply_noise_filter=apply_noise_filter,
+            ):
+                yield event
+        finally:
+            if reader_task and not reader_task.done():
+                reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader_task
