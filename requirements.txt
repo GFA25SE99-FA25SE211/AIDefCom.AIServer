@@ -13,3 +13,4 @@ huggingface_hub
 numpy
 redis[hiredis]>=5.0.0
 xxhash
+rapidfuzz>=3.0.0
