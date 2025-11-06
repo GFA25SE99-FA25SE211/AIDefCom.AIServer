@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Config
-from api.routers import speech_router, voice_router
+from api.routers import speech_router, voice_router, question_router
 
 
 # Create FastAPI app
@@ -40,6 +40,7 @@ async def startup_event():
 # Include routers
 app.include_router(speech_router.router)
 app.include_router(voice_router.router)
+app.include_router(question_router.router)
 
 
 @app.get("/")

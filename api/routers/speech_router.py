@@ -178,7 +178,7 @@ async def websocket_stt(
                     # Cache the partial transcript in Redis
                     try:
                         cache_key = f"transcript:session:{session_id}"
-                        redis_service.set(cache_key, {
+                        await redis_service.set(cache_key, {
                             "session_id": session_id,
                             "start_time": session_start.isoformat(),
                             "lines": transcript_lines,
@@ -257,7 +257,7 @@ async def websocket_stt(
             # Cache the final transcript in Redis
             try:
                 cache_key = f"transcript:session:{session_id}:final"
-                redis_service.set(cache_key, transcript_data, ttl=86400)  # Keep for 24 hours
+                await redis_service.set(cache_key, transcript_data, ttl=86400)  # Keep for 24 hours
             except Exception as cache_error:
                 print(f"⚠️ Failed to cache final transcript: {cache_error}")
             
@@ -272,6 +272,16 @@ async def websocket_stt(
                     })
             except Exception as send_error:
                 print(f"⚠️ Failed to send session_saved: {send_error}")
+        
+        # Clear question cache for this session
+        try:
+            from services.question_service import QuestionService
+            question_service = QuestionService()
+            deleted_count = await question_service.clear_questions(session_id)
+            if deleted_count > 0:
+                print(f"🗑️  Cleared {deleted_count} questions from cache (session: {session_id})")
+        except Exception as clear_error:
+            print(f"⚠️ Failed to clear question cache: {clear_error}")
         
         print("🔚 STT WebSocket closed")
 
