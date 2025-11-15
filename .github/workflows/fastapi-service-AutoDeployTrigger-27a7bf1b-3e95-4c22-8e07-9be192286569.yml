@@ -42,8 +42,9 @@ jobs:
           registryPassword: ${{ secrets.FASTAPISERVICE_REGISTRY_PASSWORD }}
           containerAppName: fastapi-service
           resourceGroup: AIDefCom
-          imageToBuild: minhtqse184278@fpt.edu.vn/fastapi-service:${{ github.sha }}
+          imageToBuild: hitech2605/fastapi-service:${{ github.sha }}
           _buildArgumentsKey_: |
             _buildArgumentsValues_
+
 
 
