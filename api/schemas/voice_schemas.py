@@ -1,4 +1,4 @@
-"""Voice API schemas - Request/Response DTOs."""
+"""Voice API schemas - Request/Response DTOs for Swagger documentation."""
 
 from __future__ import annotations
 
@@ -6,44 +6,111 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-class ProfileCreateRequest(BaseModel):
-    """Request to create voice profile."""
-    user_id: str = Field(..., description="Unique user identifier")
-    name: Optional[str] = Field(None, description="User's display name")
+# ============================================================================
+# Request Models
+# ============================================================================
+
+class AudioFileUpload(BaseModel):
+    """Audio file upload documentation (not used in FastAPI, just for Swagger)."""
+    audio_file: bytes = Field(..., description="Audio file (WAV/MP3/FLAC, max 10MB)")
 
 
-class ProfileResponse(BaseModel):
-    """Voice profile response."""
-    user_id: str
-    name: str
-    enrollment_status: str
-    enrollment_count: int
-
+# ============================================================================
+# Response Models - Enrollment
+# ============================================================================
 
 class EnrollmentResponse(BaseModel):
-    """Enrollment response."""
-    user_id: str
-    name: str
-    enrollment_status: str
-    enrollment_count: int
-    remaining_samples: int
-    quality: dict
+    """Response from voice enrollment endpoint."""
+    success: bool = Field(..., description="Whether enrollment was successful")
+    message: str = Field(..., description="Human-readable result message")
+    enrollment_count: int = Field(..., description="Total enrollment samples for this user")
+    user_id: str = Field(..., alias="id", description="User identifier")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "message": "Enrollment successful",
+                "enrollment_count": 3,
+                "id": "usr001"
+            }
+        }
 
+
+# ============================================================================
+# Response Models - Identification
+# ============================================================================
 
 class IdentificationResponse(BaseModel):
-    """Speaker identification response."""
-    identified: bool
-    speaker: str
-    score: float
-    user_id: Optional[str] = None
-    confidence: Optional[str] = None
-    quality: dict
+    """Response from speaker identification endpoint."""
+    type: str = Field(default="identify", description="Response type")
+    success: bool = Field(..., description="Whether identification was successful")
+    identified: bool = Field(..., description="Whether a speaker was identified")
+    speaker_id: Optional[str] = Field(None, description="Identified speaker's user ID")
+    speaker_name: Optional[str] = Field(None, description="Identified speaker's display name")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score (0-1)")
+    score: float = Field(..., ge=0.0, le=1.0, description="Similarity score (0-1)")
+    message: str = Field(..., description="Human-readable result message")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "type": "identify",
+                "success": True,
+                "identified": True,
+                "speaker_id": "usr001",
+                "speaker_name": "Nguyễn Văn A",
+                "confidence": 0.92,
+                "score": 0.89,
+                "message": "Speaker identified successfully"
+            }
+        }
 
+
+# ============================================================================
+# Response Models - Verification
+# ============================================================================
 
 class VerificationResponse(BaseModel):
-    """Voice verification response."""
-    user_id: str
-    verified: bool
-    score: float
-    confidence: Optional[str] = None
-    quality: dict
+    """Response from voice verification endpoint."""
+    type: str = Field(default="verify", description="Response type")
+    success: bool = Field(..., description="Whether verification was successful")
+    verified: bool = Field(..., description="Whether voice was verified")
+    claimed_id: str = Field(..., description="User ID claimed for verification")
+    speaker_id: Optional[str] = Field(None, description="Actual identified speaker ID (if match)")
+    match: bool = Field(..., description="Whether claimed_id matches speaker_id")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score (0-1)")
+    score: float = Field(..., ge=0.0, le=1.0, description="Similarity score (0-1)")
+    message: str = Field(..., description="Human-readable result message")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "type": "verify",
+                "success": True,
+                "verified": True,
+                "claimed_id": "usr001",
+                "speaker_id": "usr001",
+                "match": True,
+                "confidence": 0.94,
+                "score": 0.91,
+                "message": "Voice verified successfully"
+            }
+        }
+
+
+# ============================================================================
+# Error Response Model
+# ============================================================================
+
+class ErrorResponse(BaseModel):
+    """Error response from any endpoint."""
+    error: str = Field(..., description="Error message describing what went wrong")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Empty audio data"
+            }
+        }
+

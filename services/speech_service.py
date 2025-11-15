@@ -639,3 +639,285 @@ class SpeechService:
                 reader_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader_task
+
+    async def handle_stt_session(self, ws: WebSocket) -> None:
+        """Handle complete STT WebSocket session with transcript persistence.
+        
+        This method encapsulates all business logic for an STT session:
+        - Parse query parameters
+        - Manage WebSocket connection (ping, reader)
+        - Stream recognition events
+        - Collect and cache transcript
+        - Save to database on completion
+        - Clear question cache
+        
+        Args:
+            ws: WebSocket connection (already accepted)
+        """
+        import re
+        import json
+        from datetime import datetime
+        from starlette.websockets import WebSocketState
+        
+        # Parse query parameters
+        speaker_label = ws.query_params.get("speaker") or "Đang xác định"
+        phrase_param = ws.query_params.get("phrases")
+        user_id = ws.query_params.get("user_id")  # Optional user association
+        
+        extra_phrases = []
+        if phrase_param:
+            extra_phrases = [
+                token.strip()
+                for token in re.split(r"[|,]", phrase_param)
+                if token.strip()
+            ]
+        
+        # Session metadata
+        session_id = ws.headers.get("sec-websocket-key", f"session_{id(ws)}")
+        session_start = datetime.utcnow()
+        transcript_lines = []
+        
+        # Audio queue and control
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=50)
+        stop_event = asyncio.Event()
+        
+        # Ping task to keep connection alive
+        async def ping_task() -> None:
+            try:
+                while not stop_event.is_set():
+                    if ws.application_state != WebSocketState.CONNECTED:
+                        break
+                    try:
+                        await ws.send_json({"type": "ping"})
+                    except Exception:
+                        break
+                    await asyncio.sleep(25)
+            except Exception:
+                pass
+        
+        pinger = asyncio.create_task(ping_task())
+        
+        # WebSocket reader task
+        async def websocket_reader() -> None:
+            """Read audio chunks and commands from WebSocket."""
+            try:
+                while not stop_event.is_set():
+                    try:
+                        if ws.application_state != WebSocketState.CONNECTED:
+                            logger.debug("WebSocket disconnected in reader")
+                            break
+                        
+                        data = await ws.receive()
+                        
+                        if "bytes" in data:
+                            # Audio data -> push to queue
+                            try:
+                                audio_queue.put_nowait(data["bytes"])
+                            except asyncio.QueueFull:
+                                # Drop oldest frame
+                                try:
+                                    _ = audio_queue.get_nowait()
+                                    audio_queue.put_nowait(data["bytes"])
+                                except asyncio.QueueEmpty:
+                                    try:
+                                        audio_queue.put_nowait(data["bytes"])
+                                    except asyncio.QueueFull:
+                                        logger.warning("Audio queue full, dropping frame")
+                        
+                        elif "text" in data:
+                            # Text command (e.g., "stop")
+                            message = data["text"].strip().lower()
+                            if message == "stop":
+                                logger.info("Received 'stop' command from client")
+                                stop_event.set()
+                                break
+                        
+                        else:
+                            # Disconnect event
+                            logger.debug("Received disconnect event")
+                            break
+                    
+                    except WebSocketDisconnect:
+                        logger.info("WebSocket disconnected")
+                        break
+                    except Exception as e:
+                        logger.exception(f"WebSocket read error: {e}")
+                        break
+            finally:
+                # Signal end of stream
+                try:
+                    await audio_queue.put(None)
+                except Exception:
+                    pass
+        
+        reader_task = asyncio.create_task(websocket_reader())
+        
+        try:
+            logger.info(f"Starting STT session | session_id={session_id} | speaker={speaker_label}")
+            
+            # Stream recognition results
+            async for event in self.recognize_stream_from_queue(
+                audio_queue,
+                speaker_label=speaker_label,
+                extra_phrases=extra_phrases,
+            ):
+                # Check stop condition
+                if stop_event.is_set():
+                    logger.debug("Stop event set, breaking recognition loop")
+                    break
+                
+                # Check WebSocket state
+                if ws.application_state != WebSocketState.CONNECTED:
+                    logger.debug("WebSocket not connected, stopping recognition")
+                    break
+                
+                try:
+                    await ws.send_json(event)
+                    
+                    # Collect final transcripts
+                    if event.get("type") == "result" and event.get("text"):
+                        speaker = event.get("speaker", "Unknown")
+                        text = event.get("text", "")
+                        timestamp = datetime.utcnow().isoformat()
+                        
+                        transcript_lines.append({
+                            "timestamp": timestamp,
+                            "speaker": speaker,
+                            "text": text,
+                            "user_id": event.get("user_id"),
+                        })
+                        
+                        # Cache partial transcript in Redis
+                        try:
+                            cache_key = f"transcript:session:{session_id}"
+                            await self.redis_service.set(
+                                cache_key,
+                                {
+                                    "session_id": session_id,
+                                    "start_time": session_start.isoformat(),
+                                    "lines": transcript_lines,
+                                },
+                                ttl=3600,
+                            )
+                        except Exception as cache_error:
+                            logger.warning(f"Failed to cache transcript: {cache_error}")
+                
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected during send")
+                    break
+                except Exception as send_error:
+                    logger.warning(f"Failed to send event: {send_error}")
+                    break
+        
+        except WebSocketDisconnect:
+            logger.info("Client disconnected")
+        except Exception as e:
+            logger.exception(f"Error in STT session: {e}")
+        finally:
+            # Cleanup
+            stop_event.set()
+            
+            logger.debug("Cleaning up tasks...")
+            
+            # Cancel ping task
+            if not pinger.done():
+                pinger.cancel()
+            try:
+                await asyncio.wait_for(pinger, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            
+            # Cancel reader task
+            if not reader_task.done():
+                reader_task.cancel()
+            try:
+                await asyncio.wait_for(reader_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            
+            # Save transcript if there are any lines
+            if transcript_lines:
+                session_end = datetime.utcnow()
+                duration_seconds = (session_end - session_start).total_seconds()
+                
+                # Concatenate all transcript lines into full text
+                full_text = " ".join(line.get("text", "") for line in transcript_lines)
+                
+                transcript_data = {
+                    "session_id": session_id,
+                    "start_time": session_start.isoformat(),
+                    "end_time": session_end.isoformat(),
+                    "duration_seconds": duration_seconds,
+                    "initial_speaker": speaker_label,
+                    "lines": transcript_lines,
+                    "total_lines": len(transcript_lines),
+                }
+                
+                logger.info(
+                    f"Transcript collected | session_id={session_id} | "
+                    f"lines={len(transcript_lines)} | duration={duration_seconds:.1f}s"
+                )
+                
+                # Save to external API endpoint: POST /api/transcripts
+                try:
+                    from app.config import Config
+                    import httpx
+                    
+                    api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
+                    payload = {
+                        "sessionId": session_id,
+                        "transcriptText": full_text,
+                        "isApproved": True,  # Auto-approve STT transcripts
+                    }
+                    
+                    async with httpx.AsyncClient(
+                        verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                        timeout=Config.AUTH_SERVICE_TIMEOUT,
+                    ) as client:
+                        response = await client.post(api_url, json=payload)
+                        
+                        if response.status_code in (200, 201):
+                            logger.info(
+                                f"✅ Transcript saved to external API | "
+                                f"session_id={session_id} | status={response.status_code}"
+                            )
+                        else:
+                            logger.warning(
+                                f"❌ Failed to save transcript to API | "
+                                f"session_id={session_id} | status={response.status_code} | "
+                                f"response={response.text}"
+                            )
+                
+                except Exception as api_error:
+                    logger.exception(f"Error calling external API to save transcript: {api_error}")
+                
+                # Cache final transcript in Redis (24h TTL)
+                try:
+                    cache_key = f"transcript:session:{session_id}:final"
+                    await self.redis_service.set(cache_key, transcript_data, ttl=86400)
+                except Exception as cache_error:
+                    logger.warning(f"Failed to cache final transcript: {cache_error}")
+                
+                # Send confirmation to client if still connected
+                try:
+                    if ws.application_state == WebSocketState.CONNECTED:
+                        await ws.send_json({
+                            "type": "session_saved",
+                            "session_id": session_id,
+                            "lines_saved": len(transcript_lines),
+                            "duration": duration_seconds,
+                        })
+                except Exception as send_error:
+                    logger.debug(f"Could not send session_saved confirmation: {send_error}")
+            
+            # Clear question cache for this session
+            try:
+                from services.question_service import QuestionService
+                question_service = QuestionService()
+                deleted_count = await question_service.clear_questions(session_id)
+                if deleted_count > 0:
+                    logger.info(f"Cleared {deleted_count} questions from cache | session_id={session_id}")
+            except Exception as clear_error:
+                logger.warning(f"Failed to clear question cache: {clear_error}")
+            
+            logger.info(f"STT session closed | session_id={session_id}")

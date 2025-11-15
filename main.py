@@ -18,7 +18,6 @@ async def root():
                 "enroll": "POST /voice/enroll",
                 "identify": "POST /voice/identify",
                 "verify": "POST /voice/verify",
-                "profile_info": "GET /voice/profile/{user_id}",
                 "delete_profile": "DELETE /voice/profile/{user_id}",
                 "list_profiles": "GET /voice/profiles",
             },

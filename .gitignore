@@ -179,4 +179,8 @@ voice_profiles/
 .models/
 
 tests/
+
+test-webapp/
+
+.github/
 # End of https://www.toptal.com/developers/gitignore/api/python

@@ -10,49 +10,69 @@ import numpy as np
 
 
 class NoiseFilter:
-    """Simple RMS-based noise gate with soft threshold."""
-    
+    """Simple RMS-based noise gate with soft threshold and gentle gain."""
+
     def __init__(self, sample_rate: int = 16000, voice_threshold: float = 0.002):
         """
         Initialize noise filter.
-        
+
         Args:
             sample_rate: Audio sample rate in Hz
-            voice_threshold: RMS threshold for voice detection
+            voice_threshold: RMS threshold for voice detection (used as a floor)
         """
         self.sample_rate = sample_rate
         self.voice_threshold = voice_threshold
-    
+
     def reduce_noise(self, audio_data: bytes) -> bytes:
         """
-        Apply noise reduction to audio data.
-        
+        Apply noise reduction with a soft gate and percentile-based gain normalization.
+
         Args:
             audio_data: Raw PCM audio bytes (int16)
-        
+
         Returns:
             Filtered audio bytes (int16)
         """
-        # Convert to float32 samples
+        # Convert to float32 samples in int16 scale
         samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
         if samples.size == 0:
             return audio_data
-        
-        # Remove DC offset
-        samples -= np.mean(samples)
-        samples /= 32768.0  # Normalize to [-1, 1]
-        
-        # Calculate RMS
-        rms = float(np.sqrt(np.mean(samples * samples)) + 1e-8)
-        
-        # Soft gate: attenuate if below threshold
-        gate_threshold = max(self.voice_threshold, 0.002)
-        if rms < gate_threshold:
-            samples *= 0.65  # Attenuate instead of muting
-        
-        # Clip and convert back to int16
-        samples = np.clip(samples, -1.0, 1.0)
-        return (samples * 32768.0).astype(np.int16).tobytes()
+
+        # === NOISE GATE (SOFT) ===
+        # 20ms frames, hop = frame_size (non-overlap) for simplicity
+        frame_size = max(1, int(0.02 * self.sample_rate))
+        # Compute per-frame RMS to estimate baseline
+        rms_vals = []
+        for start in range(0, samples.size, frame_size):
+            window = samples[start:start + frame_size]
+            if window.size == 0:
+                continue
+            rms_vals.append(float(np.sqrt(np.mean(window * window) + 1e-10)))
+        if len(rms_vals) == 0:
+            return audio_data
+        baseline = float(np.percentile(rms_vals, 20))
+        # Set threshold slightly above baseline, keep a minimal floor
+        threshold = max(100.0, baseline * 1.2)
+        atten = 0.3  # soft attenuation for sub-threshold frames
+
+        # Apply soft gating
+        for start in range(0, samples.size, frame_size):
+            window = samples[start:start + frame_size]
+            if window.size == 0:
+                continue
+            rms = float(np.sqrt(np.mean(window * window) + 1e-10))
+            if rms < max(threshold, self.voice_threshold * 32768.0):
+                samples[start:start + frame_size] = window * atten
+
+        # === GAIN NORMALIZATION ===
+        # Normalize based on 98th percentile peak (ignore outliers)
+        peak = float(np.percentile(np.abs(samples), 98))
+        if peak > 0:
+            target_peak = 30000.0  # Target peak amplitude
+            gain = min(2.5, target_peak / peak)  # allow up to 2.5x gain
+            samples = np.clip(samples * gain, -32768, 32767)
+
+        return samples.astype(np.int16).tobytes()
 
 
 class AudioQualityAnalyzer:
@@ -122,7 +142,8 @@ class AudioQualityAnalyzer:
         snr_db = float(10.0 * np.log10(max(speech_energy, noise_floor) / noise_floor))
         
         # Voiced ratio (frames above energy threshold)
-        energy_threshold = max(noise_floor * 3.0, np.percentile(energy, 60))
+        # Slightly more permissive to avoid false "quiet" flags on real-world mics
+        energy_threshold = max(noise_floor * 2.0, np.percentile(energy, 50))
         voiced_ratio = float(np.mean(energy > energy_threshold)) if count > 0 else 0.0
         
         # Clipping ratio
