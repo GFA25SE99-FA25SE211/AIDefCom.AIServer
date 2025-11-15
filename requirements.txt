@@ -1,9 +1,11 @@
 fastapi
 uvicorn[standard]
+typing_extensions>=4.8.0
 azure-cognitiveservices-speech
 python-dotenv
 python-multipart
 requests
+httpx
 pyaudio
 torch
 torchaudio
@@ -14,3 +16,7 @@ numpy
 redis[hiredis]>=5.0.0
 xxhash
 rapidfuzz>=3.0.0
+azure-storage-blob>=12.19.0
+pymssql>=2.2.0
+pyodbc>=5.0.0
+sentence-transformers
