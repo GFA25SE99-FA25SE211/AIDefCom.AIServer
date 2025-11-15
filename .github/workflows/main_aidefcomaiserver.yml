@@ -1,0 +1,55 @@
+name: Build & Deploy FastAPI to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_NAME: hitech2605/aiserver   # TÊN IMAGE TRÊN DOCKER HUB
+      CONTAINERAPP_NAME: fastapi-service   # TÊN CONTAINER APP TRÊN AZURE
+      RESOURCE_GROUP: AIDefCom
+      AZURE_REGION: southeastasia        # CHỈNH THEO REGION CỦA BẠN
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # --- LOGIN DOCKER HUB ---
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --- BUILD DOCKER IMAGE ---
+      - name: Build Docker image
+        run: |
+          TAG=${{ github.sha }}
+          docker build -t $IMAGE_NAME:$TAG .
+
+      # --- PUSH TO DOCKER HUB ---
+      - name: Push Docker image
+        run: |
+          TAG=${{ github.sha }}
+          docker push $IMAGE_NAME:$TAG
+
+      # --- LOGIN AZURE ---
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # --- UPDATE AZURE CONTAINER APPS ---
+      - name: Deploy to Azure Container Apps
+        run: |
+          TAG=${{ github.sha }}
+          az containerapp update \
+            --name $CONTAINERAPP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --image $IMAGE_NAME:$TAG
