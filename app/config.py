@@ -9,6 +9,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_int_env(name: str, default: int) -> int:
+    """Parse int from env safely, tolerating values like 'NAME=123' or quoted strings.
+    Returns default on any parsing issue.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    # Accept accidental 'KEY=VALUE' format
+    if "=" in raw:
+        raw = raw.split("=", 1)[1]
+    raw = raw.strip().strip("'").strip('"')
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 class Config:
     """Application configuration class."""
     
@@ -31,7 +48,7 @@ class Config:
     # Auth/User (.NET) Service
     AUTH_SERVICE_BASE_URL: str = os.getenv("AUTH_SERVICE_BASE_URL", "")
     AUTH_SERVICE_VERIFY_SSL: bool = os.getenv("AUTH_SERVICE_VERIFY_SSL", "false").lower() == "true"
-    AUTH_SERVICE_TIMEOUT: int = int(os.getenv("AUTH_SERVICE_TIMEOUT", "10"))
+    AUTH_SERVICE_TIMEOUT: int = _parse_int_env("AUTH_SERVICE_TIMEOUT", 10)
     
     # SQL Server Database (supports both connection string and individual parameters)
     # Option 1: Full connection string (will be parsed automatically if provided)

@@ -8,24 +8,26 @@ __all__ = ["app"]
 @app.get("/")
 async def root():
     return {
-        "version": "2.3.2",
+        "version": "2.3.3",
         "service": "Speech Services API",
         "endpoints": {
             "stt": "/ws/stt",
             "voice_auth": {
-                "create_or_get": "POST /voice/profile",
-                "create_profile": "POST /voice/profile/create",
-                "enroll": "POST /voice/enroll",
+                "enroll": "POST /voice/users/{user_id}/enroll",
                 "identify": "POST /voice/identify",
-                "verify": "POST /voice/verify",
-                "delete_profile": "DELETE /voice/profile/{user_id}",
-                "list_profiles": "GET /voice/profiles",
+                "verify": "POST /voice/users/{user_id}/verify",
             },
+            "health": "/health",
+            "docs": "/docs"
         },
         "features": ["streaming", "noise-filtering", "vietnamese-optimized", "voice-authentication"],
     }
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
