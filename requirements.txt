@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-typing_extensions>=4.8.0
+typing_extensions
 azure-cognitiveservices-speech
 python-dotenv
 python-multipart

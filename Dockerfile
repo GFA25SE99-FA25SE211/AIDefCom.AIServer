@@ -16,17 +16,19 @@ WORKDIR /build
 
 # Copy and install Python dependencies
 COPY requirements.txt .
-# Speed-up: install CPU wheels for torch/torchaudio from official index first
-# Then install remaining deps. This avoids compiling from source (hours!).
+
+# Cài torch/torchaudio + các lib khác vào user site-packages
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.4.1+cpu torchaudio==2.4.1+cpu && \
+        --user torch==2.4.1+cpu torchaudio==2.4.1+cpu && \
     PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
         --user -r requirements.txt --prefer-binary
 
 
+# =========================
 # Production stage
+# =========================
 FROM python:3.11-slim
 
 # Install runtime dependencies only
@@ -44,30 +46,31 @@ RUN groupadd -r appgroup && \
 
 WORKDIR /app
 
-# Copy Python packages from builder stage
+# Copy Python packages from builder stage (user site-packages)
 COPY --from=builder --chown=appuser:appgroup /root/.local /home/appuser/.local
 
-# Copy ONLY production application code (exclude tests, test-webapp, docs)
+# Copy ONLY production application code
 COPY --chown=appuser:appgroup app/ ./app/
 COPY --chown=appuser:appgroup api/ ./api/
 COPY --chown=appuser:appgroup services/ ./services/
 COPY --chown=appuser:appgroup repositories/ ./repositories/
 COPY --chown=appuser:appgroup core/ ./core/
 
-# Set environment variables
+# Environment variables
 ENV PATH=/home/appuser/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8000
 
 # Switch to non-root user
 USER appuser
 
-# Expose port (Azure App Service will set PORT env var)
+# Expose port
 EXPOSE 8000
 
-# Health check
+# Health check endpoint (nhớ có route /health trong app)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Start application
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level info --no-access-log
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --log-level info --no-access-log"]
