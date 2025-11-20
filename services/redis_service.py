@@ -251,6 +251,31 @@ class RedisService:
         except Exception as e:
             logger.error(f"Error getting hash '{name}' from Redis: {e}")
             return None
+    
+    async def lpush(self, key: str, *values: Any) -> Optional[int]:
+        """
+        Push values to the head of a list in cache.
+        
+        Args:
+            key: List key
+            values: Values to push (will be JSON-serialized)
+            
+        Returns:
+            Length of list after push, or None if failed
+        """
+        if not self._initialized:
+            await self._ensure_connection()
+        
+        if not self.client:
+            return None
+        
+        try:
+            # Serialize all values
+            serialized_values = [json.dumps(v) for v in values]
+            return await self.client.lpush(key, *serialized_values)
+        except Exception as e:
+            logger.error(f"Error pushing to list '{key}' in Redis: {e}")
+            return None
 
 
 # Global Redis service instance

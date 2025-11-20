@@ -232,3 +232,250 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, sample_width: int = 2) -> b
         wf.setframerate(sample_rate)
         wf.writeframes(pcm)
     return buffer.getvalue()
+
+
+def calculate_rms(audio_bytes: bytes) -> float:
+    """
+    Calculate RMS (Root Mean Square) energy of audio signal.
+    
+    Args:
+        audio_bytes: Raw PCM audio bytes (int16)
+    
+    Returns:
+        RMS value (0.0 to ~32768.0 for 16-bit audio)
+    
+    Examples:
+        >>> silence = b'\\x00' * 1000
+        >>> calculate_rms(silence)
+        0.0
+        
+        >>> loud = np.full(500, 10000, dtype=np.int16).tobytes()
+        >>> calculate_rms(loud)
+        10000.0
+    """
+    if not audio_bytes or len(audio_bytes) < 2:
+        return 0.0
+    
+    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+    if samples.size == 0:
+        return 0.0
+    
+    rms = float(np.sqrt(np.mean(samples * samples) + 1e-10))
+    return rms
+
+
+def detect_energy_spike(
+    current_audio: bytes,
+    previous_audio: bytes,
+    spike_threshold: float = 1.5
+) -> bool:
+    """
+    Detect sudden energy spike (possible speaker interruption).
+    
+    Args:
+        current_audio: Current audio chunk (PCM int16)
+        previous_audio: Previous audio chunk (PCM int16)
+        spike_threshold: RMS ratio threshold (default 1.5 = 50% increase)
+    
+    Returns:
+        True if energy spike detected, False otherwise
+    
+    Examples:
+        >>> quiet = np.full(500, 1000, dtype=np.int16).tobytes()
+        >>> loud = np.full(500, 15000, dtype=np.int16).tobytes()
+        >>> detect_energy_spike(loud, quiet, spike_threshold=1.5)
+        True
+    """
+    if not current_audio or not previous_audio:
+        return False
+    
+    current_rms = calculate_rms(current_audio)
+    previous_rms = calculate_rms(previous_audio)
+    
+    # Avoid division by zero
+    if previous_rms < 100.0:  # Very quiet baseline
+        return current_rms > 1000.0  # Absolute threshold
+    
+    ratio = current_rms / previous_rms
+    return ratio >= spike_threshold
+
+
+def calculate_zero_crossing_rate(audio_bytes: bytes) -> float:
+    """
+    Calculate Zero Crossing Rate (ZCR) for acoustic change detection.
+    
+    Higher ZCR indicates different speaker or acoustic properties.
+    
+    Args:
+        audio_bytes: Raw PCM audio bytes (int16)
+    
+    Returns:
+        ZCR value (0.0 to 1.0)
+    
+    Examples:
+        >>> # Pure tone has low ZCR
+        >>> tone = (np.sin(2 * np.pi * 100 * np.arange(1000) / 16000) * 10000).astype(np.int16).tobytes()
+        >>> zcr = calculate_zero_crossing_rate(tone)
+        >>> 0.0 < zcr < 0.2
+        True
+    """
+    if not audio_bytes or len(audio_bytes) < 4:
+        return 0.0
+    
+    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+    if samples.size < 2:
+        return 0.0
+    
+    # Count sign changes
+    signs = np.sign(samples)
+    sign_changes = np.diff(signs) != 0
+    zcr = float(np.sum(sign_changes)) / max(1, len(samples) - 1)
+    
+    return zcr
+
+
+def detect_acoustic_change(
+    current_audio: bytes,
+    previous_audio: bytes,
+    zcr_threshold: float = 0.15
+) -> bool:
+    """
+    Detect acoustic change between audio segments (pitch/timbre shift).
+    
+    Args:
+        current_audio: Current audio chunk (PCM int16)
+        previous_audio: Previous audio chunk (PCM int16)
+        zcr_threshold: ZCR difference threshold
+    
+    Returns:
+        True if significant acoustic change detected
+    """
+    if not current_audio or not previous_audio:
+        return False
+    
+    current_zcr = calculate_zero_crossing_rate(current_audio)
+    previous_zcr = calculate_zero_crossing_rate(previous_audio)
+    
+    zcr_diff = abs(current_zcr - previous_zcr)
+    return zcr_diff >= zcr_threshold
+
+
+
+def detect_energy_spike(
+    current_audio: bytes,
+    previous_audio: bytes,
+    spike_threshold: float = 1.5,
+    sample_rate: int = 16000,
+) -> bool:
+    """
+    Detect energy spike that may indicate speaker interruption.
+    
+    Args:
+        current_audio: Current audio frame (PCM bytes)
+        previous_audio: Previous audio frame (PCM bytes)
+        spike_threshold: RMS ratio threshold (default 1.5 = 50% increase)
+        sample_rate: Audio sample rate
+    
+    Returns:
+        True if energy spike detected
+    
+    Example:
+        >>> # Person A speaking quietly, Person B interrupts loudly
+        >>> is_interruption = detect_energy_spike(loud_audio, quiet_audio, 1.5)
+        >>> # True if current RMS > previous RMS * 1.5
+    """
+    if not current_audio or not previous_audio:
+        return False
+    
+    # Convert to numpy arrays
+    current = np.frombuffer(current_audio, dtype=np.int16).astype(np.float32)
+    previous = np.frombuffer(previous_audio, dtype=np.int16).astype(np.float32)
+    
+    if current.size == 0 or previous.size == 0:
+        return False
+    
+    # Calculate RMS for both
+    current_rms = float(np.sqrt(np.mean(current * current) + 1e-10))
+    previous_rms = float(np.sqrt(np.mean(previous * previous) + 1e-10))
+    
+    # Avoid division by zero
+    if previous_rms < 1.0:
+        previous_rms = 1.0
+    
+    # Check ratio
+    ratio = current_rms / previous_rms
+    
+    # Also require absolute threshold (avoid false positives on silence)
+    min_abs_rms = 500.0  # Minimum absolute RMS to consider
+    
+    return ratio >= spike_threshold and current_rms >= min_abs_rms
+
+
+def calculate_rms(audio_bytes: bytes) -> float:
+    """
+    Calculate RMS (Root Mean Square) energy of audio.
+    
+    Args:
+        audio_bytes: PCM audio bytes
+    
+    Returns:
+        RMS value
+    """
+    if not audio_bytes:
+        return 0.0
+    
+    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+    if samples.size == 0:
+        return 0.0
+    
+    return float(np.sqrt(np.mean(samples * samples) + 1e-10))
+
+
+def detect_acoustic_change(
+    current_audio: bytes,
+    previous_audio: bytes,
+    change_threshold: float = 0.3,
+    sample_rate: int = 16000,
+) -> bool:
+    """
+    Detect acoustic change (pitch/timbre shift) indicating speaker change.
+    
+    Uses zero-crossing rate as a simple acoustic feature.
+    
+    Args:
+        current_audio: Current audio frame
+        previous_audio: Previous audio frame
+        change_threshold: Relative change threshold (0-1)
+        sample_rate: Audio sample rate
+    
+    Returns:
+        True if significant acoustic change detected
+    """
+    if not current_audio or not previous_audio:
+        return False
+    
+    current = np.frombuffer(current_audio, dtype=np.int16).astype(np.float32)
+    previous = np.frombuffer(previous_audio, dtype=np.int16).astype(np.float32)
+    
+    if current.size == 0 or previous.size == 0:
+        return False
+    
+    # Calculate zero-crossing rate (simple pitch indicator)
+    def zcr(signal: np.ndarray) -> float:
+        if signal.size < 2:
+            return 0.0
+        signs = np.sign(signal)
+        crossings = np.sum(np.abs(np.diff(signs))) / 2.0
+        return float(crossings / signal.size)
+    
+    current_zcr = zcr(current)
+    previous_zcr = zcr(previous)
+    
+    # Avoid division by zero
+    if previous_zcr < 1e-6:
+        return False
+    
+    # Calculate relative change
+    change = abs(current_zcr - previous_zcr) / previous_zcr
+    
+    return change >= change_threshold

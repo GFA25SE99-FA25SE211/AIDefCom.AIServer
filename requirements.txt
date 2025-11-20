@@ -20,3 +20,9 @@ azure-storage-blob>=12.19.0
 pymssql>=2.2.0
 pyodbc>=5.0.0
 sentence-transformers
+sqlalchemy>=2.0.0
+circuitbreaker>=2.0.0
+slowapi>=0.1.9
+structlog>=24.0.0
+prometheus-client>=0.19.0
+cachetools>=5.3.0

@@ -33,22 +33,31 @@ def _validate_audio_file(upload: UploadFile, raw: bytes) -> None:
 
 @router.post(
     "/users/{user_id}/enroll",
-    summary="Enroll Voice Sample",
-    description="Register a voice sample for a specific user. Requires 3 samples for full enrollment.",
+    summary="Enroll voice sample",
+    description=(
+        "Đăng ký mẫu giọng nói cho user. Cần tối thiểu 3 mẫu để hoàn tất enrollment. "
+        "Mỗi mẫu ~3-5s giọng nói rõ, ít nhiễu."
+    ),
     response_model=EnrollmentResponse,
     responses={
         200: {
-            "description": "Enrollment successful or failed (check success field)",
-            "model": EnrollmentResponse,
+            "description": "Enrollment result",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "type": "enrollment",
+                        "success": True,
+                        "user_id": "USR001",
+                        "enrollment_count": 2,
+                        "min_required": 3,
+                        "is_complete": False,
+                        "message": "Enrollment sample 2/3 saved successfully"
+                    }
+                }
+            },
         },
-        400: {
-            "description": "Invalid audio file or validation error",
-            "model": ErrorResponse,
-        },
-        500: {
-            "description": "Internal server error",
-            "model": ErrorResponse,
-        },
+        400: {"description": "Invalid audio or validation error", "content": {"application/json": {"example": {"error": "Empty audio data"}}}},
+        500: {"description": "Internal server error", "content": {"application/json": {"example": {"error": "Unexpected error"}}}},
     },
 )
 async def enroll_voice(
@@ -61,16 +70,15 @@ async def enroll_voice(
     **REST API:** `POST /voice/users/{user_id}/enroll`
     
     **Process:**
-    1. Uploads audio sample for the specified user
-    2. Extracts voice embedding using SpeechBrain ECAPA-TDNN model
-    3. Stores embedding in Azure SQL Database and audio in Azure Blob Storage
-    4. Requires minimum 3 samples for full enrollment before verification/identification
-    
-    **Requirements:**
-    - Audio format: WAV, MP3, or FLAC
-    - Max file size: 10MB
-    - Recommended duration: 3-5 seconds of clean speech
-    - Minimum 3 samples needed for enrollment completion
+    1. Nhận audio và trích xuất embedding (SpeechBrain ECAPA-TDNN)
+    2. Lưu embedding + metadata (cloud storage)
+    3. Cập nhật số mẫu; complete khi đạt `min_required` (3)
+
+    **Yêu cầu:**
+    - Định dạng: WAV / MP3 / FLAC
+    - Kích thước tối đa: 10MB
+    - Thời lượng khuyến nghị: 3–5 giây
+    - Ít nhiễu nền, giọng nói rõ
     """
     try:
         audio_data = await audio_file.read()
@@ -95,22 +103,32 @@ async def enroll_voice(
 
 @router.post(
     "/identify",
-    summary="Identify Speaker",
-    description="Identify which enrolled user is speaking from an audio sample.",
+    summary="Identify speaker",
+    description=(
+        "Nhận diện người nói từ audio so với tất cả users đã enroll (≥3 mẫu). "
+        "Trả về match nếu vượt ngưỡng tương đồng hiện hành (mặc định ≈0.70)."
+    ),
     response_model=IdentificationResponse,
     responses={
         200: {
-            "description": "Identification completed (check identified field for success)",
-            "model": IdentificationResponse,
+            "description": "Identification result",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "type": "identification",
+                        "success": True,
+                        "identified": True,
+                        "speaker_id": "USR001",
+                        "speaker_name": "Nguyễn Văn A",
+                        "score": 0.88,
+                        "confidence": 0.90,
+                        "message": "Speaker identified successfully"
+                    }
+                }
+            },
         },
-        400: {
-            "description": "Invalid audio file or no speakers found",
-            "model": ErrorResponse,
-        },
-        500: {
-            "description": "Internal server error",
-            "model": ErrorResponse,
-        },
+        400: {"description": "Invalid audio or no enrolled users", "content": {"application/json": {"example": {"error": "No enrolled users found"}}}},
+        500: {"description": "Internal server error", "content": {"application/json": {"example": {"error": "Unexpected error"}}}},
     },
 )
 async def identify_speaker(
@@ -122,17 +140,16 @@ async def identify_speaker(
     **REST API:** `POST /voice/identify`
     
     **Process:**
-    1. Extracts voice embedding from audio sample
-    2. Compares against all enrolled users (≥3 samples) in database
-    3. Returns best match if similarity score exceeds threshold (0.7)
-    
-    **Returns:**
-    - `identified=true`: Speaker found with high confidence
-    - `identified=false`: No matching speaker or score too low
-    - `speaker_id`: User ID of identified speaker
-    - `speaker_name`: Display name of identified speaker
-    - `confidence`: Confidence score (0-1)
-    - `score`: Similarity score (0-1)
+    1. Trích xuất embedding
+    2. So sánh với embeddings của toàn bộ users hoàn tất enrollment
+    3. Tính cosine similarity -> score; suy ra confidence
+    4. `identified=true` nếu score vượt ngưỡng nội bộ (≈0.70)
+
+    **Trả về:**
+    - `identified=true/false`
+    - `score`: Cosine similarity (0–1)
+    - `confidence`: Độ tin cậy (0–1)
+    - `speaker_id`, `speaker_name` (nếu match)
     """
     try:
         audio_data = await audio_file.read()
@@ -150,22 +167,33 @@ async def identify_speaker(
 
 @router.post(
     "/users/{user_id}/verify",
-    summary="Verify Voice",
-    description="Verify if an audio sample matches a specific user's voice profile.",
+    summary="Verify voice",
+    description=(
+        "Xác thực audio có khớp user đã cho (1:1). Yêu cầu user đủ 3 mẫu enroll. "
+        "Dùng điểm tương đồng và ngưỡng nội bộ (≈0.70)."
+    ),
     response_model=VerificationResponse,
     responses={
         200: {
-            "description": "Verification completed (check verified field for success)",
-            "model": VerificationResponse,
+            "description": "Verification result",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "type": "verification",
+                        "success": True,
+                        "verified": True,
+                        "claimed_id": "USR001",
+                        "speaker_id": "USR001",
+                        "match": True,
+                        "score": 0.91,
+                        "confidence": 0.94,
+                        "message": "Voice verified successfully"
+                    }
+                }
+            },
         },
-        400: {
-            "description": "Invalid audio file or user not enrolled",
-            "model": ErrorResponse,
-        },
-        500: {
-            "description": "Internal server error",
-            "model": ErrorResponse,
-        },
+        400: {"description": "Invalid audio or user not enrolled", "content": {"application/json": {"example": {"error": "User not enrolled or insufficient samples"}}}},
+        500: {"description": "Internal server error", "content": {"application/json": {"example": {"error": "Unexpected error"}}}},
     },
 )
 async def verify_voice(
@@ -178,24 +206,20 @@ async def verify_voice(
     **REST API:** `POST /voice/users/{user_id}/verify`
     
     **Process:**
-    1. Checks if user has completed enrollment (≥3 samples)
-    2. Extracts voice embedding from audio sample
-    3. Compares against user's stored embeddings
-    4. Returns verification result based on similarity threshold (0.7)
-    
-    **Returns:**
-    - `verified=true`: Voice matches claimed user ID
-    - `verified=false`: Voice does not match or user not enrolled
-    - `claimed_id`: User ID being verified
-    - `speaker_id`: Actual identified speaker (if match)
-    - `match`: Boolean indicating if claimed_id == speaker_id
-    - `confidence`: Confidence score (0-1)
-    - `score`: Similarity score (0-1)
-    
+    1. Kiểm tra user đủ mẫu (≥3)
+    2. Trích xuất embedding từ audio verify
+    3. So sánh với embeddings đã lưu
+    4. `verified=true` nếu score vượt ngưỡng nội bộ (≈0.70)
+
+    **Trả về:**
+    - `match`: claimed_id == speaker_id
+    - `verified`: trạng thái xác thực
+    - `score`, `confidence`
+
     **Use Cases:**
-    - Authentication: Verify user identity via voice
-    - Access Control: Grant access if voice matches
-    - Security: Detect voice spoofing attempts
+    - Xác thực danh tính
+    - Kiểm soát truy cập
+    - Phát hiện giả mạo giọng nói
     """
     try:
         audio_data = await audio_file.read()

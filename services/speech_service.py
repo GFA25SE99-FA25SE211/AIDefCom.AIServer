@@ -13,7 +13,20 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from repositories.azure_speech_repository import AzureSpeechRepository
-from services.audio_processing.audio_utils import NoiseFilter, pcm_to_wav
+from services.audio_processing.audio_utils import (
+    NoiseFilter,
+    pcm_to_wav,
+    detect_energy_spike,
+    detect_acoustic_change,
+    calculate_rms,
+)
+from services.audio_processing.speech_utils import (
+    filter_filler_words,
+    normalize_vietnamese_text,
+    should_log_transcript,
+    calculate_speech_confidence,
+)
+from services.multi_speaker_tracker import MultiSpeakerTracker
 from services.redis_service import get_redis_service
 
 if TYPE_CHECKING:
@@ -25,7 +38,7 @@ logger = logging.getLogger(__name__)
 IDENTIFY_MIN_SECONDS = 1.2  # Min audio length for identification
 IDENTIFY_WINDOW_SECONDS = 2.5  # Window of audio to analyze
 HISTORY_SECONDS = 4.0  # Keep 4s of audio history
-IDENTIFY_INTERVAL_SECONDS = 0.6  # Check every 0.6s for speaker changes
+IDENTIFY_INTERVAL_SECONDS = 0.5  # Reduced from 0.6s for faster speaker changes
 
 
 def _normalize_speaker_label(name: str | None) -> str:
@@ -98,6 +111,7 @@ class SpeechService:
         speaker_label: str = "Đang xác định",
         extra_phrases: Iterable[str] | None = None,
         apply_noise_filter: bool = True,
+        whitelist_user_ids: Optional[List[str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Stream speech recognition from audio queue (instead of WebSocket).
@@ -107,6 +121,7 @@ class SpeechService:
             speaker_label: Initial speaker label
             extra_phrases: Additional phrase hints
             apply_noise_filter: Whether to apply noise filtering
+            whitelist_user_ids: Optional list of user IDs to filter identification (defense session)
         
         Yields:
             Recognition events
@@ -116,6 +131,15 @@ class SpeechService:
 
         current_speaker = _normalize_speaker_label(speaker_label)
         current_user_id: Optional[str] = None
+        
+        # NEW: Multi-speaker tracker
+        speaker_tracker = MultiSpeakerTracker(max_speakers=4, inactivity_timeout=30.0)
+        speaker_tracker.switch_speaker(
+            current_speaker,
+            current_user_id,
+            timestamp=loop.time(),
+            reason="initial"
+        )
         
         # Generate session ID for caching
         import hashlib
@@ -130,6 +154,11 @@ class SpeechService:
         identify_task: Optional[asyncio.Task] = None
         last_identify_ts = 0.0
         identify_interval = max(IDENTIFY_INTERVAL_SECONDS, 0.4)
+        
+        # NEW: Sliding window verification
+        verify_task: Optional[asyncio.Task] = None
+        last_verify_ts = 0.0
+        verify_interval = 0.5  # Re-verify every 500ms
 
         FRAME_SAMPLES = 320  # 20ms @ 16kHz
         FRAME_BYTES = FRAME_SAMPLES * 2
@@ -145,14 +174,22 @@ class SpeechService:
         last_reinforce_ts: float = 0.0
         last_switch_ts: float = 0.0
         
+        # NEW: Interruption detection state
+        previous_audio_chunk: Optional[bytes] = None
+        interruption_detected: bool = False
+        
         # Track background tasks to prevent memory leak
         background_tasks: set[asyncio.Task] = set()
+        
+        # NEW: Lock for speaker state updates (prevent race conditions)
+        speaker_state_lock = asyncio.Lock()
 
-        async def resolve_speaker_from_history() -> None:
+        async def resolve_speaker_from_history(force_reidentify: bool = False) -> None:
             """Identify speaker using the buffered audio history."""
             nonlocal current_speaker, current_user_id
             nonlocal pending_candidate, pending_user_id, pending_hits, pending_top_score
             nonlocal current_confidence_score, last_reinforce_ts, last_switch_ts
+            nonlocal interruption_detected
 
             if self.voice_service is None:
                 return
@@ -170,13 +207,23 @@ class SpeechService:
                 samples = samples[-window_samples:]
             wav_bytes = pcm_to_wav(samples.tobytes(), sample_rate=self.sample_rate)
             
-            # Check cache first - use xxhash for speed
+            # Check cache first - hash full audio to avoid collisions
             try:
                 import xxhash
-                audio_hash = xxhash.xxh64(wav_bytes[:2000]).hexdigest()[:12]
+                # Hash full audio or stratified samples for better uniqueness
+                if len(wav_bytes) <= 8000:
+                    audio_hash = xxhash.xxh64(wav_bytes).hexdigest()[:16]
+                else:
+                    # Stratified sampling: start, middle, end
+                    samples = [
+                        wav_bytes[:2000],
+                        wav_bytes[len(wav_bytes)//2:len(wav_bytes)//2+2000],
+                        wav_bytes[-2000:]
+                    ]
+                    audio_hash = xxhash.xxh64(b''.join(samples)).hexdigest()[:16]
             except ImportError:
                 import hashlib
-                audio_hash = hashlib.md5(wav_bytes[:2000]).hexdigest()[:12]
+                audio_hash = hashlib.md5(wav_bytes).hexdigest()[:16]
             
             cache_key = f"speaker:id:{audio_hash}"
             
@@ -190,6 +237,7 @@ class SpeechService:
                         None,
                         self.voice_service.identify_speaker,
                         wav_bytes,
+                        whitelist_user_ids,
                     )
                     # Cache 2 min (giảm từ 5 min)
                     await self.redis_service.set(cache_key, result, ttl=120)
@@ -251,44 +299,65 @@ class SpeechService:
 
             score_for_decision = confidence_score or 0.0
             cosine_threshold = getattr(self.voice_service, "cosine_threshold", 0.75)
+            # NEW: Adaptive margin and hits for small groups
+            base_margin = getattr(self.voice_service, "speaker_switch_margin", 0.06)
+            base_hits = getattr(self.voice_service, "speaker_switch_hits_required", 3)
+            
+            # Lower requirements for small defense sessions (easier to distinguish)
+            if whitelist_user_ids and len(whitelist_user_ids) <= 6:
+                required_margin = 0.04  # 4% for small groups
+                required_hits = 2
+            else:
+                required_margin = base_margin
+                required_hits = base_hits
 
-            # Speaker lock decay to avoid sticking forever
+            # Speaker lock decay - dynamic based on confidence (3-5s)
             now_ts = loop.time()
-            DECAY_SECONDS = 2.8
-            if last_reinforce_ts and (now_ts - last_reinforce_ts) > DECAY_SECONDS:
-                if current_speaker != "Khách":
-                    logger.info(f"⌛ Speaker lock decayed after {now_ts - last_reinforce_ts:.2f}s; relaxing to Đang xác định")
-                current_speaker = "Khách"
-                current_user_id = None
-                current_confidence_score = 0.0
-                pending_candidate = None
-                pending_user_id = None
-                pending_hits = 0
-                pending_top_score = 0.0
-
-            # If same speaker, only short-circuit when confidence is strong
-            if new_name == current_speaker and (new_user or None) == current_user_id:
-                if (margin is not None and margin >= 0.03) or (score_for_decision >= cosine_threshold + 0.02):
-                    # Reinforce current speaker
-                    last_reinforce_ts = now_ts
-                    current_confidence_score = score_for_decision
+            # Higher confidence = longer lock, lower confidence = faster decay
+            base_decay = 3.0
+            confidence_bonus = min(current_confidence_score * 2.0, 2.0) if current_confidence_score else 0.0
+            DECAY_SECONDS = base_decay + confidence_bonus  # 3.0-5.0s
+            
+            async with speaker_state_lock:
+                if last_reinforce_ts and (now_ts - last_reinforce_ts) > DECAY_SECONDS:
+                    if current_speaker != "Khách":
+                        logger.info(f"⌛ Speaker lock decayed after {now_ts - last_reinforce_ts:.2f}s; relaxing to Khách")
+                    current_speaker = "Khách"
+                    current_user_id = None
+                    current_confidence_score = 0.0
                     pending_candidate = None
                     pending_user_id = None
                     pending_hits = 0
                     pending_top_score = 0.0
-                    return
-                # Otherwise fall through to allow potential switch if evidence builds
+
+                # If same speaker, only short-circuit when confidence is strong
+                if new_name == current_speaker and (new_user or None) == current_user_id:
+                    # Reinforcement margin increased from 0.03 to 0.05
+                    if (margin is not None and margin >= 0.05) or (score_for_decision >= cosine_threshold + 0.03):
+                        # Reinforce current speaker
+                        last_reinforce_ts = now_ts
+                        current_confidence_score = score_for_decision
+                        pending_candidate = None
+                        pending_user_id = None
+                        pending_hits = 0
+                        pending_top_score = 0.0
+                        return
+                    # Otherwise fall through to allow potential switch if evidence builds
 
             explicit_identified = bool(result.get("identified"))
             
             margin_str = f"{margin:.3f}" if margin is not None else "N/A"
             logger.info(f"🎯 Decision params: name={new_name} | score={score_for_decision:.3f} | threshold={cosine_threshold:.3f} | identified={explicit_identified} | forced={forced} | margin={margin_str}")
-            high_score_required = cosine_threshold + 0.06
-            medium_score_required = cosine_threshold + 0.02
-            baseline_required = cosine_threshold - 0.02  # Balanced for accuracy
-            margin_strong = margin is not None and margin >= 0.05
-            margin_ok = margin is not None and margin >= 0.03
-            margin_weak = margin is not None and margin >= 0.015  # Lowered from 0.025
+            # NEW: Stricter thresholds for better accuracy
+            high_score_required = cosine_threshold + 0.08  # Increased from +0.06
+            medium_score_required = cosine_threshold + 0.04  # Increased from +0.02
+            baseline_required = cosine_threshold  # Changed from -0.02 to exact threshold
+            
+            # NEW: Margin requirements (stronger than before)
+            margin_strong = margin is not None and margin >= required_margin  # 0.06
+            margin_ok = margin is not None and margin >= (required_margin * 0.67)  # 0.04
+            margin_weak = margin is not None and margin >= (required_margin * 0.5)  # 0.03
+            
             high_score = score_for_decision >= high_score_required
             medium_score = score_for_decision >= medium_score_required
             baseline_score = score_for_decision >= baseline_required
@@ -296,67 +365,89 @@ class SpeechService:
             should_switch = False
             switch_reason = ""
 
-            # Immediate switch rule for strong evidence of a different speaker
+            # NEW: More conservative switching rules to prevent false positives
             if new_name != current_speaker:
-                if score_for_decision >= (cosine_threshold + 0.03) and (margin is not None and margin >= 0.04):
+                # Rule 1: Immediate switch ONLY with very strong evidence
+                if score_for_decision >= (cosine_threshold + 0.05) and margin_strong:
                     should_switch = True
                     switch_reason = "immediate_strong_evidence"
                 elif pending_candidate == new_name:
-                    # Evidence-based switching after repeated hits
-                    if pending_hits + 1 >= 2 and (baseline_score and (margin is None or margin >= 0.02)):
+                    # Rule 2: Require MORE hits with strong margin
+                    if pending_hits + 1 >= required_hits and baseline_score and margin_ok:
                         should_switch = True
-                        switch_reason = "two_hits_with_baseline"
+                        switch_reason = f"{required_hits}_hits_with_baseline_margin"
             
-            # Improved logic: balance accuracy and recognition rate
-            if explicit_identified and high_score:
-                should_switch = True
-                switch_reason = switch_reason or "explicit_high"
-            elif explicit_identified and medium_score and margin_strong:
-                should_switch = True
-                switch_reason = switch_reason or "explicit_medium_strong_margin"
-            elif explicit_identified and baseline_score and margin_strong:
-                should_switch = True
-                switch_reason = switch_reason or "explicit_baseline_strong_margin"
-            elif score_for_decision >= cosine_threshold and margin_ok:
-                should_switch = True
-                switch_reason = switch_reason or "threshold_margin"
-            elif forced and score_for_decision >= baseline_required and margin_strong:
-                should_switch = True
-                switch_reason = switch_reason or "forced_baseline_strong_margin"
-            else:
-                if pending_candidate == new_name and pending_user_id == new_user:
-                    pending_hits += 1
-                    pending_top_score = max(pending_top_score, score_for_decision)
-                else:
-                    pending_candidate = new_name
-                    pending_user_id = new_user
-                    pending_hits = 1
-                    pending_top_score = score_for_decision
-
-                # margin_str = f"{margin:.3f}" if margin is not None else "N/A"
-                # logger.debug(f"📊 Pending: {new_name} hits={pending_hits} score={pending_top_score:.3f} margin={margin_str}")
-
-                if pending_hits >= 2 and baseline_score and margin_weak:
+            # Enhanced logic: prioritize high confidence + margin
+            if not should_switch:
+                if explicit_identified and high_score and margin_strong:
                     should_switch = True
-                    switch_reason = switch_reason or "two_hits_baseline_margin"
-                elif pending_hits >= 3 and baseline_score:
+                    switch_reason = switch_reason or "explicit_high_strong_margin"
+                elif explicit_identified and medium_score and margin_strong:
                     should_switch = True
-                    switch_reason = switch_reason or "three_hits_baseline"
+                    switch_reason = switch_reason or "explicit_medium_strong_margin"
+                elif score_for_decision >= (cosine_threshold + 0.02) and margin_strong:
+                    should_switch = True
+                    switch_reason = switch_reason or "threshold_strong_margin"
+                elif forced and score_for_decision >= baseline_required and margin_strong:
+                    should_switch = True
+                    switch_reason = switch_reason or "forced_baseline_strong_margin"
                 else:
-                    logger.debug(f"⏳ Waiting for more evidence: {new_name} (need {3-pending_hits} more hits or better score/margin)")
-                    return
+                    # Accumulate evidence (with lock to prevent race)
+                    async with speaker_state_lock:
+                        if pending_candidate == new_name and pending_user_id == new_user:
+                            pending_hits += 1
+                            pending_top_score = max(pending_top_score, score_for_decision)
+                        else:
+                            pending_candidate = new_name
+                            pending_user_id = new_user
+                            pending_hits = 1
+                            pending_top_score = score_for_decision
 
-            current_speaker = new_name
-            current_user_id = new_user
-            pending_candidate = None
-            pending_user_id = None
-            pending_hits = 0
-            pending_top_score = 0.0
-            # Update reinforcement timers
-            last_reinforce_ts = now_ts
-            last_switch_ts = now_ts
-            current_confidence_score = score_for_decision
-            logger.info(f"✅ Switch speaker → {current_speaker} (reason={switch_reason}, score={score_for_decision:.3f}{', margin='+format(margin, '.3f') if margin is not None else ''})")
+                        margin_str = f"{margin:.3f}" if margin is not None else "N/A"
+                        logger.debug(f"📊 Pending: {new_name} hits={pending_hits}/{required_hits} score={pending_top_score:.3f} margin={margin_str}")
+
+                        # Rule 3: Require full hit count with good margin
+                        if pending_hits >= required_hits and baseline_score and margin_ok:
+                            should_switch = True
+                            switch_reason = switch_reason or f"{required_hits}_hits_baseline_margin"
+                        elif pending_hits >= (required_hits + 1) and baseline_score:
+                            # Extra hit if margin is weak
+                            should_switch = True
+                            switch_reason = switch_reason or f"{required_hits + 1}_hits_baseline"
+                        else:
+                            logger.debug(f"⏳ Waiting: {new_name} needs {required_hits - pending_hits} more hits or better score/margin")
+                            return
+
+            # NEW: Update multi-speaker tracker with lock
+            now_ts = loop.time()
+            
+            async with speaker_state_lock:
+                switched = speaker_tracker.switch_speaker(
+                    new_speaker=new_name,
+                    new_user_id=new_user,
+                    timestamp=now_ts,
+                    confidence=score_for_decision,
+                    reason=switch_reason
+                )
+                
+                if switched or force_reidentify:
+                    current_speaker = new_name
+                    current_user_id = new_user
+                    pending_candidate = None
+                    pending_user_id = None
+                    pending_hits = 0
+                    pending_top_score = 0.0
+                    interruption_detected = False  # Reset after switch
+                    # Update reinforcement timers
+                    last_reinforce_ts = now_ts
+                    last_switch_ts = now_ts
+                    current_confidence_score = score_for_decision
+                    
+                    logger.info(f"✅ Switch speaker → {current_speaker} (reason={switch_reason}, score={score_for_decision:.3f}{', margin='+format(margin, '.3f') if margin is not None else ''})")
+                else:
+                    # Same speaker, just update state
+                    last_reinforce_ts = now_ts
+                    current_confidence_score = score_for_decision
 
             async with history_lock:
                 if len(audio_history) > history_limit_bytes * 1.5:
@@ -429,7 +520,7 @@ class SpeechService:
 
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
             """Read audio from queue, buffer for identification, and yield for Azure."""
-            nonlocal frame_buffer
+            nonlocal frame_buffer, previous_audio_chunk, interruption_detected
 
             try:
                 while True:
@@ -453,6 +544,31 @@ class SpeechService:
 
                         chunk = self.noise_filter.reduce_noise(raw_frame) if apply_noise_filter else raw_frame
 
+                        # NEW: Interruption detection
+                        if previous_audio_chunk and self.voice_service and not interruption_detected:
+                            # Check for energy spike (possible interruption)
+                            if detect_energy_spike(chunk, previous_audio_chunk, spike_threshold=1.5):
+                                logger.info("⚡ Energy spike detected - possible speaker interruption")
+                                # Force immediate re-identification
+                                self._create_tracked_task(
+                                    background_tasks,
+                                    schedule_identification(force=True, blocking=False)
+                                )
+                                interruption_detected = True
+                                # Flag will be reset after speaker switch (in resolve_speaker_from_history)
+                            
+                            # Check for acoustic change (pitch/timbre shift)
+                            elif detect_acoustic_change(chunk, previous_audio_chunk, zcr_threshold=0.15):
+                                logger.debug("🎵 Acoustic change detected")
+                                self._create_tracked_task(
+                                    background_tasks,
+                                    schedule_identification(force=True, blocking=False)
+                                )
+                                interruption_detected = True
+                                # Flag will be reset after speaker switch (in resolve_speaker_from_history)
+                        
+                        previous_audio_chunk = chunk
+
                         async with history_lock:
                             audio_history.extend(chunk)
                             if len(audio_history) > history_limit_bytes:
@@ -466,7 +582,12 @@ class SpeechService:
                                 # Force more often if:
                                 # 1. No speaker identified yet
                                 # 2. Current speaker is "Khách" (uncertain)
-                                force_identify = (current_user_id is None or current_speaker == "Khách")
+                                # 3. Interruption detected
+                                force_identify = (
+                                    current_user_id is None or
+                                    current_speaker == "Khách" or
+                                    interruption_detected
+                                )
                                 self._create_tracked_task(background_tasks, schedule_identification(force=force_identify, blocking=False))
                             else:
                                 # Not enough audio yet, just schedule with throttle
@@ -518,6 +639,38 @@ class SpeechService:
                         event["user_id"] = current_user_id
 
                     if event.get("text"):
+                        raw_text = event["text"]
+                        
+                        # NEW: Apply filler word filtering for final results
+                        if event_type == "result":
+                            # Filter filler words
+                            filtered_text = filter_filler_words(raw_text)
+                            # Normalize Vietnamese text
+                            filtered_text = normalize_vietnamese_text(filtered_text)
+                            
+                            # Check if should log (skip noise/pure fillers)
+                            if not should_log_transcript(filtered_text):
+                                logger.debug(f"🚫 Filtered noise-only transcript: '{raw_text}'")
+                                # Send as noise event instead of skipping
+                                event["type"] = "noise"
+                                event["text"] = ""
+                                event["text_raw"] = raw_text
+                            else:
+                                # Update event with filtered text
+                                event["text"] = filtered_text
+                                event["text_raw"] = raw_text  # Keep original for debugging
+                                
+                                # Calculate confidence
+                                azure_conf = event.get("confidence")
+                                event["confidence_adjusted"] = calculate_speech_confidence(filtered_text, azure_conf)
+                                
+                                # NEW: Append to speaker tracker
+                                speaker_tracker.append_text(filtered_text)
+                        else:
+                            # For partials, apply lighter filtering
+                            filtered_text = filter_filler_words(raw_text, min_word_length=1)
+                            event["text"] = filtered_text if filtered_text else raw_text
+                        
                         display_plain = f"{current_speaker}: {event['text']}"
                         event["display"] = display_plain
                         event["display_colored"] = self._colorize(event_type or "", display_plain)
@@ -527,9 +680,11 @@ class SpeechService:
                             cache_key = f"recognition:session:{session_id}:result:{result_count}"
                             self._create_tracked_task(background_tasks, self.redis_service.set(cache_key, {
                                 "text": event.get("text"),
+                                "text_raw": raw_text,
                                 "speaker": current_speaker,
                                 "user_id": current_user_id,
                                 "timestamp": loop.time(),
+                                "confidence": event.get("confidence_adjusted"),
                             }, ttl=3600))  # Cache for 1 hour
 
                     try:
@@ -564,6 +719,25 @@ class SpeechService:
                 yield event
 
         finally:
+            # NEW: Finalize multi-speaker tracking and log summary
+            final_timestamp = loop.time()
+            segments = speaker_tracker.finalize(final_timestamp)
+            session_summary = speaker_tracker.get_session_summary(final_timestamp)
+            
+            logger.info(
+                f"📊 Session Summary | speakers={session_summary['speaker_count']} | "
+                f"segments={session_summary['total_segments']} | "
+                f"active={session_summary['active_speaker']}"
+            )
+            
+            # Log top speakers by duration
+            for idx, speaker_info in enumerate(session_summary.get('speakers', [])[:3], 1):
+                logger.info(
+                    f"   #{idx} {speaker_info['speaker']}: "
+                    f"{speaker_info['total_duration']:.1f}s "
+                    f"({speaker_info['segment_count']} segments)"
+                )
+            
             if not azure_task.done():
                 azure_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -662,7 +836,8 @@ class SpeechService:
         # Parse query parameters
         speaker_label = ws.query_params.get("speaker") or "Đang xác định"
         phrase_param = ws.query_params.get("phrases")
-        user_id = ws.query_params.get("user_id")  # Optional user association
+        defense_session_id = ws.query_params.get("defense_session_id")  # Optional: filter identify by session
+        # Note: user_id is NOT required - backend will auto-identify speaker from audio
         
         extra_phrases = []
         if phrase_param:
@@ -672,13 +847,38 @@ class SpeechService:
                 if token.strip()
             ]
         
+        # Fetch defense session users whitelist if session_id provided
+        whitelist_user_ids = None
+        if defense_session_id and self.voice_service:
+            # P3 #11: Add retry logic for whitelist fetch
+            for attempt in range(3):
+                try:
+                    whitelist_user_ids = await self.voice_service.get_defense_session_users(defense_session_id)
+                    if whitelist_user_ids:
+                        logger.info(
+                            f"🎯 Defense session {defense_session_id}: "
+                            f"Will identify only among {len(whitelist_user_ids)} users"
+                        )
+                        break
+                    else:
+                        if attempt == 2:
+                            logger.warning(f"⚠️ Failed to fetch users for defense session {defense_session_id} after 3 attempts")
+                        else:
+                            await asyncio.sleep(1 ** attempt)  # 0s, 1s, 2s
+                except Exception as e:
+                    if attempt == 2:
+                        logger.exception(f"Error fetching defense session users after 3 retries: {e}")
+                    else:
+                        logger.warning(f"Retry {attempt + 1}/3 fetching defense session users: {e}")
+                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+        
         # Session metadata
         session_id = ws.headers.get("sec-websocket-key", f"session_{id(ws)}")
         session_start = datetime.utcnow()
         transcript_lines = []
         
-        # Audio queue and control
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=50)
+        # Audio queue and control (300 items = ~6s buffer at 50fps)
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=300)
         stop_event = asyncio.Event()
         
         # Ping task to keep connection alive
@@ -760,6 +960,7 @@ class SpeechService:
                 audio_queue,
                 speaker_label=speaker_label,
                 extra_phrases=extra_phrases,
+                whitelist_user_ids=whitelist_user_ids,
             ):
                 # Check stop condition
                 if stop_event.is_set():
@@ -858,7 +1059,8 @@ class SpeechService:
                     f"lines={len(transcript_lines)} | duration={duration_seconds:.1f}s"
                 )
                 
-                # Save to external API endpoint: POST /api/transcripts
+                # Save to external API endpoint: POST /api/transcripts with retry
+                # P0 #3: Add retry logic with exponential backoff and Redis fallback
                 try:
                     from app.config import Config
                     import httpx
@@ -870,26 +1072,49 @@ class SpeechService:
                         "isApproved": True,  # Auto-approve STT transcripts
                     }
                     
-                    async with httpx.AsyncClient(
-                        verify=Config.AUTH_SERVICE_VERIFY_SSL,
-                        timeout=Config.AUTH_SERVICE_TIMEOUT,
-                    ) as client:
-                        response = await client.post(api_url, json=payload)
-                        
-                        if response.status_code in (200, 201):
-                            logger.info(
-                                f"✅ Transcript saved to external API | "
-                                f"session_id={session_id} | status={response.status_code}"
-                            )
-                        else:
-                            logger.warning(
-                                f"❌ Failed to save transcript to API | "
-                                f"session_id={session_id} | status={response.status_code} | "
-                                f"response={response.text}"
-                            )
+                    saved = False
+                    last_error = None
+                    
+                    # Retry 3 times with exponential backoff
+                    for attempt in range(3):
+                        try:
+                            async with httpx.AsyncClient(
+                                verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                                timeout=Config.AUTH_SERVICE_TIMEOUT,
+                            ) as client:
+                                response = await client.post(api_url, json=payload)
+                                
+                                if response.status_code in (200, 201):
+                                    logger.info(
+                                        f"✅ Transcript saved to external API | "
+                                        f"session_id={session_id} | status={response.status_code} | "
+                                        f"attempt={attempt + 1}"
+                                    )
+                                    saved = True
+                                    break
+                                else:
+                                    last_error = f"HTTP {response.status_code}: {response.text}"
+                                    if attempt < 2:
+                                        logger.warning(
+                                            f"⚠️ Retry {attempt + 1}/3 saving transcript | "
+                                            f"status={response.status_code}"
+                                        )
+                                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+                        except Exception as req_error:
+                            last_error = str(req_error)
+                            if attempt < 2:
+                                logger.warning(f"⚠️ Retry {attempt + 1}/3 | error: {req_error}")
+                                await asyncio.sleep(2 ** attempt)
+                    
+                    # If all retries failed, just log; retry worker has been removed
+                    if not saved:
+                        logger.error(
+                            f"❌ Failed to save transcript after 3 attempts | "
+                            f"session_id={session_id} | last_error={last_error} | retry=disabled"
+                        )
                 
                 except Exception as api_error:
-                    logger.exception(f"Error calling external API to save transcript: {api_error}")
+                    logger.exception(f"Critical error saving transcript: {api_error}")
                 
                 # Cache final transcript in Redis (24h TTL)
                 try:

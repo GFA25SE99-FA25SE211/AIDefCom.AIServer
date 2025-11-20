@@ -7,7 +7,6 @@ from functools import lru_cache
 
 from app.config import Config
 from repositories.azure_speech_repository import AzureSpeechRepository
-from repositories.voice_profile_repository import VoiceProfileRepository
 from repositories.cloud_voice_profile_repository import CloudVoiceProfileRepository
 from repositories.models.speechbrain_model import SpeechBrainModelRepository
 from repositories.azure_blob_repository import AzureBlobRepository
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Singleton instances
 _azure_speech_repo: AzureSpeechRepository | None = None
-_voice_profile_repo: VoiceProfileRepository | None = None
+_cloud_voice_profile_repo: CloudVoiceProfileRepository | None = None
 _speechbrain_model_repo: SpeechBrainModelRepository | None = None
 _azure_blob_repo: AzureBlobRepository | None = None
 _sql_server_repo: SQLServerRepository | None = None
@@ -42,25 +41,16 @@ def get_azure_speech_repository() -> AzureSpeechRepository:
 
 
 @lru_cache()
-def get_voice_profile_repository() -> VoiceProfileRepository:
-    """Get voice profile repository instance.
-
-    Preference order:
-    1) If Azure Blob is configured, use CloudVoiceProfileRepository (blob-only)
-    2) Otherwise, fall back to local VoiceProfileRepository
-    """
-    global _voice_profile_repo
-    if _voice_profile_repo is None:
+def get_voice_profile_repository() -> CloudVoiceProfileRepository:
+    """Get cloud voice profile repository instance (Azure Blob only)."""
+    global _cloud_voice_profile_repo
+    if _cloud_voice_profile_repo is None:
         blob = get_azure_blob_repository()
-        if blob is not None:
-            _voice_profile_repo = CloudVoiceProfileRepository(blob_repo=blob)  # type: ignore[assignment]
-            logger.info("Using CloudVoiceProfileRepository (Azure Blob)")
-        else:
-            if Config.VOICE_PROFILE_STORAGE_MODE == "blob":
-                logger.warning("Configured for blob mode but Azure Blob is not available. Falling back to local storage.")
-            _voice_profile_repo = VoiceProfileRepository(profiles_dir=Config.VOICE_PROFILES_DIR)
-            logger.info("Using local VoiceProfileRepository (filesystem)")
-    return _voice_profile_repo
+        if blob is None:
+            raise RuntimeError("Azure Blob Storage is required but not configured. Set AZURE_STORAGE_CONNECTION_STRING.")
+        _cloud_voice_profile_repo = CloudVoiceProfileRepository(blob_repo=blob)
+        logger.info("Using CloudVoiceProfileRepository (Azure Blob Storage only)")
+    return _cloud_voice_profile_repo
 
 
 @lru_cache()

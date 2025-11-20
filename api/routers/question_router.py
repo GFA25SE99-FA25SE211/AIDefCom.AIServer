@@ -1,4 +1,4 @@
-"""REST API endpoints for question duplicate detection."""
+"""REST API endpoints for question duplicate detection (Swagger-enhanced)."""
 import traceback
 from fastapi import APIRouter, HTTPException
 from api.schemas.question_schemas import (
@@ -7,26 +7,35 @@ from api.schemas.question_schemas import (
     QuestionRegisterRequest,
     QuestionRegisterResponse,
     QuestionListResponse,
+    ClearQuestionsResponse,
     SimilarQuestion,
 )
 from services.question_service import QuestionService
 
 router = APIRouter(prefix="/questions", tags=["Questions"])
 
-# Initialize service
+# Initialize service (TTL 2h)
 question_service = QuestionService(session_ttl=7200)
 
 
-@router.post("/check-duplicate", response_model=QuestionCheckResponse)
+@router.post(
+    "/check-duplicate",
+    summary="Check duplicate question",
+    description="Kiểm tra câu hỏi có bị trùng trong session (fuzzy + semantic, ngưỡng nội bộ 0.85).",
+    response_model=QuestionCheckResponse,
+    responses={
+        200: {"description": "Kết quả kiểm tra câu hỏi"},
+        500: {"description": "Lỗi hệ thống"},
+    },
+)
 async def check_duplicate(request: QuestionCheckRequest):
-    """Check if a question is duplicate in the session."""
+    """Check if a question is duplicate in the session (threshold=0.85)."""
     try:
         is_duplicate, similar = await question_service.check_duplicate(
             session_id=request.session_id,
             question_text=request.question_text,
-            threshold=request.threshold,
         )
-        
+
         similar_questions = [
             SimilarQuestion(
                 text=s['text'],
@@ -36,60 +45,75 @@ async def check_duplicate(request: QuestionCheckRequest):
             )
             for s in similar
         ]
-        
+
         if is_duplicate:
             message = f"⚠️ Câu hỏi trùng lặp! Tìm thấy {len(similar_questions)} câu tương tự."
         else:
             message = "✅ Câu hỏi hợp lệ, chưa bị trùng."
-        
+
         return QuestionCheckResponse(
             is_duplicate=is_duplicate,
             question_text=request.question_text,
             similar_questions=similar_questions,
             message=message,
         )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/register", response_model=QuestionRegisterResponse)
+@router.post(
+    "/register",
+    summary="Register question",
+    description="Đăng ký câu hỏi mới vào session (không kiểm tra trùng).",
+    response_model=QuestionRegisterResponse,
+    responses={
+        200: {"description": "Đăng ký thành công"},
+        500: {"description": "Lỗi hệ thống"},
+    },
+)
 async def register_question(request: QuestionRegisterRequest):
-    """Register a new question in the session."""
+    """Register a new question (speaker='Khách', timestamp tự sinh)."""
     try:
+        from datetime import datetime
+
         result = await question_service.register_question(
             session_id=request.session_id,
             question_text=request.question_text,
-            speaker=request.speaker,
-            timestamp=request.timestamp,
+            speaker="Khách",
+            timestamp=datetime.utcnow().isoformat() + "Z",
         )
-        
+
         return QuestionRegisterResponse(
             success=result['success'],
             question_id=result['question_id'],
             total_questions=result['total_questions'],
             message=f"✅ Câu hỏi đã được lưu. Tổng: {result['total_questions']}",
         )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/check-and-register", response_model=QuestionCheckResponse)
+@router.post(
+    "/check-and-register",
+    summary="Check & register question",
+    description="Kiểm tra trùng lặp và tự động đăng ký nếu không trùng (ngưỡng nội bộ 0.85).",
+    response_model=QuestionCheckResponse,
+    responses={
+        200: {"description": "Kết quả kiểm tra/đăng ký"},
+        500: {"description": "Lỗi hệ thống"},
+    },
+)
 async def check_and_register(request: QuestionRegisterRequest):
-    """Check for duplicate and register if not duplicate (combo endpoint)."""
+    """Check duplicate then register if unique (threshold=0.85)."""
     try:
         print(f"🔍 API: Checking duplicate for: {request.question_text[:50]}...")
-        
-        # First check duplicate
+
         is_duplicate, similar = await question_service.check_duplicate(
             session_id=request.session_id,
             question_text=request.question_text,
-            threshold=0.85,
         )
-        
         print(f"✅ API: Check complete - is_duplicate={is_duplicate}, similar={len(similar)}")
-        
+
         similar_questions = [
             SimilarQuestion(
                 text=s['text'],
@@ -99,61 +123,74 @@ async def check_and_register(request: QuestionRegisterRequest):
             )
             for s in similar
         ]
-        
+
         if is_duplicate:
-            message = f"⚠️ Câu hỏi trùng lặp! Không thể đăng ký."
+            message = "⚠️ Câu hỏi trùng lặp! Không thể đăng ký."
         else:
-            # Register if not duplicate
-            print(f"💾 API: Registering question...")
+            from datetime import datetime
+            print("💾 API: Registering question...")
             result = await question_service.register_question(
                 session_id=request.session_id,
                 question_text=request.question_text,
-                speaker=request.speaker,
-                timestamp=request.timestamp,
+                speaker="Khách",
+                timestamp=datetime.utcnow().isoformat() + "Z",
             )
             message = f"✅ Câu hỏi đã được lưu. Tổng: {result['total_questions']}"
-        
+
         return QuestionCheckResponse(
             is_duplicate=is_duplicate,
             question_text=request.question_text,
             similar_questions=similar_questions,
             message=message,
         )
-    
     except Exception as e:
         print(f"❌ API ERROR: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/session/{session_id}", response_model=QuestionListResponse)
+@router.get(
+    "/session/{session_id}",
+    summary="List session questions",
+    description="Lấy tất cả câu hỏi trong session theo thứ tự thêm vào.",
+    response_model=QuestionListResponse,
+    responses={
+        200: {"description": "Danh sách câu hỏi"},
+        500: {"description": "Lỗi hệ thống"},
+    },
+)
 async def get_session_questions(session_id: str):
-    """Get all questions for a session."""
+    """List all questions in a session."""
     try:
         questions = await question_service.get_questions(session_id)
-        
         return QuestionListResponse(
             session_id=session_id,
             questions=questions,
             total=len(questions),
         )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/session/{session_id}")
+@router.delete(
+    "/session/{session_id}",
+    summary="Clear session questions",
+    description="Xóa toàn bộ câu hỏi trong session và trả về số lượng đã xóa.",
+    response_model=ClearQuestionsResponse,
+    responses={
+        200: {"description": "Kết quả xóa"},
+        500: {"description": "Lỗi hệ thống"},
+    },
+)
 async def clear_session_questions(session_id: str):
-    """Clear all questions for a session."""
+    """Clear all questions for a session and return count."""
     try:
         deleted = await question_service.clear_questions(session_id)
-        
-        return {
-            "success": True,
-            "session_id": session_id,
-            "deleted": deleted,
-            "message": f"✅ Đã xóa {deleted} câu hỏi.",
-        }
-    
+        return ClearQuestionsResponse(
+            success=True,
+            session_id=session_id,
+            deleted=deleted,
+            message=f"✅ Đã xóa {deleted} câu hỏi.",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
