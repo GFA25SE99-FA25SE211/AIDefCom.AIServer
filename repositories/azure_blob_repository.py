@@ -58,14 +58,14 @@ class AzureBlobRepository:
             profile_data: Profile data dictionary
         
         Returns:
-            Blob URL (e.g., https://<account>.blob.core.windows.net/voice-sample/<user_id>/<user_id>.json)
+            Blob URL (e.g., https://<account>.blob.core.windows.net/voice-sample/<user_id>/profile.json)
         
         Raises:
             AzureBlobStorageError: If upload fails
         """
         try:
-            # Blob path: voice-sample/<user_id>/<user_id>.json
-            blob_name = f"{user_id}/{user_id}.json"
+            # Blob path: voice-sample/<user_id>/profile.json
+            blob_name = f"{user_id}/profile.json"
             blob_client = self.container_client.get_blob_client(blob_name)
             
             # Convert profile data to JSON string
@@ -100,7 +100,7 @@ class AzureBlobRepository:
             AzureBlobStorageError: If download fails
         """
         try:
-            blob_name = f"{user_id}/{user_id}.json"
+            blob_name = f"{user_id}/profile.json"
             blob_client = self.container_client.get_blob_client(blob_name)
             
             if not blob_client.exists():
@@ -132,7 +132,7 @@ class AzureBlobRepository:
             AzureBlobStorageError: If deletion fails
         """
         try:
-            blob_name = f"{user_id}/{user_id}.json"
+            blob_name = f"{user_id}/profile.json"
             blob_client = self.container_client.get_blob_client(blob_name)
             
             if not blob_client.exists():
@@ -158,7 +158,7 @@ class AzureBlobRepository:
             True if exists, False otherwise
         """
         try:
-            blob_name = f"{user_id}/{user_id}.json"
+            blob_name = f"{user_id}/profile.json"
             blob_client = self.container_client.get_blob_client(blob_name)
             return blob_client.exists()
         except Exception as e:
@@ -169,22 +169,20 @@ class AzureBlobRepository:
         """List user_ids that have a profile JSON in the container.
 
         Tolerates extra nested paths by extracting the last two segments.
-        Valid profile path pattern: <user_id>/<user_id>.json
+        Valid profile path pattern: <user_id>/profile.json
         """
         results: list[str] = []
         try:
             for blob in self.container_client.list_blobs():
-                name = blob.name  # e.g. 123/123.json or nested/a/123/123.json
-                if not name.endswith('.json'):
+                name = blob.name  # e.g. user123/profile.json
+                if not name.endswith('/profile.json'):
                     continue
                 parts = name.split('/')
                 if len(parts) < 2:
                     continue
-                filename = parts[-1]
-                parent = parts[-2]
-                # filename should be <user>.json and parent folder should equal user
-                if filename[:-5] == parent:  # strip .json
-                    results.append(parent)
+                # Extract user_id from path: user_id/profile.json
+                user_id = parts[-2]
+                results.append(user_id)
             return results
         except Exception as e:
             logger.error(f"Failed listing voice profiles in blob: {e}")

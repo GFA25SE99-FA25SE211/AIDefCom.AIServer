@@ -21,18 +21,24 @@ class AudioFileUpload(BaseModel):
 
 class EnrollmentResponse(BaseModel):
     """Response from voice enrollment endpoint."""
+    type: str = Field(default="enrollment", description="Response type identifier")
     success: bool = Field(..., description="Whether enrollment was successful")
-    message: str = Field(..., description="Human-readable result message")
+    user_id: str = Field(..., description="User identifier")
     enrollment_count: int = Field(..., description="Total enrollment samples for this user")
-    user_id: str = Field(..., alias="id", description="User identifier")
-    
+    min_required: int = Field(default=3, description="Minimum samples required for full enrollment")
+    is_complete: bool = Field(..., description="Whether enrollment has reached minimum sample count")
+    message: str = Field(..., description="Human-readable result message")
+
     class Config:
         json_schema_extra = {
             "example": {
+                "type": "enrollment",
                 "success": True,
-                "message": "Enrollment successful",
+                "user_id": "USR001",
                 "enrollment_count": 3,
-                "id": "usr001"
+                "min_required": 3,
+                "is_complete": True,
+                "message": "Enrollment sample 3/3 saved successfully"
             }
         }
 
@@ -43,25 +49,25 @@ class EnrollmentResponse(BaseModel):
 
 class IdentificationResponse(BaseModel):
     """Response from speaker identification endpoint."""
-    type: str = Field(default="identify", description="Response type")
-    success: bool = Field(..., description="Whether identification was successful")
-    identified: bool = Field(..., description="Whether a speaker was identified")
-    speaker_id: Optional[str] = Field(None, description="Identified speaker's user ID")
-    speaker_name: Optional[str] = Field(None, description="Identified speaker's display name")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score (0-1)")
-    score: float = Field(..., ge=0.0, le=1.0, description="Similarity score (0-1)")
+    type: str = Field(default="identification", description="Response type identifier")
+    success: bool = Field(..., description="Whether identification process executed successfully")
+    identified: bool = Field(..., description="Whether a speaker passed similarity threshold")
+    speaker_id: Optional[str] = Field(None, description="User ID of identified speaker if match")
+    speaker_name: Optional[str] = Field(None, description="Display name of identified speaker")
+    score: float = Field(..., ge=0.0, le=1.0, description="Raw similarity score (0-1)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Derived confidence (0-1)")
     message: str = Field(..., description="Human-readable result message")
-    
+
     class Config:
         json_schema_extra = {
             "example": {
-                "type": "identify",
+                "type": "identification",
                 "success": True,
                 "identified": True,
-                "speaker_id": "usr001",
+                "speaker_id": "USR001",
                 "speaker_name": "Nguyễn Văn A",
-                "confidence": 0.92,
                 "score": 0.89,
+                "confidence": 0.92,
                 "message": "Speaker identified successfully"
             }
         }
@@ -73,27 +79,27 @@ class IdentificationResponse(BaseModel):
 
 class VerificationResponse(BaseModel):
     """Response from voice verification endpoint."""
-    type: str = Field(default="verify", description="Response type")
-    success: bool = Field(..., description="Whether verification was successful")
-    verified: bool = Field(..., description="Whether voice was verified")
-    claimed_id: str = Field(..., description="User ID claimed for verification")
-    speaker_id: Optional[str] = Field(None, description="Actual identified speaker ID (if match)")
-    match: bool = Field(..., description="Whether claimed_id matches speaker_id")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score (0-1)")
-    score: float = Field(..., ge=0.0, le=1.0, description="Similarity score (0-1)")
+    type: str = Field(default="verification", description="Response type identifier")
+    success: bool = Field(..., description="Whether verification process executed successfully")
+    verified: bool = Field(..., description="Whether voice matched claimed user")
+    claimed_id: str = Field(..., description="User ID being verified")
+    speaker_id: Optional[str] = Field(None, description="Identified speaker's user ID")
+    match: bool = Field(..., description="True if claimed_id == speaker_id")
+    score: float = Field(..., ge=0.0, le=1.0, description="Raw similarity score (0-1)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Derived confidence (0-1)")
     message: str = Field(..., description="Human-readable result message")
-    
+
     class Config:
         json_schema_extra = {
             "example": {
-                "type": "verify",
+                "type": "verification",
                 "success": True,
                 "verified": True,
-                "claimed_id": "usr001",
-                "speaker_id": "usr001",
+                "claimed_id": "USR001",
+                "speaker_id": "USR001",
                 "match": True,
-                "confidence": 0.94,
                 "score": 0.91,
+                "confidence": 0.94,
                 "message": "Voice verified successfully"
             }
         }

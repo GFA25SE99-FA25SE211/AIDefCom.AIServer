@@ -7,11 +7,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-
+import httpx
 import numpy as np
 
 from core.exceptions import VoiceProfileNotFoundError, VoiceAuthenticationError, AudioValidationError
-from repositories.voice_profile_repository import VoiceProfileRepository
+from repositories.cloud_voice_profile_repository import CloudVoiceProfileRepository
 from repositories.models.speechbrain_model import SpeechBrainModelRepository
 from services.audio_processing.audio_utils import (
     AudioQualityAnalyzer,
@@ -45,7 +45,7 @@ class VoiceService:
     
     def __init__(
         self,
-        voice_profile_repo: VoiceProfileRepository,
+        voice_profile_repo: CloudVoiceProfileRepository,
         model_repo: SpeechBrainModelRepository,
         thresholds: QualityThresholds | None = None,
         azure_blob_repo: Any = None,
@@ -84,10 +84,14 @@ class VoiceService:
         self.embedding_dim = model_repo.get_embedding_dim()
         self.model_tag = model_repo.get_model_tag()
         
-        # Thresholds
+        # Thresholds - IMPROVED for better accuracy
         self.enrollment_threshold = 0.76
-        self.cosine_threshold = 0.78 if self.model_tag == "xvector" else 0.70
-        self.verification_threshold = max(self.cosine_threshold + 0.05, 0.80)
+        # Increased from 0.70/0.78 to 0.75/0.80 for better speaker discrimination
+        self.cosine_threshold = 0.80 if self.model_tag == "xvector" else 0.75
+        self.verification_threshold = max(self.cosine_threshold + 0.05, 0.82)
+        # NEW: Margin threshold for speaker switching (prevent false switches)
+        self.speaker_switch_margin = 0.06  # Top-2 margin requirement
+        self.speaker_switch_hits_required = 3  # Require 3 consecutive hits
         self.angle_cap = float(np.deg2rad(ANGLE_CAP_DEG))
         self.z_threshold = 2.2
         self.enroll_min_similarity = 0.63 if self.model_tag == "ecapa" else 0.68
@@ -117,6 +121,9 @@ class VoiceService:
         logger.info(
             f"Voice Service initialized | model={self.model_tag} | dim={self.embedding_dim}"
         )
+        # Embedding caches for performance
+        self._embedding_cache: Dict[str, np.ndarray] = {}
+        self._mean_cache: Dict[str, np.ndarray] = {}
     
     def _get_user_from_api(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch user info from .NET API."""
@@ -338,7 +345,46 @@ class VoiceService:
         
         return response
     
-    def identify_speaker(self, audio_bytes: bytes) -> Dict[str, Any]:
+    async def get_defense_session_users(self, session_id: str) -> Optional[List[str]]:
+        """Fetch list of user IDs from defense session.
+        
+        Args:
+            session_id: Defense session ID
+            
+        Returns:
+            List of user IDs or None if failed
+        """
+        from app.config import Config
+        
+        try:
+            url = f"{Config.AUTH_SERVICE_BASE_URL}/api/defense-sessions/{session_id}/users"
+            
+            async with httpx.AsyncClient(
+                verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                timeout=Config.AUTH_SERVICE_TIMEOUT
+            ) as client:
+                response = await client.get(url)
+                
+                if response.status_code != 200:
+                    logger.error(f"Failed to fetch defense session users: {response.status_code}")
+                    return None
+                
+                data = response.json()
+                
+                # Extract user IDs from response
+                if "data" in data and isinstance(data["data"], list):
+                    user_ids = [user["id"] for user in data["data"] if "id" in user]
+                    logger.info(f"✅ Fetched {len(user_ids)} users from defense session {session_id}")
+                    return user_ids
+                
+                logger.warning(f"Invalid response format from defense session API")
+                return None
+                
+        except Exception as e:
+            logger.exception(f"Error fetching defense session users: {e}")
+            return None
+    
+    def identify_speaker(self, audio_bytes: bytes, whitelist_user_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Identify speaker from audio.
         
@@ -379,9 +425,10 @@ class VoiceService:
                 "quality": quality,
             }
         
-        # Get all enrolled profiles
-        enrolled_profiles = self._get_enrolled_profiles()
-        logger.info(f"🔍 Identify: Found {len(enrolled_profiles)} enrolled profiles")
+        # Get enrolled profiles (batch optimized)
+        enrolled_profiles = self._get_enrolled_profiles_batch(whitelist_user_ids)
+        logger.info(f"🔍 Identify: Using {len(enrolled_profiles)} enrolled profiles"
+        )
         
         if not enrolled_profiles:
             return {
@@ -918,6 +965,61 @@ class VoiceService:
             except Exception as e:
                 logger.warning(f"Failed to load profile {user_id}: {e}")
         return enrolled
+
+    def _get_enrolled_profiles_batch(
+        self,
+        whitelist_user_ids: Optional[List[str]] = None,
+        max_workers: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Get enrolled profiles in parallel (thread pool) and precompute normalized vectors."""
+        import concurrent.futures
+
+        all_ids = self.profile_repo.list_profiles()
+        if whitelist_user_ids:
+            id_set = set(whitelist_user_ids)
+            target_ids = [uid for uid in all_ids if uid in id_set]
+        else:
+            target_ids = all_ids
+
+        def load_one(uid: str) -> Optional[Dict[str, Any]]:
+            try:
+                profile = self.profile_repo.load_profile(uid)
+                if profile.get("enrollment_status") != "enrolled" or profile.get("enrollment_count", 0) < 3:
+                    return None
+                embeddings = self.profile_repo.get_embeddings(uid)
+                if not embeddings:
+                    return None
+                # Normalize embeddings matrix
+                mat = np.stack(embeddings, axis=0).astype(np.float32)
+                norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-6
+                norm_mat = mat / norms
+                profile["embeddings"] = embeddings  # keep raw if needed
+                profile["embeddings_norm"] = norm_mat
+
+                # Cache normalized matrix
+                self._embedding_cache[uid] = norm_mat
+
+                # Prepare mean embedding if present
+                raw_mean = profile.get("mean_embedding")
+                if raw_mean is not None:
+                    mean_arr = np.asarray(raw_mean, dtype=np.float32).reshape(-1)
+                    if mean_arr.size == self.embedding_dim:
+                        mean_norm = mean_arr / (np.linalg.norm(mean_arr) + 1e-6)
+                        profile["mean_embedding_norm"] = mean_norm
+                        self._mean_cache[uid] = mean_norm
+                return profile
+            except Exception as e:
+                logger.warning(f"Failed to load profile {uid}: {e}")
+                return None
+
+        enrolled: List[Dict[str, Any]] = []
+        if not target_ids:
+            return enrolled
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for prof in ex.map(load_one, target_ids):
+                if prof:
+                    enrolled.append(prof)
+        return enrolled
     
     def _calculate_candidate_scores(
         self,
@@ -929,36 +1031,31 @@ class VoiceService:
         candidates = []
         
         for profile in profiles:
-            raw_mean = profile.get("mean_embedding")
-            mean_emb = None
+            mean_vec = profile.get("mean_embedding_norm")
             mean_cosine = None
             mean_angle = None
-            if raw_mean is not None:
-                mean_arr = np.asarray(raw_mean, dtype=np.float32).reshape(-1)
-                if mean_arr.size == self.embedding_dim:
-                    norm = np.linalg.norm(mean_arr) + 1e-6
-                    mean_vec = mean_arr / norm
-                    mean_cosine = float(np.clip(np.dot(probe_norm, mean_vec), -1.0, 1.0))
-                    mean_angle = float(np.arccos(mean_cosine))
-                    mean_emb = mean_vec
-            
-            sample_vecs = []
-            for emb in profile.get("embeddings", []):
-                arr = np.asarray(emb, dtype=np.float32).reshape(-1)
-                if arr.size != self.embedding_dim:
+            if isinstance(mean_vec, np.ndarray) and mean_vec.size == self.embedding_dim:
+                mean_cosine = float(np.clip(np.dot(probe_norm, mean_vec), -1.0, 1.0))
+                mean_angle = float(np.arccos(mean_cosine))
+
+            sample_matrix = profile.get("embeddings_norm")
+            if sample_matrix is None:
+                # Fallback: build normalized matrix on the fly
+                sample_vecs = []
+                for emb in profile.get("embeddings", []):
+                    arr = np.asarray(emb, dtype=np.float32).reshape(-1)
+                    if arr.size != self.embedding_dim:
+                        continue
+                    norm = np.linalg.norm(arr)
+                    if norm < 1e-6:
+                        continue
+                    sample_vecs.append(arr / norm)
+                if not sample_vecs and mean_vec is None:
                     continue
-                norm = np.linalg.norm(arr)
-                if norm < 1e-6:
-                    continue
-                sample_vecs.append(arr / norm)
-            
-            if not sample_vecs and mean_cosine is None:
-                continue
-            
-            if not sample_vecs and mean_emb is not None:
-                sample_vecs = [mean_emb]
-            
-            sample_matrix = np.stack(sample_vecs, axis=0)
+                if not sample_vecs and mean_vec is not None:
+                    sample_vecs = [mean_vec]
+                sample_matrix = np.stack(sample_vecs, axis=0)
+
             sample_cosines = np.clip(sample_matrix @ probe_norm, -1.0, 1.0)
             max_sample_cosine = float(np.max(sample_cosines))
             avg_sample_cosine = float(np.mean(sample_cosines))

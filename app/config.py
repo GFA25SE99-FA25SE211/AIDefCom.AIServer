@@ -67,6 +67,13 @@ class Config:
     # Voice Enrollment Settings
     MAX_ENROLLMENT_COUNT: int = 3  # Maximum enrollment samples per user
     
+    # Voice Authentication Thresholds (tunable via env vars)
+    VOICE_COSINE_THRESHOLD_XVECTOR: float = float(os.getenv("VOICE_COSINE_THRESHOLD_XVECTOR", "0.80"))
+    VOICE_COSINE_THRESHOLD_ECAPA: float = float(os.getenv("VOICE_COSINE_THRESHOLD_ECAPA", "0.75"))
+    VOICE_SPEAKER_LOCK_DECAY_SECONDS: float = float(os.getenv("VOICE_SPEAKER_LOCK_DECAY_SECONDS", "5.0"))
+    VOICE_SPEAKER_SWITCH_MARGIN: float = float(os.getenv("VOICE_SPEAKER_SWITCH_MARGIN", "0.06"))
+    VOICE_SPEAKER_SWITCH_HITS_REQUIRED: int = int(os.getenv("VOICE_SPEAKER_SWITCH_HITS_REQUIRED", "3"))
+    
     # Application
     APP_TITLE: str = "AIDefCom AI Service"
     APP_DESCRIPTION: str = "Speech-to-Text + Voice Authentication"

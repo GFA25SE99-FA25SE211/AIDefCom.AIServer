@@ -22,14 +22,18 @@ async def websocket_stt(
     """
     WebSocket endpoint for streaming speech-to-text.
     
-    Query parameters:
+    Query parameters (optional):
         - speaker: Initial speaker label (default: "Đang xác định")
         - phrases: Additional phrase hints separated by | or ,
-        - user_id: Optional user ID for transcript association
+        - defense_session_id: Defense session ID to filter speaker identification
+        
+    Backend automatically identifies speaker from audio - no need to send user_id.
+    If defense_session_id is provided, speaker identification will only match against
+    users enrolled in that defense session (fetched from /api/defense-sessions/{id}/users).
         
     Client can send:
         - Binary data: Audio chunks for recognition
-        - Text "stop": End session and save transcript to database
+        - Text "stop": End session and save transcript to external API
     """
     try:
         await ws.accept()
