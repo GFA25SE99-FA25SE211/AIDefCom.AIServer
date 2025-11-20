@@ -210,9 +210,12 @@ audio_file: <binary audio file>
 ## 🎙️ Speech-to-Text WebSocket
 
 ### WebSocket Endpoint
-**Endpoint:** `ws://<host>/ws/stt` (hoặc `wss://` cho HTTPS)
+**Endpoint:** `wss://<host>/ws/stt`
 
 Real-time speech-to-text streaming với Azure Cognitive Services.
+
+Operational notes:
+- Không sử dụng background workers. Các lỗi lưu transcript (sau 3 lần thử) sẽ chỉ được ghi log, không có retry nền.
 
 #### Connection
 ```javascript
@@ -243,6 +246,15 @@ Sau khi connect, FE có thể gửi JSON message để config:
 }
 ```
 
+**Query Parameters (URL):**
+- `defense_session_id` (string, optional): ID của defense session để filter speaker identification
+
+**Example with defense session:**
+```javascript
+const defenseSessionId = "550e8400-e29b-41d4-a716-446655440000";
+const ws = new WebSocket(`wss://<your-app>.azurewebsites.net/ws/stt?defense_session_id=${defenseSessionId}`);
+```
+
 **Fields:**
 - `session_id` (string, optional): Session ID để group transcripts
 - `lang` (string, optional): Language code (default: "vi-VN")
@@ -250,6 +262,8 @@ Sau khi connect, FE có thể gửi JSON message để config:
 
 **⚠️ Lưu ý quan trọng:**
 - **KHÔNG cần gửi `user_id` hay `speaker`** - Backend sẽ tự động nhận diện người nói từ audio bằng voice identification
+- **Nếu có `defense_session_id`**: Backend chỉ identify trong danh sách users của defense session đó (gọi `/api/defense-sessions/{id}/users`)
+- **Nếu không có `defense_session_id`**: Backend identify trong TẤT CẢ users đã enroll
 - Speaker name và user_id sẽ được trả về trong events `recognized`
 
 #### Sending Audio
@@ -372,7 +386,7 @@ ws.onmessage = (event) => {
   "event": "session_stopped",
   "session_id": "abc123",
   "total_lines": 15,
-  "message": "Session ended and transcript saved"
+  "message": "Session ended; transcript save attempted"
 }
 ```
 
@@ -394,7 +408,7 @@ ws.send("stop");
 ws.close();
 ```
 
-**Note:** Khi kết thúc session, transcript sẽ tự động được lưu vào external API `/api/transcripts`.
+**Note:** Khi kết thúc session, backend sẽ cố gắng lưu transcript vào external API `/api/transcripts` với tối đa 3 lần thử nội tuyến (best-effort). Nếu vẫn thất bại, lỗi sẽ được ghi log; không có cơ chế retry nền.
 
 #### Audio Requirements
 - **Format:** PCM 16-bit, mono
@@ -415,15 +429,13 @@ Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
 ```json
 {
   "session_id": "session_123",
-  "question_text": "AI là gì?",
-  "threshold": 0.85
+  "question_text": "AI là gì?"
 }
 ```
 
 **Fields:**
 - `session_id` (string, required): Session ID
 - `question_text` (string, required): Nội dung câu hỏi
-- `threshold` (float, optional): Ngưỡng tương đồng (default: 0.85)
 
 #### Response (Not Duplicate)
 ```json
@@ -463,17 +475,15 @@ Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
 ```json
 {
   "session_id": "session_123",
-  "question_text": "Machine Learning hoạt động thế nào?",
-  "speaker": "Nguyen Van A",
-  "timestamp": "2025-11-16T10:30:00Z"
+  "question_text": "Machine Learning hoạt động thế nào?"
 }
 ```
 
 **Fields:**
 - `session_id` (string, required): Session ID
 - `question_text` (string, required): Nội dung câu hỏi
-- `speaker` (string, optional): Người hỏi
-- `timestamp` (string, optional): Thời gian hỏi (ISO format)
+
+**Note:** `speaker` và `timestamp` sẽ được backend tự động generate.
 
 #### Response
 ```json
@@ -496,11 +506,15 @@ Check duplicate + register nếu không trùng (một bước).
 ```json
 {
   "session_id": "session_123",
-  "question_text": "Deep Learning khác gì Machine Learning?",
-  "speaker": "Tran Thi B",
-  "timestamp": "2025-11-16T10:35:00Z"
+  "question_text": "Deep Learning khác gì Machine Learning?"
 }
 ```
+
+**Fields:**
+- `session_id` (string, required): Session ID
+- `question_text` (string, required): Nội dung câu hỏi
+
+**Note:** Backend tự động set `threshold=0.85`, `speaker="Khách"`, và `timestamp=current_time`.
 
 #### Response (Registered)
 ```json
@@ -696,10 +710,6 @@ Frontend nên config các URL sau:
 // Production
 const API_BASE_URL = 'https://<your-app>.azurewebsites.net';
 const WS_BASE_URL = 'wss://<your-app>.azurewebsites.net';
-
-// Development (local)
-const API_BASE_URL = 'http://localhost:8000';
-const WS_BASE_URL = 'ws://localhost:8000';
 ```
 
 ---
