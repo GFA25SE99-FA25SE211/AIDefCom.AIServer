@@ -11,24 +11,35 @@ from repositories.cloud_voice_profile_repository import CloudVoiceProfileReposit
 from repositories.models.speechbrain_model import SpeechBrainModelRepository
 from repositories.azure_blob_repository import AzureBlobRepository
 from repositories.sql_server_repository import SQLServerRepository
+from repositories.interfaces.i_sql_server_repository import ISQLServerRepository
 from services.speech_service import SpeechService
 from services.voice_service import VoiceService, QualityThresholds
+from services.question_service import QuestionService
+from services.redis_service import get_redis_service
+
+# Import interfaces
+from services.interfaces.i_voice_service import IVoiceService
+from services.interfaces.i_speech_service import ISpeechService
+from services.interfaces.i_question_service import IQuestionService
+from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
+from repositories.interfaces.i_speech_repository import ISpeechRepository
 
 logger = logging.getLogger(__name__)
 
 
 # Singleton instances
-_azure_speech_repo: AzureSpeechRepository | None = None
-_cloud_voice_profile_repo: CloudVoiceProfileRepository | None = None
+_azure_speech_repo: ISpeechRepository | None = None
+_cloud_voice_profile_repo: IVoiceProfileRepository | None = None
 _speechbrain_model_repo: SpeechBrainModelRepository | None = None
 _azure_blob_repo: AzureBlobRepository | None = None
-_sql_server_repo: SQLServerRepository | None = None
-_voice_service: VoiceService | None = None
-_speech_service: SpeechService | None = None
+_sql_server_repo: ISQLServerRepository | None = None
+_voice_service: IVoiceService | None = None
+_speech_service: ISpeechService | None = None
+_question_service: IQuestionService | None = None
 
 
 @lru_cache()
-def get_azure_speech_repository() -> AzureSpeechRepository:
+def get_azure_speech_repository() -> ISpeechRepository:
     """Get Azure Speech repository instance."""
     global _azure_speech_repo
     if _azure_speech_repo is None:
@@ -41,15 +52,18 @@ def get_azure_speech_repository() -> AzureSpeechRepository:
 
 
 @lru_cache()
-def get_voice_profile_repository() -> CloudVoiceProfileRepository:
-    """Get cloud voice profile repository instance (Azure Blob only)."""
+def get_voice_profile_repository() -> IVoiceProfileRepository:
+    """Get cloud voice profile repository instance (Azure Blob only) with optional Redis L2 cache."""
     global _cloud_voice_profile_repo
     if _cloud_voice_profile_repo is None:
         blob = get_azure_blob_repository()
         if blob is None:
             raise RuntimeError("Azure Blob Storage is required but not configured. Set AZURE_STORAGE_CONNECTION_STRING.")
-        _cloud_voice_profile_repo = CloudVoiceProfileRepository(blob_repo=blob)
-        logger.info("Using CloudVoiceProfileRepository (Azure Blob Storage only)")
+        _cloud_voice_profile_repo = CloudVoiceProfileRepository(
+            blob_repo=blob,
+            redis_service=get_redis_service(),
+        )
+        logger.info("Using CloudVoiceProfileRepository (Azure Blob Storage + Redis L2 cache)")
     return _cloud_voice_profile_repo
 
 
@@ -86,7 +100,7 @@ def get_azure_blob_repository() -> AzureBlobRepository | None:
 
 
 @lru_cache()
-def get_sql_server_repository() -> SQLServerRepository | None:
+def get_sql_server_repository() -> ISQLServerRepository | None:
     """Get SQL Server repository instance.
     
     Supports two configuration methods:
@@ -130,7 +144,7 @@ def get_sql_server_repository() -> SQLServerRepository | None:
 
 
 @lru_cache()
-def get_voice_service() -> VoiceService:
+def get_voice_service() -> IVoiceService:
     """Get voice service instance."""
     global _voice_service
     if _voice_service is None:
@@ -156,12 +170,25 @@ def get_voice_service() -> VoiceService:
 
 
 @lru_cache()
-def get_speech_service() -> SpeechService:
+def get_speech_service() -> ISpeechService:
     """Get speech service instance."""
     global _speech_service
     if _speech_service is None:
         _speech_service = SpeechService(
             azure_speech_repo=get_azure_speech_repository(),
             voice_service=get_voice_service(),
+            redis_service=get_redis_service(),
         )
     return _speech_service
+
+
+@lru_cache()
+def get_question_service() -> IQuestionService:
+    """Get question service instance."""
+    global _question_service
+    if _question_service is None:
+        _question_service = QuestionService(
+            redis_service=get_redis_service(),
+            session_ttl=7200,
+        )
+    return _question_service

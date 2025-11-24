@@ -11,8 +11,9 @@ import httpx
 import numpy as np
 
 from core.exceptions import VoiceProfileNotFoundError, VoiceAuthenticationError, AudioValidationError
-from repositories.cloud_voice_profile_repository import CloudVoiceProfileRepository
+from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
 from repositories.models.speechbrain_model import SpeechBrainModelRepository
+from services.interfaces.i_voice_service import IVoiceService
 from services.audio_processing.audio_utils import (
     AudioQualityAnalyzer,
     NoiseFilter,
@@ -40,12 +41,12 @@ class QualityThresholds:
     snr_floor_db: float = 15.0
     clip_ceiling: float = 0.02
 
-class VoiceService:
+class VoiceService(IVoiceService):
     """Voice authentication business logic service."""
     
     def __init__(
         self,
-        voice_profile_repo: CloudVoiceProfileRepository,
+        voice_profile_repo: IVoiceProfileRepository,
         model_repo: SpeechBrainModelRepository,
         thresholds: QualityThresholds | None = None,
         azure_blob_repo: Any = None,
@@ -55,7 +56,7 @@ class VoiceService:
         Initialize voice service.
         
         Args:
-            voice_profile_repo: Repository for voice profile persistence
+            voice_profile_repo: Interface for voice profile persistence
             model_repo: Repository for SpeechBrain model
             thresholds: Quality thresholds for audio validation
             azure_blob_repo: Optional Azure Blob Storage repository

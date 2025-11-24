@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover - optional dependency
     pyodbc = None  # type: ignore
 
 from core.exceptions import AIServerException
+from repositories.interfaces.i_sql_server_repository import ISQLServerRepository
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,8 @@ class SQLServerError(AIServerException):
     pass
 
 
-class SQLServerRepository:
-    """Repository for SQL Server operations on AppUser table."""
+class SQLServerRepository(ISQLServerRepository):
+    """Concrete implementation of ISQLServerRepository for AppUser + transcripts."""
     
     def __init__(
         self,

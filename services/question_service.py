@@ -4,22 +4,24 @@ from datetime import datetime
 from rapidfuzz import fuzz
 import string
 from typing import Optional
-from services.redis_service import get_redis_service
+from repositories.interfaces.i_redis_service import IRedisService
+from services.interfaces.i_question_service import IQuestionService
 
 
-class QuestionService:
+class QuestionService(IQuestionService):
     """Service for detecting duplicate questions in a session."""
     
-    def __init__(self, session_ttl: int = 7200):
-        """Initialize with Redis for production use."""
+    def __init__(self, redis_service: Optional[IRedisService] = None, session_ttl: int = 7200):
+        """Initialize with Redis service interface."""
         self.session_ttl = session_ttl
-        self._redis_service = None
+        self._redis_service = redis_service
         self._semantic_model = None  # Lazy load SBERT
     
     @property
-    def redis_service(self):
+    def redis_service(self) -> IRedisService:
         """Lazy load Redis service."""
         if self._redis_service is None:
+            from services.redis_service import get_redis_service
             self._redis_service = get_redis_service()
         return self._redis_service
     

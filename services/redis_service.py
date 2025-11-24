@@ -10,11 +10,12 @@ from typing import Any, Optional
 import redis.asyncio as aioredis
 
 from app.config import Config
+from repositories.interfaces.i_redis_service import IRedisService
 
 logger = logging.getLogger(__name__)
 
 
-class RedisService:
+class RedisService(IRedisService):
     """Service for Azure Cache for Redis operations with async support."""
     
     def __init__(self) -> None:

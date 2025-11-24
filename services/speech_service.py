@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import AsyncGenerator, Dict, Any, Iterable, Optional, TYPE_CHECKING
+from typing import AsyncGenerator, Dict, Any, Iterable, Optional, TYPE_CHECKING, List
 
 import numpy as np
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from repositories.azure_speech_repository import AzureSpeechRepository
+from repositories.interfaces.i_speech_repository import ISpeechRepository
+from services.interfaces.i_speech_service import ISpeechService
+from services.interfaces.i_voice_service import IVoiceService
 from services.audio_processing.audio_utils import (
     NoiseFilter,
     pcm_to_wav,
@@ -27,10 +29,7 @@ from services.audio_processing.speech_utils import (
     calculate_speech_confidence,
 )
 from services.multi_speaker_tracker import MultiSpeakerTracker
-from services.redis_service import get_redis_service
-
-if TYPE_CHECKING:
-    from services.voice_service import VoiceService
+from repositories.interfaces.i_redis_service import IRedisService
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +51,14 @@ def _normalize_speaker_label(name: str | None) -> str:
     return normalized
 
 
-class SpeechService:
+class SpeechService(ISpeechService):
     """Speech-to-text service with speaker identification."""
     
     def __init__(
         self,
-        azure_speech_repo: AzureSpeechRepository,
-        voice_service: Optional["VoiceService"] = None,
+        azure_speech_repo: ISpeechRepository,
+        voice_service: Optional[IVoiceService] = None,
+        redis_service: Optional[IRedisService] = None,
     ) -> None:
         """
         Initialize speech service.
@@ -66,14 +66,26 @@ class SpeechService:
         Args:
             azure_speech_repo: Repository for Azure Speech operations
             voice_service: Optional voice authentication service
+            redis_service: Optional Redis service for caching
         """
         self.azure_speech_repo = azure_speech_repo
         self.voice_service = voice_service
+        self.redis_service = redis_service
         self.noise_filter = NoiseFilter()
         self.sample_rate = azure_speech_repo.sample_rate
-        self.redis_service = get_redis_service()
         
         logger.info("Speech Service initialized with Redis caching")
+
+    def get_defense_session_users(self, session_id: str) -> Optional[List[str]]:
+        """Return list of user IDs enrolled in a defense session (delegates to voice service).
+        If voice service not available or session invalid, returns None.
+        """
+        if not self.voice_service:
+            return None
+        try:
+            return self.voice_service.get_defense_session_users(session_id)
+        except Exception:
+            return None
     
     def _score_to_confidence(self, score: Optional[float]) -> Optional[str]:
         """Map cosine similarity scores to human-readable confidence levels."""
