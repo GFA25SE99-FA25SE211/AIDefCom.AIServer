@@ -15,19 +15,21 @@ from cachetools import LRUCache
 
 from core.exceptions import VoiceProfileNotFoundError
 from repositories.azure_blob_repository import AzureBlobRepository
-from services.redis_service import RedisService, get_redis_service
+from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
+from repositories.interfaces.i_redis_service import IRedisService
 from repositories.models.voice_profile_model import VoiceProfile as VoiceProfileModel
 import asyncio
 
 logger = logging.getLogger(__name__)
 
 
-class CloudVoiceProfileRepository:
+class CloudVoiceProfileRepository(IVoiceProfileRepository):
     """Repository that reads/writes profile JSON with L1/L2/L3 cache."""
 
-    def __init__(self, blob_repo: AzureBlobRepository, redis_service: Optional[RedisService] = None) -> None:
+    def __init__(self, blob_repo: AzureBlobRepository, redis_service: Optional[IRedisService] = None) -> None:
         self.blob_repo = blob_repo
-        self.redis_service = redis_service or get_redis_service()
+        # Do not call DI factories here (DIP). If redis_service is None, L2 caching is disabled gracefully.
+        self.redis_service = redis_service
         
         # L1 Cache: In-memory LRU for hot profiles (max 100 profiles ~5MB)
         self._memory_cache: LRUCache = LRUCache(maxsize=100)
@@ -64,7 +66,7 @@ class CloudVoiceProfileRepository:
         except RuntimeError:
             can_use_async = True
 
-        if can_use_async:
+        if can_use_async and self.redis_service is not None:
             try:
                 cached_data = asyncio.run(self.redis_service.get(cache_key))
                 if cached_data:
@@ -88,7 +90,7 @@ class CloudVoiceProfileRepository:
             except Exception as ve:
                 logger.warning(f"VoiceProfile validation failed for {user_id}: {ve}")
             self._memory_cache[user_id] = data
-            if can_use_async:
+            if can_use_async and self.redis_service is not None:
                 try:
                     asyncio.run(self.redis_service.setex(cache_key, self._redis_ttl, json.dumps(data)))
                 except Exception as e:
@@ -118,7 +120,7 @@ class CloudVoiceProfileRepository:
             can_use_async = False
         except RuntimeError:
             can_use_async = True
-        if can_use_async:
+        if can_use_async and self.redis_service is not None:
             try:
                 asyncio.run(self.redis_service.delete(cache_key))
             except Exception as e:

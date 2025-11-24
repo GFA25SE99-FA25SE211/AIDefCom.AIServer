@@ -12,6 +12,7 @@ from typing import AsyncGenerator, Dict, Any, Iterable, Sequence, AsyncIterable
 import azure.cognitiveservices.speech as speechsdk
 
 from core.exceptions import AzureSpeechError
+from repositories.interfaces.i_speech_repository import ISpeechRepository
 from services.audio_processing.audio_utils import pcm_to_wav
 
 logger = logging.getLogger(__name__)
@@ -247,7 +248,7 @@ DEFAULT_PHRASE_HINTS: Sequence[str] = (
 )
 
 
-class AzureSpeechRepository:
+class AzureSpeechRepository(ISpeechRepository):
     """Repository for Azure Speech Service operations."""
     
     def __init__(
@@ -316,6 +317,120 @@ class AzureSpeechRepository:
         logger.info(
             f"Azure Speech Repository initialized | language={language} | region={region} | sr={sample_rate}Hz"
         )
+    
+    async def recognize_continuous_async(
+        self,
+        audio_stream: Any,
+        speaker: str,
+        extra_phrases: Sequence[str] | None = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Implement interface method for continuous recognition.
+        
+        This method is an adapter to the existing ``recognize_stream`` implementation.
+        It accepts either:
+          1. An ``AsyncIterable[bytes]`` of raw PCM frames (will internally create a push stream), or
+          2. An Azure ``PushAudioInputStream`` instance already being fed by caller.
+        
+        Args:
+            audio_stream: AsyncIterable[bytes] OR Azure PushAudioInputStream
+            speaker: Initial speaker label (currently informational / unused by Azure SDK)
+            extra_phrases: Additional phrase hints
+        
+        Yields:
+            Dict events with keys: type (partial|result|nomatch|error), text?, error?
+        """
+        # Case 1: Caller passed an async iterable of PCM bytes – delegate to existing helper.
+        if hasattr(audio_stream, "__aiter__") and not isinstance(audio_stream, speechsdk.audio.PushAudioInputStream):
+            async for evt in self.recognize_stream(audio_stream, extra_phrases=extra_phrases):
+                yield evt
+            return
+
+        # Case 2: Caller passed a PushAudioInputStream (already being written to externally).
+        # We construct a recognizer around it and emit events.
+        fmt = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=self.sample_rate,
+            bits_per_sample=16,
+            channels=1,
+        )
+        try:
+            # If the provided stream is not already an Azure PushAudioInputStream, attempt to wrap.
+            if not isinstance(audio_stream, speechsdk.audio.PushAudioInputStream):
+                push_stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
+                # Attempt best-effort forwarding from supplied object if it is file-like.
+                if hasattr(audio_stream, "read"):
+                    data = audio_stream.read()
+                    if data:
+                        push_stream.write(data)
+                audio_stream = push_stream
+        except Exception as exc:
+            logger.warning(f"Failed to adapt audio_stream to PushAudioInputStream: {exc}")
+            # Fall back: treat as async iterable if possible
+            if hasattr(audio_stream, "__aiter__"):
+                async for evt in self.recognize_stream(audio_stream, extra_phrases=extra_phrases):
+                    yield evt
+                return
+            raise
+
+        audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config,
+        )
+
+        # Combine phrase hints
+        all_hints = list(self.default_phrase_hints)
+        if extra_phrases:
+            all_hints.extend(extra_phrases)
+        if speaker:
+            # Treat speaker label as a weak hint if not too generic
+            lowered = speaker.lower()
+            if lowered not in {"khách", "guest", "unknown"}:
+                all_hints.append(speaker)
+        if all_hints:
+            phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+            for phrase in all_hints:
+                with contextlib.suppress(Exception):
+                    phrase_list.addPhrase(phrase)
+
+        event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
+
+        def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            text = evt.result.text.strip()
+            if text:
+                event_queue.put_nowait({"type": "partial", "text": text})
+
+        def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = evt.result.text.strip()
+                if text:
+                    event_queue.put_nowait({"type": "result", "text": text})
+            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                event_queue.put_nowait({"type": "nomatch"})
+
+        def on_canceled(evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+            if evt.reason == speechsdk.CancellationReason.Error:
+                logger.error(f"Azure Speech error: {evt.error_details}")
+                event_queue.put_nowait({"type": "error", "error": evt.error_details})
+            event_queue.put_nowait(None)
+
+        def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
+            event_queue.put_nowait(None)
+
+        recognizer.recognizing.connect(on_recognizing)
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_session_stopped)
+
+        recognizer.start_continuous_recognition_async()
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            with contextlib.suppress(Exception):
+                recognizer.stop_continuous_recognition_async()
     
     async def recognize_stream(
         self,

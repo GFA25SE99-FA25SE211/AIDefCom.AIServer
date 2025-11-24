@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 
 from api.dependencies import get_speech_service
-from services.speech_service import SpeechService
+from services.interfaces.i_speech_service import ISpeechService
 
 
 router = APIRouter()
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 @router.websocket("/ws/stt")
 async def websocket_stt(
     ws: WebSocket,
-    speech_service: SpeechService = Depends(get_speech_service),
+    speech_service: ISpeechService = Depends(get_speech_service),
 ) -> None:
     """
     WebSocket endpoint for streaming speech-to-text.

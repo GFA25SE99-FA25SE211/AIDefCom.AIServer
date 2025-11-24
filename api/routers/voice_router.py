@@ -8,7 +8,7 @@ from fastapi import APIRouter, File, UploadFile, Depends, Path
 from fastapi.responses import JSONResponse
 
 from api.dependencies import get_voice_service
-from services.voice_service import VoiceService
+from services.interfaces.i_voice_service import IVoiceService
 from api.schemas.voice_schemas import (
     EnrollmentResponse,
     IdentificationResponse,
@@ -63,7 +63,7 @@ def _validate_audio_file(upload: UploadFile, raw: bytes) -> None:
 async def enroll_voice(
     user_id: str = Path(..., description="User ID to enroll voice for"),
     audio_file: UploadFile = File(..., description="Audio file for enrollment (WAV/MP3/FLAC, max 10MB)"),
-    voice_service: VoiceService = Depends(get_voice_service),
+    voice_service: IVoiceService = Depends(get_voice_service),
 ):
     """Enroll voice sample for a specific user.
     

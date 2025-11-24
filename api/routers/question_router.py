@@ -1,6 +1,6 @@
 """REST API endpoints for question duplicate detection (Swagger-enhanced)."""
 import traceback
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from api.schemas.question_schemas import (
     QuestionCheckRequest,
     QuestionCheckResponse,
@@ -10,12 +10,10 @@ from api.schemas.question_schemas import (
     ClearQuestionsResponse,
     SimilarQuestion,
 )
-from services.question_service import QuestionService
+from services.interfaces.i_question_service import IQuestionService
+from api.dependencies import get_question_service
 
 router = APIRouter(prefix="/questions", tags=["Questions"])
-
-# Initialize service (TTL 2h)
-question_service = QuestionService(session_ttl=7200)
 
 
 @router.post(
@@ -28,7 +26,10 @@ question_service = QuestionService(session_ttl=7200)
         500: {"description": "Lỗi hệ thống"},
     },
 )
-async def check_duplicate(request: QuestionCheckRequest):
+async def check_duplicate(
+    request: QuestionCheckRequest,
+    question_service: IQuestionService = Depends(get_question_service),
+):
     """Check if a question is duplicate in the session (threshold=0.85)."""
     try:
         is_duplicate, similar = await question_service.check_duplicate(
@@ -71,7 +72,10 @@ async def check_duplicate(request: QuestionCheckRequest):
         500: {"description": "Lỗi hệ thống"},
     },
 )
-async def register_question(request: QuestionRegisterRequest):
+async def register_question(
+    request: QuestionRegisterRequest,
+    question_service: IQuestionService = Depends(get_question_service),
+):
     """Register a new question (speaker='Khách', timestamp tự sinh)."""
     try:
         from datetime import datetime
@@ -103,7 +107,10 @@ async def register_question(request: QuestionRegisterRequest):
         500: {"description": "Lỗi hệ thống"},
     },
 )
-async def check_and_register(request: QuestionRegisterRequest):
+async def check_and_register(
+    request: QuestionRegisterRequest,
+    question_service: IQuestionService = Depends(get_question_service),
+):
     """Check duplicate then register if unique (threshold=0.85)."""
     try:
         print(f"🔍 API: Checking duplicate for: {request.question_text[:50]}...")
@@ -159,7 +166,10 @@ async def check_and_register(request: QuestionRegisterRequest):
         500: {"description": "Lỗi hệ thống"},
     },
 )
-async def get_session_questions(session_id: str):
+async def get_session_questions(
+    session_id: str,
+    question_service: IQuestionService = Depends(get_question_service),
+):
     """List all questions in a session."""
     try:
         questions = await question_service.get_questions(session_id)
@@ -182,7 +192,10 @@ async def get_session_questions(session_id: str):
         500: {"description": "Lỗi hệ thống"},
     },
 )
-async def clear_session_questions(session_id: str):
+async def clear_session_questions(
+    session_id: str,
+    question_service: IQuestionService = Depends(get_question_service),
+):
     """Clear all questions for a session and return count."""
     try:
         deleted = await question_service.clear_questions(session_id)
