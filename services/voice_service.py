@@ -132,10 +132,14 @@ class VoiceService(IVoiceService):
             return None
         try:
             import requests
-            url = f"{self.auth_api_base}/auth/users/{user_id}"
+            url = f"{self.auth_api_base}/api/auth/users/{user_id}"
             resp = requests.get(url, verify=self.auth_verify_ssl, timeout=5)
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                # Extract from ApiResponse wrapper if present
+                if isinstance(data, dict) and "data" in data:
+                    return data["data"]
+                return data
             logger.warning(f"User API returned {resp.status_code} for user_id={user_id}")
             return None
         except Exception as e:
@@ -201,10 +205,11 @@ class VoiceService(IVoiceService):
         # Fetch user info from .NET API to validate user exists
         user_info = self._get_user_from_api(user_id)
         if user_info is None:
-            return {"error": f"User not found or API unavailable: {user_id}", "id": user_id}
-        
-        # Extract name from API response
-        user_name = user_info.get("fullName") or user_info.get("name") or user_id
+            logger.warning(f"User API unavailable or user not found: {user_id}. Proceeding with enrollment anyway.")
+            user_name = user_id  # Fallback to user_id as name
+        else:
+            # Extract name from API response (could be in "data" wrapper)
+            user_name = user_info.get("fullName") or user_info.get("name") or user_id
         
         # Load or auto-create profile
         try:
