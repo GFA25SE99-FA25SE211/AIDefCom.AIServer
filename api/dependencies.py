@@ -178,6 +178,7 @@ def get_speech_service() -> ISpeechService:
             azure_speech_repo=get_azure_speech_repository(),
             voice_service=get_voice_service(),
             redis_service=get_redis_service(),
+            question_service=get_question_service(),
         )
     return _speech_service
 
