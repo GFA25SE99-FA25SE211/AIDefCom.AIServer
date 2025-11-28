@@ -66,6 +66,32 @@ class IQuestionService(ABC):
         pass
     
     @abstractmethod
+    async def check_and_register(
+        self,
+        session_id: str,
+        question_text: str,
+        speaker: str = "Khách",
+        timestamp: str = None,
+        threshold: float = 0.85,
+        semantic_threshold: float = 0.85
+    ) -> Dict[str, Any]:
+        """
+        Atomic operation: check duplicate and register if not duplicate.
+        
+        Args:
+            session_id: Session identifier
+            question_text: Question text to check and register
+            speaker: Speaker name (default "Khách")
+            timestamp: UTC ISO 8601 timestamp (auto-generated if None)
+            threshold: Fuzzy similarity threshold (default 0.85)
+            semantic_threshold: Semantic similarity threshold (default 0.85)
+            
+        Returns:
+            Dict with is_duplicate, similar, registered, question_id, total_questions, question_text
+        """
+        pass
+    
+    @abstractmethod
     async def clear_questions(self, session_id: str) -> int:
         """
         Clear all questions for session.

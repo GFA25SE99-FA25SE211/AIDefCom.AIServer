@@ -144,6 +144,38 @@ class QuestionService(IQuestionService):
         
         return [q['text'] for q in questions]
     
+    async def check_and_register(
+        self,
+        session_id: str,
+        question_text: str,
+        speaker: str = "Khách",
+        timestamp: str = None,
+        threshold: float = 0.85,
+        semantic_threshold: float = 0.85
+    ) -> dict:
+        """Atomic: check duplicate and register if unique."""
+        is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
+        
+        registered = False
+        question_id = None
+        
+        if not is_dup:
+            reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
+            registered = reg.get("success", False)
+            question_id = reg.get("question_id")
+        
+        # Get total questions count (after possible registration)
+        existing = await self.get_questions(session_id)
+        
+        return {
+            "is_duplicate": is_dup,
+            "similar": similar,
+            "registered": registered,
+            "question_id": question_id,
+            "total_questions": len(existing),
+            "question_text": question_text,
+        }
+    
     async def clear_questions(self, session_id: str) -> int:
         """Clear all questions for a session."""
         key = self._get_session_key(session_id)

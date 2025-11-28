@@ -15,6 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 from repositories.interfaces.i_speech_repository import ISpeechRepository
 from services.interfaces.i_speech_service import ISpeechService
 from services.interfaces.i_voice_service import IVoiceService
+from services.interfaces.i_question_service import IQuestionService
 from services.audio_processing.audio_utils import (
     NoiseFilter,
     pcm_to_wav,
@@ -52,13 +53,14 @@ def _normalize_speaker_label(name: str | None) -> str:
 
 
 class SpeechService(ISpeechService):
-    """Speech-to-text service with speaker identification."""
+    """Speech-to-text service with speaker identification and question capture support."""
     
     def __init__(
         self,
         azure_speech_repo: ISpeechRepository,
         voice_service: Optional[IVoiceService] = None,
         redis_service: Optional[IRedisService] = None,
+        question_service: Optional[IQuestionService] = None,
     ) -> None:
         """
         Initialize speech service.
@@ -67,14 +69,20 @@ class SpeechService(ISpeechService):
             azure_speech_repo: Repository for Azure Speech operations
             voice_service: Optional voice authentication service
             redis_service: Optional Redis service for caching
+            question_service: Optional question duplicate detection service
         """
         self.azure_speech_repo = azure_speech_repo
         self.voice_service = voice_service
         self.redis_service = redis_service
+        self.question_service = question_service
         self.noise_filter = NoiseFilter()
         self.sample_rate = azure_speech_repo.sample_rate
         
-        logger.info("Speech Service initialized with Redis caching")
+        logger.info("Speech Service initialized (Redis caching, QuestionService=%s)", bool(self.question_service))
+        # Question mode state (per session_id)
+        self._question_mode: Dict[str, bool] = {}
+        self._question_buffer: Dict[str, List[str]] = {}
+        self._question_last_final: Dict[str, Optional[str]] = {}
 
     def get_defense_session_users(self, session_id: str) -> Optional[List[str]]:
         """Return list of user IDs enrolled in a defense session (delegates to voice service).
@@ -937,12 +945,65 @@ class SpeechService(ISpeechService):
                                         logger.warning("Audio queue full, dropping frame")
                         
                         elif "text" in data:
-                            # Text command (e.g., "stop")
-                            message = data["text"].strip().lower()
+                            # Text command (e.g., control messages: stop, q:start, q:end)
+                            message_raw = data["text"].strip()
+                            message = message_raw.lower()
                             if message == "stop":
                                 logger.info("Received 'stop' command from client")
                                 stop_event.set()
                                 break
+                            elif message == "q:start":
+                                # Begin question capture mode
+                                self._question_mode[session_id] = True
+                                self._question_buffer[session_id] = []
+                                self._question_last_final[session_id] = None
+                                try:
+                                    await ws.send_json({
+                                        "type": "question_mode_started",
+                                        "session_id": session_id
+                                    })
+                                except Exception:
+                                    pass
+                            elif message == "q:end":
+                                # End question mode and process captured text
+                                if self._question_mode.get(session_id):
+                                    self._question_mode[session_id] = False
+                                    buffered_parts = self._question_buffer.get(session_id, [])
+                                    question_text = " ".join(buffered_parts).strip()
+                                    # Fallback if empty -> use last final
+                                    if not question_text:
+                                        last_final = self._question_last_final.get(session_id)
+                                        if last_final:
+                                            question_text = last_final
+                                    
+                                    # Call QuestionService directly
+                                    if self.question_service and question_text:
+                                        try:
+                                            result = await self.question_service.check_and_register(
+                                                session_id=session_id,
+                                                question_text=question_text,
+                                                speaker=speaker_label or "Khách"
+                                            )
+                                            # Add WebSocket-specific fields
+                                            result["type"] = "question_mode_result"
+                                            result["session_id"] = session_id
+                                            await ws.send_json(result)
+                                        except Exception as e:
+                                            # Send error response
+                                            await ws.send_json({
+                                                "type": "question_mode_result",
+                                                "session_id": session_id,
+                                                "question_text": question_text,
+                                                "error": str(e),
+                                                "is_duplicate": False,
+                                                "registered": False,
+                                                "question_id": None,
+                                                "total_questions": 0,
+                                                "similar": []
+                                            })
+                                # Clear buffer regardless
+                                self._question_buffer.pop(session_id, None)
+                                self._question_last_final.pop(session_id, None)
                         
                         else:
                             # Disconnect event
@@ -999,6 +1060,10 @@ class SpeechService(ISpeechService):
                             "text": text,
                             "user_id": event.get("user_id"),
                         })
+                        # If question mode active, buffer this final text
+                        if self._question_mode.get(session_id):
+                            self._question_buffer.setdefault(session_id, []).append(text)
+                            self._question_last_final[session_id] = text
                         
                         # Cache partial transcript in Redis
                         try:
@@ -1147,14 +1212,13 @@ class SpeechService(ISpeechService):
                 except Exception as send_error:
                     logger.debug(f"Could not send session_saved confirmation: {send_error}")
             
-            # Clear question cache for this session
-            try:
-                from services.question_service import QuestionService
-                question_service = QuestionService()
-                deleted_count = await question_service.clear_questions(session_id)
-                if deleted_count > 0:
-                    logger.info(f"Cleared {deleted_count} questions from cache | session_id={session_id}")
-            except Exception as clear_error:
-                logger.warning(f"Failed to clear question cache: {clear_error}")
+            # Clear question cache for this session (use injected service if available)
+            if self.question_service:
+                try:
+                    deleted_count = await self.question_service.clear_questions(session_id)
+                    if deleted_count > 0:
+                        logger.info(f"Cleared {deleted_count} questions from cache | session_id={session_id}")
+                except Exception as clear_error:
+                    logger.warning(f"Failed to clear question cache: {clear_error}")
             
             logger.info(f"STT session closed | session_id={session_id}")
