@@ -578,7 +578,7 @@ class SpeechService(ISpeechService):
                                 # Flag will be reset after speaker switch (in resolve_speaker_from_history)
                             
                             # Check for acoustic change (pitch/timbre shift)
-                            elif detect_acoustic_change(chunk, previous_audio_chunk, zcr_threshold=0.15):
+                            elif detect_acoustic_change(chunk, previous_audio_chunk, change_threshold=0.3):
                                 logger.debug("🎵 Acoustic change detected")
                                 self._create_tracked_task(
                                     background_tasks,
@@ -663,20 +663,20 @@ class SpeechService(ISpeechService):
                         
                         # NEW: Apply filler word filtering for final results
                         if event_type == "result":
-                            # Filter filler words
-                            filtered_text = filter_filler_words(raw_text)
-                            # Normalize Vietnamese text
+                            # Keep original text without filtering filler words
+                            filtered_text = raw_text
+                            # Normalize Vietnamese text only (keep all words)
                             filtered_text = normalize_vietnamese_text(filtered_text)
                             
-                            # Check if should log (skip noise/pure fillers)
-                            if not should_log_transcript(filtered_text):
-                                logger.debug(f"🚫 Filtered noise-only transcript: '{raw_text}'")
+                            # Check if should log (skip if completely empty after normalization)
+                            if not filtered_text.strip():
+                                logger.debug(f"🚫 Filtered empty transcript: '{raw_text}'")
                                 # Send as noise event instead of skipping
                                 event["type"] = "noise"
                                 event["text"] = ""
                                 event["text_raw"] = raw_text
                             else:
-                                # Update event with filtered text
+                                # Update event with normalized text (keep all words including "là", "thì", etc.)
                                 event["text"] = filtered_text
                                 event["text_raw"] = raw_text  # Keep original for debugging
                                 
@@ -687,9 +687,8 @@ class SpeechService(ISpeechService):
                                 # NEW: Append to speaker tracker
                                 speaker_tracker.append_text(filtered_text)
                         else:
-                            # For partials, apply lighter filtering
-                            filtered_text = filter_filler_words(raw_text, min_word_length=1)
-                            event["text"] = filtered_text if filtered_text else raw_text
+                            # For partials, keep original text
+                            event["text"] = raw_text
                         
                         display_plain = f"{current_speaker}: {event['text']}"
                         event["display"] = display_plain
@@ -856,8 +855,12 @@ class SpeechService(ISpeechService):
         # Parse query parameters
         speaker_label = ws.query_params.get("speaker") or "Đang xác định"
         phrase_param = ws.query_params.get("phrases")
-        defense_session_id = ws.query_params.get("defense_session_id")  # Optional: filter identify by session
+        # Support both defense_session_id and session_id (backward compatibility)
+        defense_session_id = ws.query_params.get("defense_session_id") or ws.query_params.get("session_id")
         # Note: user_id is NOT required - backend will auto-identify speaker from audio
+        
+        # Debug: Log all query params to verify what frontend is sending
+        logger.info(f"📥 WS Query Params: {dict(ws.query_params)} | defense_session_id={defense_session_id}")
         
         extra_phrases = []
         if phrase_param:
@@ -976,31 +979,93 @@ class SpeechService(ISpeechService):
                                         if last_final:
                                             question_text = last_final
                                     
-                                    # Call QuestionService directly
+                                    logger.info(f"📝 Question mode ended | text='{question_text[:80]}...'")
+                                    
+                                    # Send ACK immediately to avoid blocking
+                                    try:
+                                        await ws.send_json({
+                                            "type": "question_mode_ended",
+                                            "session_id": session_id,
+                                            "question_text": question_text[:100] if question_text else "",
+                                            "message": "⏳ Đang kiểm tra câu hỏi..."
+                                        })
+                                        logger.info("✅ Sent question_mode_ended ACK")
+                                    except Exception as ack_err:
+                                        logger.warning(f"Failed to send ACK: {ack_err}")
+                                    
+                                    # Process in background (fire-and-forget with tracking)
                                     if self.question_service and question_text:
-                                        try:
-                                            result = await self.question_service.check_and_register(
-                                                session_id=session_id,
-                                                question_text=question_text,
-                                                speaker=speaker_label or "Khách"
-                                            )
-                                            # Add WebSocket-specific fields
-                                            result["type"] = "question_mode_result"
-                                            result["session_id"] = session_id
-                                            await ws.send_json(result)
-                                        except Exception as e:
-                                            # Send error response
-                                            await ws.send_json({
-                                                "type": "question_mode_result",
-                                                "session_id": session_id,
-                                                "question_text": question_text,
-                                                "error": str(e),
-                                                "is_duplicate": False,
-                                                "registered": False,
-                                                "question_id": None,
-                                                "total_questions": 0,
-                                                "similar": []
-                                            })
+                                        import time
+                                        start_time = time.time()
+                                        
+                                        async def _check_and_register_bg():
+                                            try:
+                                                logger.info(f"🔄 Starting background question check | text='{question_text[:50]}'")
+                                                result = await asyncio.wait_for(
+                                                    self.question_service.check_and_register(
+                                                        session_id=session_id,
+                                                        question_text=question_text,
+                                                        speaker=speaker_label or "Khách"
+                                                    ),
+                                                    timeout=15.0  # Increased: model load can take 10s+
+                                                )
+                                                elapsed = time.time() - start_time
+                                                logger.info(f"✅ Question check completed in {elapsed:.2f}s | duplicate={result.get('is_duplicate')}")
+                                                
+                                                # Send result when done
+                                                try:
+                                                    if ws.application_state == WebSocketState.CONNECTED:
+                                                        result["type"] = "question_mode_result"
+                                                        result["session_id"] = session_id
+                                                        await ws.send_json(result)
+                                                        logger.info("✅ Sent question_mode_result")
+                                                    else:
+                                                        logger.warning("⚠️ WS not connected, cannot send result")
+                                                except Exception as send_err:
+                                                    logger.warning(f"Failed to send result: {send_err}")
+                                            except asyncio.TimeoutError:
+                                                logger.error(f"❌ Question check timeout (>15s) | text='{question_text[:50]}'")
+                                                try:
+                                                    if ws.application_state == WebSocketState.CONNECTED:
+                                                        await ws.send_json({
+                                                            "type": "question_mode_result",
+                                                            "session_id": session_id,
+                                                            "question_text": question_text,
+                                                            "error": "Timeout: Kiểm tra câu hỏi quá lâu",
+                                                            "is_duplicate": False,
+                                                            "registered": False,
+                                                            "question_id": None,
+                                                            "total_questions": 0,
+                                                            "similar": []
+                                                        })
+                                                except Exception:
+                                                    pass
+                                            except Exception as e:
+                                                logger.error(f"❌ Background question check failed: {e}", exc_info=True)
+                                                # Send error response
+                                                try:
+                                                    if ws.application_state == WebSocketState.CONNECTED:
+                                                        await ws.send_json({
+                                                            "type": "question_mode_result",
+                                                            "session_id": session_id,
+                                                            "question_text": question_text,
+                                                            "error": str(e),
+                                                            "is_duplicate": False,
+                                                            "registered": False,
+                                                            "question_id": None,
+                                                            "total_questions": 0,
+                                                            "similar": []
+                                                        })
+                                                except Exception:
+                                                    pass
+                                        
+                                        # Create task and keep reference to prevent GC
+                                        task = asyncio.create_task(_check_and_register_bg())
+                                        # Store in session-level task tracker if needed
+                                        logger.info("🚀 Background task created (fire-and-forget)")
+                                    else:
+                                        logger.warning("⚠️ QuestionService unavailable or empty text")
+                                    
                                 # Clear buffer regardless
                                 self._question_buffer.pop(session_id, None)
                                 self._question_last_final.pop(session_id, None)
@@ -1046,9 +1111,14 @@ class SpeechService(ISpeechService):
                     break
                 
                 try:
-                    await ws.send_json(event)
+                    # Check WS state before sending
+                    if ws.application_state == WebSocketState.CONNECTED:
+                        await ws.send_json(event)
+                    else:
+                        logger.debug("WS not connected, skipping event send")
+                        break
                     
-                    # Collect final transcripts
+                    # Collect final transcripts (skip noise events)
                     if event.get("type") == "result" and event.get("text"):
                         speaker = event.get("speaker", "Unknown")
                         text = event.get("text", "")
@@ -1117,100 +1187,128 @@ class SpeechService(ISpeechService):
             if transcript_lines:
                 session_end = datetime.utcnow()
                 duration_seconds = (session_end - session_start).total_seconds()
-                
-                # Concatenate all transcript lines into full text
-                full_text = " ".join(line.get("text", "") for line in transcript_lines)
-                
-                transcript_data = {
-                    "session_id": session_id,
-                    "start_time": session_start.isoformat(),
-                    "end_time": session_end.isoformat(),
-                    "duration_seconds": duration_seconds,
-                    "initial_speaker": speaker_label,
-                    "lines": transcript_lines,
-                    "total_lines": len(transcript_lines),
-                }
-                
+
+                # Build full_text with speaker names in format: [Speaker]: [Text]
+                parts: List[str] = []
+                for line in transcript_lines:
+                    speaker = line.get("speaker", "Unknown")
+                    txt = (line.get("text") or "").strip()
+                    if not txt:
+                        raw = (line.get("text_raw") or "").strip()
+                        if raw:
+                            txt = raw
+                    if txt:
+                        parts.append(f"{speaker}: {txt}")
+                full_text = "\n".join(parts).strip()
+
+                MIN_TRANSCRIPT_CHARS = 12
                 logger.info(
-                    f"Transcript collected | session_id={session_id} | "
-                    f"lines={len(transcript_lines)} | duration={duration_seconds:.1f}s"
+                    f"📝 Transcript summary | session_id={session_id} | lines={len(transcript_lines)} | length={len(full_text)} | preview='{full_text[:100]}'"
                 )
-                
-                # Save to external API endpoint: POST /api/transcripts with retry
-                # P0 #3: Add retry logic with exponential backoff and Redis fallback
-                try:
-                    from app.config import Config
-                    import httpx
-                    
-                    api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
-                    payload = {
-                        "sessionId": session_id,
-                        "transcriptText": full_text,
-                        "isApproved": True,  # Auto-approve STT transcripts
+
+                # Conditions to skip saving
+                if not full_text:
+                    logger.warning(f"⚠️ Skip save: empty transcript | session_id={session_id}")
+                elif len(full_text) < MIN_TRANSCRIPT_CHARS:
+                    logger.warning(
+                        f"⚠️ Skip save: too short (<{MIN_TRANSCRIPT_CHARS}) | session_id={session_id} | text='{full_text}'"
+                    )
+                else:
+                    transcript_data = {
+                        "session_id": session_id,
+                        "start_time": session_start.isoformat(),
+                        "end_time": session_end.isoformat(),
+                        "duration_seconds": duration_seconds,
+                        "initial_speaker": speaker_label,
+                        "lines": transcript_lines,
+                        "total_lines": len(transcript_lines),
                     }
-                    
-                    saved = False
-                    last_error = None
-                    
-                    # Retry 3 times with exponential backoff
-                    for attempt in range(3):
+
+                    logger.info(
+                        f"Transcript collected | session_id={session_id} | lines={len(transcript_lines)} | duration={duration_seconds:.1f}s"
+                    )
+
+                    # Save to external API endpoint: POST /api/transcripts with retry (diagnostic logging)
+                    # IMPORTANT: Requires valid numeric defense_session_id (FK to DefenseSession table)
+                    if not defense_session_id or not defense_session_id.isdigit():
+                        logger.warning(
+                            f"⚠️ Skip API save: defense_session_id not provided or invalid | "
+                            f"defense_session_id={defense_session_id} | session_id={session_id}"
+                        )
+                        logger.info("💡 Transcript cached in Redis only (no database save)")
+                    else:
                         try:
-                            async with httpx.AsyncClient(
-                                verify=Config.AUTH_SERVICE_VERIFY_SSL,
-                                timeout=Config.AUTH_SERVICE_TIMEOUT,
-                            ) as client:
-                                response = await client.post(api_url, json=payload)
-                                
-                                if response.status_code in (200, 201):
-                                    logger.info(
-                                        f"✅ Transcript saved to external API | "
-                                        f"session_id={session_id} | status={response.status_code} | "
-                                        f"attempt={attempt + 1}"
-                                    )
-                                    saved = True
-                                    break
-                                else:
-                                    last_error = f"HTTP {response.status_code}: {response.text}"
+                            from app.config import Config
+                            import httpx
+
+                            api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
+                            session_id_int = int(defense_session_id)
+
+                            payload = {
+                                "sessionId": session_id_int,
+                                "transcriptText": full_text,
+                                "isApproved": True,
+                            }
+
+                            logger.info(
+                                f"📤 Attempting transcript save | defense_session_id={session_id_int} | chars={len(full_text)}"
+                            )
+
+                            saved = False
+                            last_error = None
+                            for attempt in range(3):
+                                try:
+                                    async with httpx.AsyncClient(
+                                        verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                                        timeout=Config.AUTH_SERVICE_TIMEOUT,
+                                    ) as client:
+                                        response = await client.post(api_url, json=payload)
+                                    if response.status_code in (200, 201):
+                                        logger.info(
+                                            f"✅ Saved transcript | attempt={attempt+1} status={response.status_code}"
+                                        )
+                                        saved = True
+                                        break
+                                    else:
+                                        last_error = f"HTTP {response.status_code}: {response.text}"
+                                        if attempt < 2:
+                                            logger.warning(
+                                                f"⚠️ Retry {attempt+1}/3 saving transcript | status={response.status_code}"
+                                            )
+                                            await asyncio.sleep(2 ** attempt)
+                                except Exception as req_err:
+                                    last_error = str(req_err)
                                     if attempt < 2:
                                         logger.warning(
-                                            f"⚠️ Retry {attempt + 1}/3 saving transcript | "
-                                            f"status={response.status_code}"
+                                            f"⚠️ Retry {attempt+1}/3 error: {req_err}"
                                         )
-                                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
-                        except Exception as req_error:
-                            last_error = str(req_error)
-                            if attempt < 2:
-                                logger.warning(f"⚠️ Retry {attempt + 1}/3 | error: {req_error}")
-                                await asyncio.sleep(2 ** attempt)
-                    
-                    # If all retries failed, just log; retry worker has been removed
-                    if not saved:
-                        logger.error(
-                            f"❌ Failed to save transcript after 3 attempts | "
-                            f"session_id={session_id} | last_error={last_error} | retry=disabled"
-                        )
-                
-                except Exception as api_error:
-                    logger.exception(f"Critical error saving transcript: {api_error}")
-                
-                # Cache final transcript in Redis (24h TTL)
-                try:
-                    cache_key = f"transcript:session:{session_id}:final"
-                    await self.redis_service.set(cache_key, transcript_data, ttl=86400)
-                except Exception as cache_error:
-                    logger.warning(f"Failed to cache final transcript: {cache_error}")
-                
-                # Send confirmation to client if still connected
-                try:
-                    if ws.application_state == WebSocketState.CONNECTED:
-                        await ws.send_json({
-                            "type": "session_saved",
-                            "session_id": session_id,
-                            "lines_saved": len(transcript_lines),
-                            "duration": duration_seconds,
-                        })
-                except Exception as send_error:
-                    logger.debug(f"Could not send session_saved confirmation: {send_error}")
+                                        await asyncio.sleep(2 ** attempt)
+
+                            if not saved:
+                                logger.error(
+                                    f"❌ Failed to save transcript after retries | defense_session_id={session_id_int} | error={last_error}"
+                                )
+                        except Exception as api_err:
+                            logger.exception(f"Critical error saving transcript: {api_err}")
+
+                    # Cache final transcript (only if we had valid content)
+                    try:
+                        cache_key = f"transcript:session:{session_id}:final"
+                        await self.redis_service.set(cache_key, transcript_data, ttl=86400)
+                    except Exception as cache_err:
+                        logger.warning(f"Failed to cache final transcript: {cache_err}")
+
+                    # Notify client
+                    try:
+                        if ws.application_state == WebSocketState.CONNECTED:
+                            await ws.send_json({
+                                "type": "session_saved",
+                                "session_id": session_id,
+                                "lines_saved": len(transcript_lines),
+                                "duration": duration_seconds,
+                            })
+                    except Exception:
+                        pass
             
             # Clear question cache for this session (use injected service if available)
             if self.question_service:

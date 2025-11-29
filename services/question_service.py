@@ -27,10 +27,11 @@ class QuestionService(IQuestionService):
     
     @property
     def semantic_model(self):
-        """Lazy load SBERT model for semantic similarity."""
+        """Lazy load SBERT model for semantic similarity (Vietnamese multilingual)."""
         if self._semantic_model is None:
             from sentence_transformers import SentenceTransformer
-            self._semantic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+            # Use multilingual model for Vietnamese support
+            self._semantic_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         return self._semantic_model
     
     def _get_session_key(self, session_id: str) -> str:
@@ -85,11 +86,11 @@ class QuestionService(IQuestionService):
             from torch import nn
             cos = nn.functional.cosine_similarity(new_emb, q_emb, dim=0).item()
             
-            # Stricter logic but more practical
+            # Vietnamese-optimized logic: Prioritize semantic similarity for paraphrases
             is_duplicate = (
-                (fuzzy_score >= threshold and cos >= 0.70) or  # Both reasonably high
-                fuzzy_score >= 0.95 or  # Nearly identical text
-                cos >= 0.85  # Similar meaning (lowered from 0.92)
+                (fuzzy_score >= 0.65 and cos >= 0.60) or  # Both moderately high (Vietnamese paraphrases)
+                fuzzy_score >= 0.85 or  # Nearly identical wording
+                cos >= 0.70  # Strong semantic similarity (multilingual model catches paraphrases)
             )
             
             if is_duplicate:

@@ -57,12 +57,16 @@ app.add_middleware(
 async def startup_event():
     """Preload models and services on startup."""
     print("🚀 Preloading models and services...")
-    from api.dependencies import get_speech_service, get_voice_service
+    from api.dependencies import get_speech_service, get_voice_service, get_question_service
     
     # Force initialize services and load models
     _ = get_speech_service()
     _ = get_voice_service()
-    print("✅ Models loaded successfully")
+    
+    # Preload QuestionService semantic model (avoid timeout on first use)
+    question_service = get_question_service()
+    _ = question_service.semantic_model  # Trigger lazy load
+    print("✅ Models loaded successfully (including semantic model)")
     
     # Background workers removed per configuration
     print("ℹ️ Background workers disabled")

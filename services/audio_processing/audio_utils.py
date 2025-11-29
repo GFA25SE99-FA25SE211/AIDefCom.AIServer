@@ -334,33 +334,6 @@ def calculate_zero_crossing_rate(audio_bytes: bytes) -> float:
     return zcr
 
 
-def detect_acoustic_change(
-    current_audio: bytes,
-    previous_audio: bytes,
-    zcr_threshold: float = 0.15
-) -> bool:
-    """
-    Detect acoustic change between audio segments (pitch/timbre shift).
-    
-    Args:
-        current_audio: Current audio chunk (PCM int16)
-        previous_audio: Previous audio chunk (PCM int16)
-        zcr_threshold: ZCR difference threshold
-    
-    Returns:
-        True if significant acoustic change detected
-    """
-    if not current_audio or not previous_audio:
-        return False
-    
-    current_zcr = calculate_zero_crossing_rate(current_audio)
-    previous_zcr = calculate_zero_crossing_rate(previous_audio)
-    
-    zcr_diff = abs(current_zcr - previous_zcr)
-    return zcr_diff >= zcr_threshold
-
-
-
 def detect_energy_spike(
     current_audio: bytes,
     previous_audio: bytes,
