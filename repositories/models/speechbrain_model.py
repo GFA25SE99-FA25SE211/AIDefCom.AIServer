@@ -175,34 +175,43 @@ class SpeechBrainModelRepository:
             ModelLoadError: If model is not loaded
         """
         if self._classifier is None:
+            logger.error("Attempted to extract embedding but model is not loaded")
             raise ModelLoadError("Model not loaded")
         
-        # Convert to tensor
-        tensor = torch.from_numpy(audio_signal).float().unsqueeze(0).to(self.device)
-        
-        # Extract embedding
-        with torch.no_grad():
-            emb = self._classifier.encode_batch(tensor)
-        
-        # Convert to numpy
-        emb_np = emb.squeeze().cpu().numpy().astype(np.float32)
-        emb_np = np.reshape(emb_np, (-1,)).astype(np.float32)
-        
-        # Normalize
-        norm = float(np.linalg.norm(emb_np) + 1e-8)
-        if not np.isfinite(norm) or norm < 1e-6:
-            raise ModelLoadError("Embedding norm too small or invalid")
-        
-        emb_np /= norm
-        
-        # Ensure correct dimension
-        if emb_np.size != self.embedding_dim:
-            emb_fixed = np.zeros(self.embedding_dim, dtype=np.float32)
-            copy_len = min(self.embedding_dim, emb_np.size)
-            emb_fixed[:copy_len] = emb_np[:copy_len]
-            emb_np = emb_fixed
-        
-        return emb_np
+        try:
+            # Convert to tensor
+            tensor = torch.from_numpy(audio_signal).float().unsqueeze(0).to(self.device)
+            
+            # Extract embedding
+            with torch.no_grad():
+                emb = self._classifier.encode_batch(tensor)
+            
+            # Convert to numpy
+            emb_np = emb.squeeze().cpu().numpy().astype(np.float32)
+            emb_np = np.reshape(emb_np, (-1,)).astype(np.float32)
+            
+            # Normalize
+            norm = float(np.linalg.norm(emb_np) + 1e-8)
+            if not np.isfinite(norm) or norm < 1e-6:
+                raise ModelLoadError("Embedding norm too small or invalid")
+            
+            emb_np /= norm
+            
+            # Ensure correct dimension
+            if emb_np.size != self.embedding_dim:
+                emb_fixed = np.zeros(self.embedding_dim, dtype=np.float32)
+                copy_len = min(self.embedding_dim, emb_np.size)
+                emb_fixed[:copy_len] = emb_np[:copy_len]
+                emb_np = emb_fixed
+            
+            return emb_np
+            
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"CUDA out of memory during embedding extraction: {e}")
+            raise ModelLoadError(f"GPU out of memory: {e}") from e
+        except Exception as e:
+            logger.exception(f"Failed to extract embedding: {e}")
+            raise ModelLoadError(f"Embedding extraction failed: {e}") from e
     
     def get_embedding_dim(self) -> int:
         """Get the dimension of the embedding vector."""
