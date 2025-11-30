@@ -374,6 +374,12 @@ class VoiceService(IVoiceService):
             if consistency:
                 response["consistency"] = consistency
             
+            # Explicit memory cleanup
+            del embedding
+            del embeddings
+            import gc
+            gc.collect()
+            
             return response
             
         except Exception as e:
@@ -915,14 +921,19 @@ class VoiceService(IVoiceService):
         }
         
         if not quality_ok:
+            # Cleanup before returning
+            del signal_norm, signal_filtered
             return np.zeros(self.embedding_dim, dtype=np.float32), quality
         
         # Extract embedding
         try:
             embedding = self.model_repo.extract_embedding(signal_norm)
+            # Cleanup intermediate arrays
+            del signal_norm, signal_filtered
         except Exception as e:
             quality["ok"] = False
             quality["reason"] = f"Embedding extraction failed: {e}"
+            del signal_norm, signal_filtered
             return np.zeros(self.embedding_dim, dtype=np.float32), quality
         
         return embedding, quality

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import gc
 
 from fastapi import APIRouter, File, UploadFile, Depends, Path
 from fastapi.responses import JSONResponse
@@ -80,9 +82,6 @@ async def enroll_voice(
     - Thời lượng khuyến nghị: 3–5 giây
     - Ít nhiễu nền, giọng nói rõ
     """
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-    
     try:
         # Read audio data with timeout
         try:
@@ -104,19 +103,15 @@ async def enroll_voice(
             logger.error(f"Audio validation error: {ve}")
             return JSONResponse(content={"error": str(ve)}, status_code=400)
         
-        # Run enrollment in thread pool with timeout to prevent blocking
-        loop = asyncio.get_event_loop()
-        executor = ThreadPoolExecutor(max_workers=1)
-        
+        # Run enrollment in background thread with timeout
         try:
             result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    executor,
+                asyncio.to_thread(
                     voice_service.enroll_voice,
                     user_id,
                     audio_data
                 ),
-                timeout=60.0  # 60 second timeout for enrollment
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             logger.error(f"Enrollment timeout for user {user_id}")
@@ -128,7 +123,9 @@ async def enroll_voice(
                 status_code=504
             )
         finally:
-            executor.shutdown(wait=False)
+            # Force garbage collection to free memory
+            del audio_data
+            gc.collect()
         
         # Check if there's an error in the result
         if "error" in result:
