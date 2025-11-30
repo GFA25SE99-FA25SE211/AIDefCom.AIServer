@@ -6,9 +6,9 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-# ============================================================================
+# ==============================================================
 # Request Models
-# ============================================================================
+# ==============================================================
 
 class AudioFileUpload(BaseModel):
     """Audio file upload documentation (not used in FastAPI, just for Swagger)."""
