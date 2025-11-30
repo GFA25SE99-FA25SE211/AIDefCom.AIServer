@@ -269,6 +269,10 @@ class AzureSpeechRepository(ISpeechRepository):
             default_phrase_hints: Default phrase hints for better recognition
             sample_rate: Audio sample rate (Hz)
         """
+        self.speech_key = subscription_key          
+        self.subscription_key = subscription_key    
+        self.region = region                        
+        self.language = language                    
         self.sample_rate = sample_rate
         self.default_phrase_hints: Sequence[str] = (
             tuple(default_phrase_hints) if default_phrase_hints else DEFAULT_PHRASE_HINTS
