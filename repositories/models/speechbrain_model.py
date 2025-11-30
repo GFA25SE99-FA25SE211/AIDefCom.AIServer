@@ -186,9 +186,15 @@ class SpeechBrainModelRepository:
             with torch.no_grad():
                 emb = self._classifier.encode_batch(tensor)
             
+            # Cleanup tensor immediately to free GPU/CPU memory
+            del tensor
+            
             # Convert to numpy
             emb_np = emb.squeeze().cpu().numpy().astype(np.float32)
             emb_np = np.reshape(emb_np, (-1,)).astype(np.float32)
+            
+            # Cleanup torch tensor
+            del emb
             
             # Normalize
             norm = float(np.linalg.norm(emb_np) + 1e-8)
@@ -208,6 +214,9 @@ class SpeechBrainModelRepository:
             
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"CUDA out of memory during embedding extraction: {e}")
+            # Force cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             raise ModelLoadError(f"GPU out of memory: {e}") from e
         except Exception as e:
             logger.exception(f"Failed to extract embedding: {e}")
