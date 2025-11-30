@@ -80,25 +80,75 @@ async def enroll_voice(
     - Thời lượng khuyến nghị: 3–5 giây
     - Ít nhiễu nền, giọng nói rõ
     """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+    
     try:
-        audio_data = await audio_file.read()
+        # Read audio data with timeout
+        try:
+            audio_data = await asyncio.wait_for(audio_file.read(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout reading audio file for user {user_id}")
+            return JSONResponse(
+                content={"error": "Timeout reading audio file", "user_id": user_id},
+                status_code=408
+            )
+        
         if not audio_data:
             logger.error("Empty audio data received for enroll_voice")
             return JSONResponse(content={"error": "Empty audio data"}, status_code=400)
+        
         try:
             _validate_audio_file(audio_file, audio_data)
         except ValueError as ve:
             logger.error(f"Audio validation error: {ve}")
             return JSONResponse(content={"error": str(ve)}, status_code=400)
         
-        result = voice_service.enroll_voice(user_id, audio_data)
-        status = 200 if result.get("success") else 400
-        if not result.get("success"):
-            logger.error(f"Enroll failed: {result}")
-        return JSONResponse(content=result, status_code=status)
+        # Run enrollment in thread pool with timeout to prevent blocking
+        loop = asyncio.get_event_loop()
+        executor = ThreadPoolExecutor(max_workers=1)
+        
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor,
+                    voice_service.enroll_voice,
+                    user_id,
+                    audio_data
+                ),
+                timeout=60.0  # 60 second timeout for enrollment
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Enrollment timeout for user {user_id}")
+            return JSONResponse(
+                content={
+                    "error": "Enrollment processing timeout. Please try again.",
+                    "user_id": user_id
+                },
+                status_code=504
+            )
+        finally:
+            executor.shutdown(wait=False)
+        
+        # Check if there's an error in the result
+        if "error" in result:
+            logger.warning(f"Enrollment error for user {user_id}: {result.get('error')}")
+            return JSONResponse(content=result, status_code=400)
+        
+        # Success case - result contains enrollment data
+        logger.info(f"Enrollment successful for user {user_id}: {result.get('enrollment_count')}/{result.get('max_enrollment_count')}")
+        return JSONResponse(content=result, status_code=200)
+        
     except Exception as exc:
-        logger.error(f"Unexpected error in enroll_voice: {exc}")
-        return JSONResponse(content={"error": str(exc)}, status_code=500)
+        logger.exception(f"Unexpected error in enroll_voice for user {user_id}: {exc}")
+        return JSONResponse(
+            content={
+                "error": "Internal server error during enrollment",
+                "details": str(exc),
+                "user_id": user_id
+            },
+            status_code=500
+        )
 
 
 @router.post(

@@ -202,154 +202,187 @@ class VoiceService(IVoiceService):
         Returns:
             Enrollment result
         """
-        # Fetch user info from .NET API to validate user exists
-        user_info = self._get_user_from_api(user_id)
-        if user_info is None:
-            logger.warning(f"User API unavailable or user not found: {user_id}. Proceeding with enrollment anyway.")
-            user_name = user_id  # Fallback to user_id as name
-        else:
-            # Extract name from API response (could be in "data" wrapper)
-            user_name = user_info.get("fullName") or user_info.get("name") or user_id
-        
-        # Load or auto-create profile
         try:
-            profile = self.profile_repo.load_profile(user_id)
-        except VoiceProfileNotFoundError:
-            # Auto-create profile with name from .NET API
-            profile = self.profile_repo.create_profile(user_id, user_name, self.embedding_dim)
-        
-        # Check if maximum enrollments reached
-        current_count = profile.get("enrollment_count", 0)
-        max_count = getattr(self, "max_enrollment_count", 3)
-        
-        if current_count >= max_count:
-            return {
-                "error": f"Maximum enrollment limit reached ({max_count} samples)",
-                "user_id": user_id,
-                "enrollment_count": current_count,
-                "max_enrollment_count": max_count,
-                "completed": True,
-                "can_record_next": False,
-                "next_sample_number": current_count,
-                "message": f"Đã đủ {max_count} samples. Không cần ghi thêm.",
-            }
-        
-        # Process audio
-        try:
-            embedding, quality = self._process_audio_for_enrollment(audio_bytes)
-        except AudioValidationError as e:
-            return {
-                "error": str(e),
-                "id": user_id,
-                "quality": {"ok": False, "reason": str(e)},
-            }
-        except Exception as e:
-            logger.exception(f"Audio processing failed | user_id={user_id}")
-            return {"error": "Failed to process audio input", "id": user_id, "details": str(e)}
-        
-        # Check quality
-        if not quality["ok"]:
-            return {
-                "error": quality.get("reason") or "Audio quality below requirements",
-                "id": user_id,
-                "quality": quality,
-            }
-        
-        # Check consistency with existing samples
-        embeddings = self.profile_repo.get_embeddings(user_id)
-        consistency = self._check_enrollment_consistency(embedding, embeddings, profile)
-        
-        if consistency and not consistency["passed"]:
-            return {
-                "error": "Voice sample inconsistent with previous samples",
-                "id": user_id,
-                "consistency": consistency,
-                "quality": quality,
-            }
-        
-        # Add sample to profile
-        self.profile_repo.add_voice_sample(
-            user_id,
-            embedding,
-            metrics=quality,
-        )
-        
-        # Update profile statistics
-        embeddings = self.profile_repo.get_embeddings(user_id)
-        self._update_profile_stats(user_id, embeddings)
-        
-        # Update enrollment status
-        enrollment_count = len(embeddings)
-        if enrollment_count >= MIN_ENROLL_SAMPLES:
-            self.profile_repo.update_enrollment_status(user_id, "enrolled")
-            enrollment_status = "enrolled"
-            remaining = max(0, max_count - enrollment_count)
-        else:
-            self.profile_repo.update_enrollment_status(user_id, "partial")
-            enrollment_status = "partial"
-            remaining = max(0, max_count - enrollment_count)
-        
-        # Upload logic: first sample -> upload & DB update; subsequent samples -> just overwrite blob; final sample -> ensure blob updated
-        blob_url = None
-        initial_upload = False
-        final_upload = False
-        db_updated = False
-        if self.azure_blob_repo and self.sql_server_repo:
+            # Validate input
+            if not audio_bytes:
+                return {
+                    "error": "Empty audio data",
+                    "user_id": user_id,
+                }
+            
+            # Fetch user info from .NET API to validate user exists
+            user_info = self._get_user_from_api(user_id)
+            if user_info is None:
+                logger.warning(f"User API unavailable or user not found: {user_id}. Proceeding with enrollment anyway.")
+                user_name = user_id  # Fallback to user_id as name
+            else:
+                # Extract name from API response (could be in "data" wrapper)
+                user_name = user_info.get("fullName") or user_info.get("name") or user_id
+            
+            # Load or auto-create profile
             try:
-                updated_profile = self.profile_repo.load_profile(user_id)
-                should_upload = True  # always keep blob in sync
-                if current_count == 0:
-                    # First sample just added (now enrollment_count will be 1 after add)
-                    initial_upload = True
-                if enrollment_count == max_count:
-                    final_upload = True
-                if should_upload:
-                    blob_url = self.azure_blob_repo.upload_voice_profile(user_id, updated_profile)
-                    logger.info(
-                        "Voice profile uploaded to Azure Blob | user_id=%s | url=%s | initial=%s | final=%s",
-                        user_id, blob_url, initial_upload, final_upload,
-                    )
-                    # Always update DB URL to ensure consistency
-                    db_updated = self.sql_server_repo.update_voice_sample_path(user_id, blob_url)
-                    if db_updated:
-                        logger.info("VoiceSamplePath updated in database | user_id=%s | url=%s", user_id, blob_url)
-                    else:
-                        logger.warning("Failed to update VoiceSamplePath in database | user_id=%s", user_id)
+                profile = self.profile_repo.load_profile(user_id)
+            except VoiceProfileNotFoundError:
+                # Auto-create profile with name from .NET API
+                profile = self.profile_repo.create_profile(user_id, user_name, self.embedding_dim)
             except Exception as e:
-                import traceback
-                logger.error(
-                    "Failed Azure Blob operation | user_id=%s | error=%s | initial=%s | final=%s | traceback=%s",
-                    user_id, e, initial_upload, final_upload, traceback.format_exc(),
+                logger.exception(f"Failed to load/create profile for {user_id}")
+                return {
+                    "error": f"Failed to load or create profile: {str(e)}",
+                    "user_id": user_id,
+                }
+            
+            # Check if maximum enrollments reached
+            current_count = profile.get("enrollment_count", 0)
+            max_count = getattr(self, "max_enrollment_count", 3)
+            
+            if current_count >= max_count:
+                return {
+                    "error": f"Maximum enrollment limit reached ({max_count} samples)",
+                    "user_id": user_id,
+                    "enrollment_count": current_count,
+                    "max_enrollment_count": max_count,
+                    "completed": True,
+                    "can_record_next": False,
+                    "next_sample_number": current_count,
+                    "message": f"Đã đủ {max_count} samples. Không cần ghi thêm.",
+                }
+            
+            # Process audio
+            try:
+                embedding, quality = self._process_audio_for_enrollment(audio_bytes)
+            except AudioValidationError as e:
+                return {
+                    "error": str(e),
+                    "id": user_id,
+                    "quality": {"ok": False, "reason": str(e)},
+                }
+            except Exception as e:
+                logger.exception(f"Audio processing failed | user_id={user_id}")
+                return {"error": "Failed to process audio input", "id": user_id, "details": str(e)}
+            
+            # Check quality
+            if not quality["ok"]:
+                return {
+                    "error": quality.get("reason") or "Audio quality below requirements",
+                    "id": user_id,
+                    "quality": quality,
+                }
+            
+            # Check consistency with existing samples
+            embeddings = self.profile_repo.get_embeddings(user_id)
+            consistency = self._check_enrollment_consistency(embedding, embeddings, profile)
+            
+            if consistency and not consistency["passed"]:
+                return {
+                    "error": "Voice sample inconsistent with previous samples",
+                    "id": user_id,
+                    "consistency": consistency,
+                    "quality": quality,
+                }
+            
+            # Add sample to profile
+            try:
+                self.profile_repo.add_voice_sample(
+                    user_id,
+                    embedding,
+                    metrics=quality,
                 )
-                # Non-fatal
-        
-        response = {
-            "id": user_id,
-            "name": profile.get("name", user_id),
-            "enrollment_status": enrollment_status,
-            "enrollment_count": enrollment_count,
-            "max_enrollment_count": max_count,
-            "remaining_samples": remaining,
-            "quality": quality,
-            "completed": enrollment_count >= max_count,
-            "can_record_next": enrollment_count < max_count,
-            "next_sample_number": enrollment_count + 1 if enrollment_count < max_count else enrollment_count,
-        }
-        if enrollment_count >= max_count:
-            response["message"] = f"✅ Hoàn tất. Đã đủ {enrollment_count}/{max_count} samples."
-        else:
-            response["message"] = f"✅ Sample {enrollment_count} OK. Còn {max_count - enrollment_count} sample nữa."
-        
-        if blob_url:
-            response["blob_url"] = blob_url
-            response["initial_upload"] = initial_upload
-            response["final_upload"] = final_upload
-            response["db_updated"] = db_updated
-        
-        if consistency:
-            response["consistency"] = consistency
-        
-        return response
+            except Exception as e:
+                logger.exception(f"Failed to add voice sample for {user_id}")
+                return {
+                    "error": f"Failed to save voice sample: {str(e)}",
+                    "user_id": user_id,
+                }
+            
+            # Update profile statistics
+            try:
+                embeddings = self.profile_repo.get_embeddings(user_id)
+                self._update_profile_stats(user_id, embeddings)
+            except Exception as e:
+                logger.warning(f"Failed to update profile stats for {user_id}: {e}")
+                # Non-fatal, continue
+            
+            # Update enrollment status
+            enrollment_count = len(embeddings)
+            if enrollment_count >= MIN_ENROLL_SAMPLES:
+                self.profile_repo.update_enrollment_status(user_id, "enrolled")
+                enrollment_status = "enrolled"
+                remaining = max(0, max_count - enrollment_count)
+            else:
+                self.profile_repo.update_enrollment_status(user_id, "partial")
+                enrollment_status = "partial"
+                remaining = max(0, max_count - enrollment_count)
+            
+            # Upload logic: first sample -> upload & DB update; subsequent samples -> just overwrite blob; final sample -> ensure blob updated
+            blob_url = None
+            initial_upload = False
+            final_upload = False
+            db_updated = False
+            if self.azure_blob_repo and self.sql_server_repo:
+                try:
+                    updated_profile = self.profile_repo.load_profile(user_id)
+                    should_upload = True  # always keep blob in sync
+                    if current_count == 0:
+                        # First sample just added (now enrollment_count will be 1 after add)
+                        initial_upload = True
+                    if enrollment_count == max_count:
+                        final_upload = True
+                    if should_upload:
+                        blob_url = self.azure_blob_repo.upload_voice_profile(user_id, updated_profile)
+                        logger.info(
+                            "Voice profile uploaded to Azure Blob | user_id=%s | url=%s | initial=%s | final=%s",
+                            user_id, blob_url, initial_upload, final_upload,
+                        )
+                        # Always update DB URL to ensure consistency
+                        db_updated = self.sql_server_repo.update_voice_sample_path(user_id, blob_url)
+                        if db_updated:
+                            logger.info("VoiceSamplePath updated in database | user_id=%s | url=%s", user_id, blob_url)
+                        else:
+                            logger.warning("Failed to update VoiceSamplePath in database | user_id=%s", user_id)
+                except Exception as e:
+                    import traceback
+                    logger.error(
+                        "Failed Azure Blob operation | user_id=%s | error=%s | initial=%s | final=%s | traceback=%s",
+                        user_id, e, initial_upload, final_upload, traceback.format_exc(),
+                    )
+                    # Non-fatal
+            
+            response = {
+                "id": user_id,
+                "name": profile.get("name", user_id),
+                "enrollment_status": enrollment_status,
+                "enrollment_count": enrollment_count,
+                "max_enrollment_count": max_count,
+                "remaining_samples": remaining,
+                "quality": quality,
+                "completed": enrollment_count >= max_count,
+                "can_record_next": enrollment_count < max_count,
+                "next_sample_number": enrollment_count + 1 if enrollment_count < max_count else enrollment_count,
+            }
+            if enrollment_count >= max_count:
+                response["message"] = f"✅ Hoàn tất. Đã đủ {enrollment_count}/{max_count} samples."
+            else:
+                response["message"] = f"✅ Sample {enrollment_count} OK. Còn {max_count - enrollment_count} sample nữa."
+            
+            if blob_url:
+                response["blob_url"] = blob_url
+                response["initial_upload"] = initial_upload
+                response["final_upload"] = final_upload
+                response["db_updated"] = db_updated
+            
+            if consistency:
+                response["consistency"] = consistency
+            
+            return response
+            
+        except Exception as e:
+            # Catch-all for any unexpected errors
+            logger.exception(f"Unexpected error in enroll_voice for user {user_id}")
+            return {
+                "error": f"Unexpected error during enrollment: {str(e)}",
+                "user_id": user_id,
+            }
     
     async def get_defense_session_users(self, session_id: str) -> Optional[List[str]]:
         """Fetch list of user IDs from defense session.
