@@ -283,17 +283,23 @@ class AzureSpeechRepository(ISpeechRepository):
         self.speech_config.speech_recognition_language = language
         self.speech_config.output_format = speechsdk.OutputFormat.Detailed
         
-        # Segmentation & silence timeouts (optimized for Vietnamese with faster response)
-        # Reduced from 800ms to 500ms for quicker speaker change detection
+        # Enable continuous recognition optimizations
         self.speech_config.set_property(
-            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "500"
+            speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
+            "CONVERSATION"  # Better for real-time streaming
+        )
+        
+        # Segmentation & silence timeouts (optimized for low-latency Vietnamese)
+        # Reduced for faster response - critical for production latency
+        self.speech_config.set_property(
+            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "400"  # Reduced from 500ms
         )
         self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "5000"
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "3000"  # Reduced from 5000ms
         )
-        # Reduced from 500ms to 300ms for faster finalization
+        # Faster finalization for quicker transcript delivery
         self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "300"
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "200"  # Reduced from 300ms
         )
         
         # TrueText (capitalization + punctuation)

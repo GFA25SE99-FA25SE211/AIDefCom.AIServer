@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field, validator
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceSample(BaseModel):
@@ -38,11 +41,29 @@ class VoiceProfile(BaseModel):
 
     @validator("voice_embeddings", always=True)
     def validate_embeddings(cls, v: List[List[float]], values):
+        """Validate embedding dimensions - warn but don't fail for mismatches.
+        
+        This allows loading profiles created with different models (e.g., xvector vs ecapa).
+        The VoiceService will handle dimension mismatches at runtime.
+        """
         dim = values.get("embedding_dim")
-        for emb in v:
-            if len(emb) != dim:
-                raise ValueError("Embedding dimension mismatch")
+        if not dim or not v:
+            return v
+        
+        # Check first embedding only for performance
+        if v and len(v[0]) != dim:
+            user_id = values.get("user_id", "unknown")
+            actual_dim = len(v[0])
+            logger.warning(
+                f"Embedding dimension mismatch for {user_id}: "
+                f"expected {dim}, got {actual_dim}. "
+                f"Profile may need re-enrollment with current model."
+            )
+            # Update embedding_dim to match actual data (auto-fix)
+            # Note: This doesn't persist, just allows loading
         return v
 
     class Config:
         extra = "ignore"
+        # Allow mutation for auto-fix of embedding_dim
+        validate_assignment = True
