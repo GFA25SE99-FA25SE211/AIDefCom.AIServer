@@ -54,6 +54,87 @@ DEFAULT_PHRASE_HINTS: Sequence[str] = (
     "tóm lại",
     "kết luận",
     
+    # --- REGIONAL VIETNAMESE / Giọng vùng miền ---
+    # Miền Bắc (Northern)
+    "giời ơi",
+    "thế à",
+    "thế ạ",
+    "cơ mà",
+    "ấy mà",
+    "nhỉ",
+    "chứ",
+    "đấy",
+    "kia",
+    "này",
+    "thôi",
+    "rồi",
+    "đi",
+    "nào",
+    "sao",
+    
+    # Miền Trung (Central) - Nghệ An, Huế, Đà Nẵng
+    "răng",  # sao
+    "rứa",  # vậy
+    "chi",  # gì
+    "mô",  # đâu
+    "ni",  # này
+    "nớ",  # kia
+    "tê",  # đó
+    "hè",  # nhé/hả
+    "chừ",  # giờ
+    "bây chừ",  # bây giờ
+    "eng",  # anh
+    "ả",  # chị
+    "mệ",  # mẹ
+    "bọ",  # bố
+    "tau",  # tao
+    "mi",  # mày
+    "choa",  # chúng tôi
+    "bay",  # các bạn
+    "có chi mô",  # không có gì
+    "biết chi mô",  # biết gì đâu
+    "làm răng",  # làm sao
+    "răng rứa",  # sao vậy
+    
+    # Miền Nam (Southern)
+    "hông",  # không
+    "đâu có",
+    "có hông",  # có không
+    "dzậy",  # vậy
+    "dzô",  # vô
+    "trời ơi",
+    "ủa",
+    "hả",
+    "hen",  # nhé
+    "nghen",  # nhé
+    "nè",  # này
+    "đó",
+    "đây nè",
+    "sao ta",
+    "gì ta",
+    "gì dzậy",  # gì vậy
+    "chi dzậy",  # gì vậy
+    "được hông",  # được không
+    "biết hông",  # biết không
+    "có gì đâu",
+    "hổng có",  # không có
+    "hổng biết",  # không biết
+    "hổng hiểu",  # không hiểu
+    "quá trời",
+    "quá xá",
+    "dữ lắm",
+    "ghê quá",
+    
+    # Common contractions / Nói tắt phổ biến
+    "bít",  # biết
+    "hỉu",  # hiểu
+    "đc",  # được
+    "ko",  # không
+    "z",  # vậy
+    "gòi",  # rồi
+    "chưa gì",
+    "chưa chi",
+    
     # --- Vietnamese question words / Từ để hỏi ---
     "cái gì",
     "là gì",

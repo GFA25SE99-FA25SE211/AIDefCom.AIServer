@@ -919,6 +919,9 @@ class SpeechService(ISpeechService):
         # Session metadata - MUST define before using
         session_id = ws.headers.get("sec-websocket-key", f"session_{id(ws)}")
         
+        # === USE defense_session_id FOR TRANSCRIPT CACHE (enables resume after reload) ===
+        transcript_cache_key = f"transcript:defense:{defense_session_id}" if defense_session_id else f"transcript:session:{session_id}"
+        
         # Join room for this defense session (enables broadcast)
         if defense_session_id:
             await room_manager.join_room(defense_session_id, ws)
@@ -966,6 +969,32 @@ class SpeechService(ISpeechService):
             whitelist_fetch_task = asyncio.create_task(_fetch_whitelist_background())
         session_start = datetime.utcnow()
         transcript_lines = []
+        
+        # === LOAD EXISTING TRANSCRIPT FROM CACHE (resume after reload) ===
+        if defense_session_id and self.redis_service:
+            try:
+                existing = await asyncio.wait_for(
+                    self.redis_service.get(transcript_cache_key),
+                    timeout=2.0
+                )
+                if existing and isinstance(existing, dict):
+                    transcript_lines = existing.get("lines", [])
+                    original_start = existing.get("start_time")
+                    if original_start:
+                        try:
+                            session_start = datetime.fromisoformat(original_start)
+                        except Exception:
+                            pass
+                    logger.info(f"📂 Resumed transcript | defense_session_id={defense_session_id} | existing_lines={len(transcript_lines)}")
+            except asyncio.TimeoutError:
+                logger.debug("Timeout loading existing transcript")
+            except Exception as e:
+                logger.debug(f"No existing transcript: {e}")
+        
+        # === FLAG: Only save to DB when explicitly requested ===
+        # Set to True when: session:end command OR save:transcript command
+        # This prevents saving incomplete transcripts when user reloads page
+        should_save_to_db = False
         
         # Audio queue and control (300 items = ~6s buffer at 50fps)
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=300)
@@ -1169,8 +1198,10 @@ class SpeechService(ISpeechService):
                                     exclude_ws=None  # Gửi cho tất cả, kể cả thư ký (để confirm)
                                 )
                             elif message == "session:end":
-                                # Thư ký kết thúc phiên - broadcast cho member
-                                logger.info(f"📢 Broadcasting session:end to room {defense_session_id}")
+                                # Thư ký kết thúc phiên - broadcast cho member và save transcript
+                                nonlocal should_save_to_db
+                                should_save_to_db = True  # Mark to save transcript to DB
+                                logger.info(f"📢 Broadcasting session:end to room {defense_session_id} | will_save_db=True")
                                 await room_manager.broadcast_to_room(
                                     defense_session_id,
                                     {"type": "session_ended"},
@@ -1310,17 +1341,17 @@ class SpeechService(ISpeechService):
                             self._question_buffer.setdefault(session_id, []).append(text)
                             self._question_last_final[session_id] = text
                         
-                        # Cache partial transcript in Redis
+                        # Cache partial transcript in Redis (using defense_session_id key for resume support)
                         try:
-                            cache_key = f"transcript:session:{session_id}"
                             await self.redis_service.set(
-                                cache_key,
+                                transcript_cache_key,
                                 {
+                                    "defense_session_id": defense_session_id,
                                     "session_id": session_id,
                                     "start_time": session_start.isoformat(),
                                     "lines": transcript_lines,
                                 },
-                                ttl=3600,
+                                ttl=7200,  # 2 hours for defense session
                             )
                         except Exception as cache_error:
                             logger.warning(f"Failed to cache transcript: {cache_error}")
@@ -1410,7 +1441,14 @@ class SpeechService(ISpeechService):
 
                     # Save to external API endpoint: POST /api/transcripts with retry (diagnostic logging)
                     # IMPORTANT: Requires valid numeric defense_session_id (FK to DefenseSession table)
-                    if not defense_session_id or not defense_session_id.isdigit():
+                    # IMPORTANT: Only save when should_save_to_db=True (session:end or save:transcript command)
+                    if not should_save_to_db:
+                        logger.info(
+                            f"💡 Skip DB save: no save command received (user may have reloaded) | "
+                            f"session_id={session_id} | lines={len(transcript_lines)}"
+                        )
+                        logger.info("💡 Transcript cached in Redis only. Send 'session:end' or 'save:transcript' to save to DB.")
+                    elif not defense_session_id or not defense_session_id.isdigit():
                         logger.warning(
                             f"⚠️ Skip API save: defense_session_id not provided or invalid | "
                             f"defense_session_id={defense_session_id} | session_id={session_id}"
@@ -1473,8 +1511,9 @@ class SpeechService(ISpeechService):
 
                     # Cache final transcript (only if we had valid content)
                     try:
-                        cache_key = f"transcript:session:{session_id}:final"
-                        await self.redis_service.set(cache_key, transcript_data, ttl=86400)
+                        await self.redis_service.set(transcript_cache_key, transcript_data, ttl=86400)
+                        # Also cache with :final suffix for explicit final version
+                        await self.redis_service.set(f"{transcript_cache_key}:final", transcript_data, ttl=86400)
                     except Exception as cache_err:
                         logger.warning(f"Failed to cache final transcript: {cache_err}")
 
