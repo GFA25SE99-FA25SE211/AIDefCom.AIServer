@@ -30,6 +30,7 @@ from services.audio_processing.speech_utils import (
     calculate_speech_confidence,
 )
 from services.multi_speaker_tracker import MultiSpeakerTracker
+from services.session_room_manager import get_session_room_manager
 from repositories.interfaces.i_redis_service import IRedisService
 
 logger = logging.getLogger(__name__)
@@ -880,6 +881,7 @@ class SpeechService(ISpeechService):
         - Manage WebSocket connection (ping, reader)
         - Stream recognition events
         - Collect and cache transcript
+        - Broadcast transcripts to all clients in same defense session
         - Save to database on completion
         - Clear question cache
         
@@ -890,6 +892,11 @@ class SpeechService(ISpeechService):
         import json
         from datetime import datetime
         from starlette.websockets import WebSocketState
+        
+        # Get room manager for broadcast
+        room_manager = get_session_room_manager()
+        if self.redis_service:
+            room_manager.set_redis_service(self.redis_service)
         
         # Parse query parameters
         speaker_label = ws.query_params.get("speaker") or "Đang xác định"
@@ -912,11 +919,19 @@ class SpeechService(ISpeechService):
         # Session metadata - MUST define before using
         session_id = ws.headers.get("sec-websocket-key", f"session_{id(ws)}")
         
+        # Join room for this defense session (enables broadcast)
+        if defense_session_id:
+            await room_manager.join_room(defense_session_id, ws)
+            room_size = room_manager.get_room_size(defense_session_id)
+            logger.info(f"🏠 Joined room {defense_session_id} | room_size={room_size}")
+        
         # Send immediate connected confirmation to client (before any blocking operations)
         try:
             await ws.send_json({
                 "type": "connected",
                 "session_id": session_id,
+                "defense_session_id": defense_session_id,
+                "room_size": room_manager.get_room_size(defense_session_id) if defense_session_id else 0,
                 "message": "WebSocket connected, starting recognition..."
             })
             logger.info(f"✅ Sent connected event | session_id={session_id}")
@@ -1185,6 +1200,29 @@ class SpeechService(ISpeechService):
                             "text": text,
                             "user_id": event.get("user_id"),
                         })
+                        
+                        # === BROADCAST TO ALL CLIENTS IN SAME DEFENSE SESSION ===
+                        if defense_session_id:
+                            broadcast_event = {
+                                "type": "broadcast_transcript",
+                                "speaker": speaker,
+                                "text": text,
+                                "user_id": event.get("user_id"),
+                                "timestamp": timestamp,
+                                "confidence": event.get("confidence_adjusted"),
+                                "source_session_id": session_id,  # Who sent this
+                            }
+                            try:
+                                sent_count = await room_manager.broadcast_to_room(
+                                    defense_session_id,
+                                    broadcast_event,
+                                    exclude_ws=ws,  # Don't send back to sender (they already got it)
+                                )
+                                if sent_count > 0:
+                                    logger.debug(f"📢 Broadcast to {sent_count} clients in room {defense_session_id}")
+                            except Exception as broadcast_err:
+                                logger.debug(f"Broadcast failed: {broadcast_err}")
+                        
                         # If question mode active, buffer this final text
                         if self._question_mode.get(session_id):
                             self._question_buffer.setdefault(session_id, []).append(text)
@@ -1217,6 +1255,11 @@ class SpeechService(ISpeechService):
         except Exception as e:
             logger.exception(f"Error in STT session: {e}")
         finally:
+            # === LEAVE ROOM ON DISCONNECT ===
+            if defense_session_id:
+                await room_manager.leave_room(defense_session_id, ws)
+                logger.info(f"👋 Left room {defense_session_id}")
+            
             # Cleanup
             stop_event.set()
             

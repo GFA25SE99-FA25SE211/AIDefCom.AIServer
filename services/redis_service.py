@@ -277,6 +277,55 @@ class RedisService(IRedisService):
         except Exception as e:
             logger.error(f"Error pushing to list '{key}' in Redis: {e}")
             return None
+    
+    async def publish(self, channel: str, message: Any) -> bool:
+        """
+        Publish message to a Redis Pub/Sub channel.
+        
+        Args:
+            channel: Channel name (e.g., 'transcript:session:123')
+            message: Message to publish (will be JSON-serialized)
+            
+        Returns:
+            True if published successfully, False otherwise
+        """
+        if not self._initialized:
+            await self._ensure_connection()
+        
+        if not self.client:
+            return False
+        
+        try:
+            serialized = json.dumps(message, ensure_ascii=False)
+            await self.client.publish(channel, serialized)
+            return True
+        except Exception as e:
+            logger.debug(f"Redis publish error for channel '{channel}': {e}")
+            return False
+    
+    async def subscribe(self, channel: str):
+        """
+        Subscribe to a Redis Pub/Sub channel.
+        
+        Args:
+            channel: Channel name to subscribe to
+            
+        Returns:
+            PubSub object for receiving messages, or None if failed
+        """
+        if not self._initialized:
+            await self._ensure_connection()
+        
+        if not self.client:
+            return None
+        
+        try:
+            pubsub = self.client.pubsub()
+            await pubsub.subscribe(channel)
+            return pubsub
+        except Exception as e:
+            logger.error(f"Redis subscribe error for channel '{channel}': {e}")
+            return None
 
 
 # Global Redis service instance
