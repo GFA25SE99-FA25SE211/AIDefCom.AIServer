@@ -727,8 +727,8 @@ class SpeechService(ISpeechService):
                                 # NEW: Append to speaker tracker
                                 speaker_tracker.append_text(filtered_text)
                         else:
-                            # For partials, keep original text
-                            event["text"] = raw_text
+                            # For partials, apply light normalization (no filtering)
+                            event["text"] = normalize_vietnamese_text(raw_text)
                         
                         display_plain = f"{current_speaker}: {event['text']}"
                         event["display"] = display_plain

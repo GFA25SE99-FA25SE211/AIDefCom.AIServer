@@ -113,8 +113,10 @@ def normalize_vietnamese_text(text: str) -> str:
     # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text)
     
-    # Fix common Vietnamese STT errors
+    # === VIETNAMESE STT COMMON ERRORS ===
+    # Words often misrecognized by Azure Speech
     replacements = {
+        # Abbreviations
         " đc ": " được ",
         " ko ": " không ",
         " k ": " không ",
@@ -123,13 +125,53 @@ def normalize_vietnamese_text(text: str) -> str:
         " vs ": " với ",
         " tl ": " trả lời ",
         " bv ": " bảo vệ ",
+        " gv ": " giáo viên ",
+        " sv ": " sinh viên ",
+        " hs ": " học sinh ",
+        
+        # Common misrecognitions
+        " dạ ": " dạ ",  # Keep as is (polite word)
+        " da ": " dạ ",  # Often miss the diacritics
+        " vang ": " vâng ",
+        " vâng a ": " vâng ạ ",
+        " da vang ": " dạ vâng ",
+        " cam on ": " cảm ơn ",
+        " xin chao ": " xin chào ",
+        
+        # Technical terms often split incorrectly
+        "web socket": "WebSocket",
+        "web sockets": "WebSocket",
+        " api ": " API ",
+        " sql ": " SQL ",
+        " json ": " JSON ",
+        " html ": " HTML ",
+        " css ": " CSS ",
+        " ai ": " AI ",  # Context: artificial intelligence
+        
+        # Punctuation fixes
+        " . ": ". ",
+        " , ": ", ",
+        " ? ": "? ",
+        " ! ": "! ",
     }
     
     text_lower = text.lower()
     for wrong, correct in replacements.items():
-        if wrong in text_lower:
-            # Case-insensitive replace (preserve original case pattern)
+        if wrong.lower() in text_lower:
+            # Case-insensitive replace
             text = re.sub(re.escape(wrong), correct, text, flags=re.IGNORECASE)
+    
+    # Fix repeated words (common STT error)
+    words = text.split()
+    cleaned_words = []
+    prev_word = None
+    for word in words:
+        # Skip if same as previous word (stuttering fix)
+        if word.lower() == prev_word:
+            continue
+        cleaned_words.append(word)
+        prev_word = word.lower()
+    text = ' '.join(cleaned_words)
     
     # Capitalize first letter of sentences
     text = re.sub(r'(^|[.!?]\s+)([a-zàáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ])',

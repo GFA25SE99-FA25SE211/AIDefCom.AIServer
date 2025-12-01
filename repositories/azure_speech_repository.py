@@ -19,11 +19,79 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_PHRASE_HINTS: Sequence[str] = (
+    # --- Vietnamese common words often misrecognized / Từ tiếng Việt hay bị nhận sai ---
+    "xin chào",
+    "cảm ơn",
+    "vâng ạ",
+    "dạ vâng",
+    "được ạ",
+    "không ạ",
+    "vâng",
+    "dạ",
+    "ạ",
+    "nhé",
+    "nha",
+    "à",
+    "ừ",
+    "ờ",
+    "thế này",
+    "như vậy",
+    "tại vì",
+    "bởi vì",
+    "cho nên",
+    "vì vậy",
+    "tuy nhiên",
+    "mặc dù",
+    "ngoài ra",
+    "hơn nữa",
+    "đầu tiên",
+    "tiếp theo",
+    "cuối cùng",
+    "ví dụ",
+    "chẳng hạn",
+    "cụ thể",
+    "nói chung",
+    "tóm lại",
+    "kết luận",
+    
+    # --- Vietnamese question words / Từ để hỏi ---
+    "cái gì",
+    "là gì",
+    "như thế nào",
+    "tại sao",
+    "vì sao",
+    "bao nhiêu",
+    "bao lâu",
+    "khi nào",
+    "ở đâu",
+    "ai",
+    "của ai",
+    
+    # --- Vietnamese pronouns / Đại từ ---
+    "tôi",
+    "mình",
+    "em",
+    "anh",
+    "chị",
+    "bạn",
+    "các bạn",
+    "chúng tôi",
+    "chúng ta",
+    "chúng em",
+    "thầy",
+    "cô",
+    "giáo viên",
+    "giảng viên",
+    "sinh viên",
+    "học sinh",
+    
     # --- Academic & Defense context / Học thuật & bảo vệ khóa luận ---
     "capstone project",
     "graduation thesis",
     "thesis defense",
     "bảo vệ khóa luận",
+    "bảo vệ đồ án",
+    "bảo vệ luận văn",
     "đề tài tốt nghiệp",
     "hội đồng bảo vệ",
     "ủy viên phản biện",
@@ -289,20 +357,19 @@ class AzureSpeechRepository(ISpeechRepository):
             "CONVERSATION"  # Better for real-time streaming
         )
         
-        # Segmentation & silence timeouts (optimized for low-latency Vietnamese)
-        # Reduced for faster response - critical for production latency
+        # === VIETNAMESE OPTIMIZATION: Increase silence timeout for better accuracy ===
+        # Longer timeouts = more context = better Vietnamese recognition
         self.speech_config.set_property(
-            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "400"  # Reduced from 500ms
+            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "600"  # Increased from 400ms for Vietnamese
         )
         self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "3000"  # Reduced from 5000ms
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "5000"  # 5s initial
         )
-        # Faster finalization for quicker transcript delivery
         self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "200"  # Reduced from 300ms
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "400"  # Increased from 200ms
         )
         
-        # TrueText (capitalization + punctuation)
+        # TrueText (capitalization + punctuation) - important for Vietnamese
         try:
             self.speech_config.set_property(
                 speechsdk.PropertyId.SpeechServiceResponse_PostProcessingOption,
@@ -314,15 +381,26 @@ class AzureSpeechRepository(ISpeechRepository):
                 "SpeechServiceResponse_PostProcessingOption", "TrueText"
             )
         
+        # === VIETNAMESE: Enable profanity masking to avoid wrong words ===
+        self.speech_config.set_profanity(speechsdk.ProfanityOption.Masked)
+        
         # Timestamps & stable partial results
         try:
             self.speech_config.request_word_level_timestamps()
         except Exception:
             pass
         
+        # === VIETNAMESE OPTIMIZATION: Higher threshold for more stable results ===
+        # Prevents "jumping" text in partial results
         self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold, "3"
+            speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold, "4"  # Increased from 3
         )
+        
+        # === VIETNAMESE: Enable dictation mode for better continuous speech ===
+        try:
+            self.speech_config.enable_dictation()
+        except Exception:
+            pass
         
         logger.info(
             f"Azure Speech Repository initialized | language={language} | region={region} | sr={sample_rate}Hz"
