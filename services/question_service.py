@@ -1,11 +1,15 @@
 """Question duplicate detection service using Redis and fuzzy matching."""
+import asyncio
 import json
+import logging
 from datetime import datetime
 from rapidfuzz import fuzz
 import string
 from typing import Optional
 from repositories.interfaces.i_redis_service import IRedisService
 from services.interfaces.i_question_service import IQuestionService
+
+logger = logging.getLogger(__name__)
 
 
 class QuestionService(IQuestionService):
@@ -16,6 +20,8 @@ class QuestionService(IQuestionService):
         self.session_ttl = session_ttl
         self._redis_service = redis_service
         self._semantic_model = None  # Lazy load SBERT
+        # Local locks per session (for single-container atomicity)
+        self._session_locks: dict[str, asyncio.Lock] = {}
     
     @property
     def redis_service(self) -> IRedisService:
@@ -37,6 +43,12 @@ class QuestionService(IQuestionService):
     def _get_session_key(self, session_id: str) -> str:
         """Get Redis key for session questions."""
         return f"questions:session:{session_id}"
+    
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create lock for a session (prevents race conditions)."""
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
     
     def _normalize_text(self, text: str) -> str:
         """Normalize text for comparison."""
@@ -154,28 +166,43 @@ class QuestionService(IQuestionService):
         threshold: float = 0.85,
         semantic_threshold: float = 0.85
     ) -> dict:
-        """Atomic: check duplicate and register if unique."""
-        is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
+        """Atomic: check duplicate and register if unique.
         
-        registered = False
-        question_id = None
+        Uses lock to prevent race conditions where two identical questions
+        are submitted at the same time and both pass duplicate check.
+        """
+        # Get lock for this session to ensure atomicity
+        lock = self._get_session_lock(session_id)
         
-        if not is_dup:
-            reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
-            registered = reg.get("success", False)
-            question_id = reg.get("question_id")
-        
-        # Get total questions count (after possible registration)
-        existing = await self.get_questions(session_id)
-        
-        return {
-            "is_duplicate": is_dup,
-            "similar": similar,
-            "registered": registered,
-            "question_id": question_id,
-            "total_questions": len(existing),
-            "question_text": question_text,
-        }
+        async with lock:
+            logger.info(f"🔒 Acquired lock for session {session_id} | checking: '{question_text[:50]}'")
+            
+            is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
+            
+            registered = False
+            question_id = None
+            
+            if not is_dup:
+                reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
+                registered = reg.get("success", False)
+                question_id = reg.get("question_id")
+                logger.info(f"✅ Registered question #{question_id} | text='{question_text[:50]}'")
+            else:
+                logger.info(f"🔄 Duplicate detected | text='{question_text[:50]}' | similar_count={len(similar)}")
+            
+            # Get total questions count (after possible registration)
+            existing = await self.get_questions(session_id)
+            
+            logger.info(f"🔓 Released lock for session {session_id}")
+            
+            return {
+                "is_duplicate": is_dup,
+                "similar": similar,
+                "registered": registered,
+                "question_id": question_id,
+                "total_questions": len(existing),
+                "question_text": question_text,
+            }
     
     async def clear_questions(self, session_id: str) -> int:
         """Clear all questions for a session."""

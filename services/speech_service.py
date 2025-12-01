@@ -1065,12 +1065,16 @@ class SpeechService(ISpeechService):
                                         import time
                                         start_time = time.time()
                                         
+                                        # IMPORTANT: Use defense_session_id for duplicate check (not ws session_id)
+                                        # All questions in same defense session should be checked together
+                                        question_session_key = defense_session_id or session_id
+                                        
                                         async def _check_and_register_bg():
                                             try:
-                                                logger.info(f"🔄 Starting background question check | text='{question_text[:50]}'")
+                                                logger.info(f"🔄 Starting background question check | session={question_session_key} | text='{question_text[:50]}'")
                                                 result = await asyncio.wait_for(
                                                     self.question_service.check_and_register(
-                                                        session_id=session_id,
+                                                        session_id=question_session_key,  # Use defense_session_id!
                                                         question_text=question_text,
                                                         speaker=speaker_label or "Khách"
                                                     ),
@@ -1086,6 +1090,26 @@ class SpeechService(ISpeechService):
                                                         result["session_id"] = session_id
                                                         await ws.send_json(result)
                                                         logger.info("✅ Sent question_mode_result")
+                                                        
+                                                        # === BROADCAST question_mode_result TO ALL CLIENTS ===
+                                                        if defense_session_id:
+                                                            broadcast_event = {
+                                                                "type": "broadcast_question_result",
+                                                                "question_text": question_text,
+                                                                "is_duplicate": result.get("is_duplicate", False),
+                                                                "similar": result.get("similar", []),
+                                                                "speaker": speaker_label or "Member",
+                                                                "source_session_id": session_id,
+                                                            }
+                                                            try:
+                                                                await room_manager.broadcast_to_room(
+                                                                    defense_session_id,
+                                                                    broadcast_event,
+                                                                    exclude_ws=ws,  # Không gửi lại cho người đặt
+                                                                )
+                                                                logger.debug(f"📢 Broadcast question_result to room {defense_session_id}")
+                                                            except Exception:
+                                                                pass
                                                     else:
                                                         logger.warning("⚠️ WS not connected, cannot send result")
                                                 except Exception as send_err:
@@ -1136,7 +1160,48 @@ class SpeechService(ISpeechService):
                                 # Clear buffer regardless
                                 self._question_buffer.pop(session_id, None)
                                 self._question_last_final.pop(session_id, None)
-                        
+                            elif message == "session:start":
+                                # Thư ký bắt đầu ghi âm - broadcast cho member
+                                logger.info(f"📢 Broadcasting session:start to room {defense_session_id}")
+                                await room_manager.broadcast_to_room(
+                                    defense_session_id,
+                                    {"type": "session_started"},
+                                    exclude_ws=None  # Gửi cho tất cả, kể cả thư ký (để confirm)
+                                )
+                            elif message == "session:end":
+                                # Thư ký kết thúc phiên - broadcast cho member
+                                logger.info(f"📢 Broadcasting session:end to room {defense_session_id}")
+                                await room_manager.broadcast_to_room(
+                                    defense_session_id,
+                                    {"type": "session_ended"},
+                                    exclude_ws=None
+                                )
+                            elif message == "question:started":
+                                # Member bắt đầu đặt câu hỏi - broadcast cho thư ký
+                                if defense_session_id:
+                                    logger.info(f"📢 Broadcasting question:started to room {defense_session_id}")
+                                    await room_manager.broadcast_to_room(
+                                        defense_session_id,
+                                        {
+                                            "type": "broadcast_question_started",
+                                            "speaker": speaker_label or "Member",
+                                            "source_session_id": session_id,
+                                        },
+                                        exclude_ws=ws,
+                                    )
+                            elif message == "question:processing":
+                                # Member kết thúc đặt câu hỏi, đang xử lý - broadcast cho thư ký
+                                if defense_session_id:
+                                    logger.info(f"📢 Broadcasting question:processing to room {defense_session_id}")
+                                    await room_manager.broadcast_to_room(
+                                        defense_session_id,
+                                        {
+                                            "type": "broadcast_question_processing",
+                                            "speaker": speaker_label or "Member",
+                                            "source_session_id": session_id,
+                                        },
+                                        exclude_ws=ws,
+                                    )
                         else:
                             # Disconnect event
                             logger.debug("Received disconnect event")
@@ -1187,6 +1252,23 @@ class SpeechService(ISpeechService):
                     else:
                         logger.debug("WS not connected, skipping event send")
                         break
+                    
+                    # === BROADCAST PARTIAL TEXT TO ALL CLIENTS (real-time typing) ===
+                    if event.get("type") == "partial" and event.get("text") and defense_session_id:
+                        broadcast_partial = {
+                            "type": "broadcast_partial",
+                            "speaker": event.get("speaker", "Unknown"),
+                            "text": event.get("text"),
+                            "source_session_id": session_id,
+                        }
+                        try:
+                            await room_manager.broadcast_to_room(
+                                defense_session_id,
+                                broadcast_partial,
+                                exclude_ws=ws,
+                            )
+                        except Exception:
+                            pass  # Don't log partial broadcast failures
                     
                     # Collect final transcripts (skip noise events)
                     if event.get("type") == "result" and event.get("text"):
@@ -1408,13 +1490,11 @@ class SpeechService(ISpeechService):
                     except Exception:
                         pass
             
-            # Clear question cache for this session (use injected service if available)
-            if self.question_service:
-                try:
-                    deleted_count = await self.question_service.clear_questions(session_id)
-                    if deleted_count > 0:
-                        logger.info(f"Cleared {deleted_count} questions from cache | session_id={session_id}")
-                except Exception as clear_error:
-                    logger.warning(f"Failed to clear question cache: {clear_error}")
+            # Clear question cache for this defense session (use injected service if available)
+            # NOTE: Only clear if this was the last client in the room, or use defense_session_id
+            if self.question_service and defense_session_id:
+                # Don't auto-clear - questions should persist until session officially ends
+                # Questions are stored per defense_session_id, not per WS connection
+                pass
             
-            logger.info(f"STT session closed | session_id={session_id}")
+            logger.info(f"STT session closed | session_id={session_id} | defense_session_id={defense_session_id}")
