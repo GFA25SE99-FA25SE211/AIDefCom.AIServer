@@ -281,7 +281,73 @@ async def verify_voice(
     except Exception as exc:
         return JSONResponse(content={"error": str(exc)}, status_code=500)
 
-        status = 200 if result.get("success") else 400
-        return JSONResponse(content=result, status_code=status)
+
+@router.get(
+    "/users/{user_id}/enrollment-status",
+    summary="Get enrollment status",
+    description=(
+        "Lấy thông tin trạng thái enrollment của user: số mẫu đã enroll, "
+        "trạng thái (not_enrolled/partial/enrolled), và thông tin profile."
+    ),
+    responses={
+        200: {
+            "description": "Enrollment status",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user_id": "USR001",
+                        "name": "Nguyễn Văn A",
+                        "enrollment_status": "partial",
+                        "enrollment_count": 2,
+                        "min_required": 3,
+                        "is_complete": False,
+                        "message": "User has 2/3 enrollment samples"
+                    }
+                }
+            },
+        },
+        404: {"description": "User not found"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def get_enrollment_status(
+    user_id: str = Path(..., description="User ID to check enrollment status"),
+    voice_service: IVoiceService = Depends(get_voice_service),
+):
+    """Get enrollment status for a specific user.
+    
+    **REST API:** `GET /voice/users/{user_id}/enrollment-status`
+    
+    **Returns:**
+    - `enrollment_count`: Số mẫu đã enroll (0-3)
+    - `enrollment_status`: not_enrolled / partial / enrolled
+    - `is_complete`: True nếu đủ 3 mẫu
+    - `min_required`: Số mẫu tối thiểu (3)
+    """
+    try:
+        # Get or create profile (will return existing if exists)
+        result = voice_service.get_or_create_profile(user_id)
+        
+        enrollment_count = result.get("enrollment_count", 0)
+        min_required = 3
+        is_complete = enrollment_count >= min_required
+        
+        return JSONResponse(
+            content={
+                "user_id": user_id,
+                "name": result.get("name", user_id),
+                "enrollment_status": result.get("enrollment_status", "not_enrolled"),
+                "enrollment_count": enrollment_count,
+                "min_required": min_required,
+                "is_complete": is_complete,
+                "message": f"User has {enrollment_count}/{min_required} enrollment samples"
+                           + (" - Enrollment complete!" if is_complete else ""),
+            },
+            status_code=200
+        )
     except Exception as exc:
-        return JSONResponse(content={"error": str(exc)}, status_code=500)
+        logger.exception(f"Error getting enrollment status for user {user_id}: {exc}")
+        return JSONResponse(
+            content={"error": str(exc), "user_id": user_id},
+            status_code=500
+        )
