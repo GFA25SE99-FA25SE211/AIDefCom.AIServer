@@ -421,17 +421,26 @@ class VoiceService(IVoiceService):
         """
         from app.config import Config
         
+        if not Config.AUTH_SERVICE_BASE_URL:
+            logger.warning("AUTH_SERVICE_BASE_URL not configured, skipping whitelist fetch")
+            return None
+        
+        url = f"{Config.AUTH_SERVICE_BASE_URL}/api/defense-sessions/{session_id}/users"
+        
         try:
-            url = f"{Config.AUTH_SERVICE_BASE_URL}/api/defense-sessions/{session_id}/users"
+            logger.info(f"🔍 Fetching defense session users | url={url}")
             
             async with httpx.AsyncClient(
                 verify=Config.AUTH_SERVICE_VERIFY_SSL,
-                timeout=Config.AUTH_SERVICE_TIMEOUT
+                timeout=httpx.Timeout(5.0, connect=3.0)  # 5s total, 3s connect
             ) as client:
                 response = await client.get(url)
                 
                 if response.status_code != 200:
-                    logger.error(f"Failed to fetch defense session users: {response.status_code}")
+                    logger.warning(
+                        f"⚠️ Defense session API returned {response.status_code} | "
+                        f"url={url} | body={response.text[:200] if response.text else 'empty'}"
+                    )
                     return None
                 
                 data = response.json()
@@ -442,11 +451,24 @@ class VoiceService(IVoiceService):
                     logger.info(f"✅ Fetched {len(user_ids)} users from defense session {session_id}")
                     return user_ids
                 
-                logger.warning(f"Invalid response format from defense session API")
+                # Try alternative response formats
+                if isinstance(data, list):
+                    user_ids = [user["id"] for user in data if isinstance(user, dict) and "id" in user]
+                    if user_ids:
+                        logger.info(f"✅ Fetched {len(user_ids)} users (array format) from session {session_id}")
+                        return user_ids
+                
+                logger.warning(f"⚠️ Invalid response format: {str(data)[:200]}")
                 return None
                 
+        except httpx.ConnectError as e:
+            logger.warning(f"⚠️ Cannot connect to AUTH_SERVICE: {e}")
+            return None
+        except httpx.TimeoutException as e:
+            logger.warning(f"⚠️ Timeout fetching defense session users: {e}")
+            return None
         except Exception as e:
-            logger.exception(f"Error fetching defense session users: {e}")
+            logger.warning(f"⚠️ Error fetching defense session users: {e}")
             return None
     
     def identify_speaker(self, audio_bytes: bytes, whitelist_user_ids: Optional[List[str]] = None) -> Dict[str, Any]:

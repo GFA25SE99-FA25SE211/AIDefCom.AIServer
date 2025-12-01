@@ -107,16 +107,37 @@ class SessionRoomManager:
         if not defense_session_id:
             return 0
         
-        # Also publish to Redis for cross-process broadcast
+        # ALWAYS broadcast local first (real-time, no delay)
+        sent_count = await self._broadcast_local(defense_session_id, message, exclude_ws)
+        
+        # ALSO publish to Redis for cross-container broadcast (fire-and-forget)
+        # Other containers' subscribers will handle their local connections
         if self._redis_service:
             channel = f"transcript:room:{defense_session_id}"
             try:
-                await self._redis_service.publish(channel, message)
+                # Add source marker to prevent echo back to same container
+                message_with_meta = {
+                    **message,
+                    "_source_container_id": id(self),  # Unique per container instance
+                }
+                # Fire-and-forget: don't await, don't block
+                asyncio.create_task(self._publish_to_redis(channel, message_with_meta))
             except Exception as e:
-                logger.debug(f"Redis publish failed: {e}")
+                logger.debug(f"Redis publish scheduling failed: {e}")
         
-        # Local broadcast
-        return await self._broadcast_local(defense_session_id, message, exclude_ws)
+        return sent_count
+    
+    async def _publish_to_redis(self, channel: str, message: Dict[str, Any]) -> None:
+        """Publish to Redis (fire-and-forget helper)."""
+        try:
+            await asyncio.wait_for(
+                self._redis_service.publish(channel, message),
+                timeout=1.0  # Max 1s, don't block
+            )
+        except asyncio.TimeoutError:
+            logger.debug(f"Redis publish timeout for {channel}")
+        except Exception as e:
+            logger.debug(f"Redis publish error: {e}")
     
     async def _broadcast_local(
         self,
@@ -160,7 +181,11 @@ class SessionRoomManager:
         return sent_count
     
     def _start_subscriber(self, defense_session_id: str) -> None:
-        """Start Redis Pub/Sub subscriber for a room."""
+        """Start Redis Pub/Sub subscriber for a room.
+        
+        This is for CROSS-CONTAINER communication only.
+        Messages from same container are already broadcast locally.
+        """
         if defense_session_id in self._subscriber_tasks:
             return
         
@@ -172,13 +197,23 @@ class SessionRoomManager:
                     return
                 
                 logger.info(f"📡 Started Redis subscriber for room {defense_session_id}")
+                my_container_id = id(self)  # This container's unique ID
                 
                 async for message in pubsub.listen():
                     if message["type"] == "message":
                         try:
                             data = json.loads(message["data"])
-                            # Broadcast to local connections (already broadcasted via Redis)
-                            await self._broadcast_local(defense_session_id, data)
+                            
+                            # Skip messages from same container (already broadcast locally)
+                            source_container_id = data.pop("_source_container_id", None)
+                            if source_container_id == my_container_id:
+                                continue  # Skip - already handled locally
+                            
+                            # Remove other meta fields
+                            data.pop("_exclude_ws_id", None)
+                            
+                            # Broadcast to local connections (from OTHER containers)
+                            await self._broadcast_local(defense_session_id, data, exclude_ws=None)
                         except json.JSONDecodeError:
                             pass
                         except Exception as e:
