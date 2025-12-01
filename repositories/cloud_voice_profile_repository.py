@@ -49,53 +49,29 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
         return self.blob_repo.profile_exists_in_blob(user_id)
 
     def load_profile(self, user_id: str) -> Dict[str, Any]:
-        """Load profile with L1/L2/L3 cache hierarchy (sync).
-        Uses L1 memory cache, then best-effort L2 Redis (if safe), then L3 Blob.
-        If running inside an event loop, skips Redis to avoid deadlocks.
+        """Load profile with L1/L3 cache hierarchy (sync).
+        Uses L1 memory cache, then L3 Blob.
+        Redis L2 cache is only used in async context via load_profile_async.
         """
         # L1: Memory cache (hot profiles)
         if user_id in self._memory_cache:
             logger.debug(f"L1 cache hit: {user_id}")
             return self._memory_cache[user_id]
         
-        # L2: Redis cache (5 min TTL)
-        cache_key = f"voice:profile:{user_id}"
-        try:
-            asyncio.get_running_loop()
-            can_use_async = False
-        except RuntimeError:
-            can_use_async = True
-
-        if can_use_async and self.redis_service is not None:
-            try:
-                cached_data = asyncio.run(self.redis_service.get(cache_key))
-                if cached_data:
-                    logger.debug(f"L2 cache hit: {user_id}")
-                    profile = cached_data if isinstance(cached_data, dict) else json.loads(cached_data)
-                    self._memory_cache[user_id] = profile
-                    return profile
-            except Exception as e:
-                logger.debug(f"Redis get failed (continuing without L2): {e}")
-        
-        # L3: Azure Blob (source of truth)
+        # L3: Azure Blob (source of truth) - skip Redis in sync context to avoid deadlock
         try:
             data = self.blob_repo.download_voice_profile(user_id)
             if data is None:
                 raise VoiceProfileNotFoundError(f"Profile not found for user: {user_id}")
             
-            # Validate and populate caches
+            # Validate and populate L1 cache
             try:
                 model = VoiceProfileModel(**data)
                 data = model.dict()
             except Exception as ve:
                 logger.warning(f"VoiceProfile validation failed for {user_id}: {ve}")
             self._memory_cache[user_id] = data
-            if can_use_async and self.redis_service is not None:
-                try:
-                    asyncio.run(self.redis_service.setex(cache_key, self._redis_ttl, json.dumps(data)))
-                except Exception as e:
-                    logger.debug(f"Redis setex failed (continuing): {e}")
-            logger.debug(f"L3 blob fetch + cache updated: {user_id}")
+            logger.debug(f"L3 blob fetch + L1 cache updated: {user_id}")
             return data
         except Exception as e:
             logger.error(f"Failed to load profile from blob: {user_id} | {e}")
@@ -110,23 +86,10 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
         # Upload JSON via blob repo (overwrite)
         self.blob_repo.upload_voice_profile(user_id, profile_data)
         
-        # Invalidate L1 cache
+        # Invalidate L1 cache only (Redis invalidation happens in async context)
         self._memory_cache.pop(user_id, None)
         
-        # Invalidate L2 cache
-        cache_key = f"voice:profile:{user_id}"
-        try:
-            asyncio.get_running_loop()
-            can_use_async = False
-        except RuntimeError:
-            can_use_async = True
-        if can_use_async and self.redis_service is not None:
-            try:
-                asyncio.run(self.redis_service.delete(cache_key))
-            except Exception as e:
-                logger.debug(f"Redis delete failed (continuing): {e}")
-        
-        logger.debug(f"Profile saved + caches invalidated: {user_id}")
+        logger.debug(f"Profile saved + L1 cache invalidated: {user_id}")
 
     def create_profile(self, user_id: str, name: str, embedding_dim: int) -> Dict[str, Any]:
         profile_data = {

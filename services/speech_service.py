@@ -34,11 +34,32 @@ from repositories.interfaces.i_redis_service import IRedisService
 
 logger = logging.getLogger(__name__)
 
-# Constants
-IDENTIFY_MIN_SECONDS = 1.2  # Min audio length for identification
-IDENTIFY_WINDOW_SECONDS = 2.5  # Window of audio to analyze
-HISTORY_SECONDS = 4.0  # Keep 4s of audio history
-IDENTIFY_INTERVAL_SECONDS = 0.5  # Reduced from 0.6s for faster speaker changes
+# Constants - Optimized for faster response on production
+IDENTIFY_MIN_SECONDS = 0.8  # Reduced from 1.2s for faster initial identification
+IDENTIFY_WINDOW_SECONDS = 2.0  # Reduced from 2.5s for quicker speaker changes
+HISTORY_SECONDS = 3.0  # Reduced from 4s - less memory, faster processing
+IDENTIFY_INTERVAL_SECONDS = 0.4  # Reduced from 0.5s for more responsive updates
+
+# Redis operation timeout (don't let cache slow down recognition)
+REDIS_TIMEOUT_SECONDS = 0.5  # Max 500ms for any Redis operation
+
+# Dedicated thread pool for CPU-bound voice identification (avoid blocking event loop)
+import concurrent.futures
+_VOICE_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
+def _get_voice_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Get or create dedicated executor for voice identification."""
+    global _VOICE_EXECUTOR
+    if _VOICE_EXECUTOR is None:
+        # Use 2-4 workers depending on CPU cores (voice ID is CPU-intensive)
+        import os
+        max_workers = min(4, max(2, (os.cpu_count() or 2)))
+        _VOICE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="voice_id_"
+        )
+        logger.info(f"Created voice identification executor with {max_workers} workers")
+    return _VOICE_EXECUTOR
 
 
 def _normalize_speaker_label(name: str | None) -> str:
@@ -247,20 +268,38 @@ class SpeechService(ISpeechService):
             
             cache_key = f"speaker:id:{audio_hash}"
             
-            cached_result = await self.redis_service.get(cache_key)
+            # Redis get with timeout (don't block recognition)
+            cached_result = None
+            try:
+                cached_result = await asyncio.wait_for(
+                    self.redis_service.get(cache_key),
+                    timeout=REDIS_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.debug(f"Redis get timeout for {cache_key}")
+            except Exception as e:
+                logger.debug(f"Redis get error: {e}")
+            
             if cached_result:
                 logger.debug(f"✅ Cache hit: {audio_hash}")
                 result = cached_result
             else:
                 try:
+                    # Use dedicated executor to avoid blocking event loop
+                    executor = _get_voice_executor()
                     result = await loop.run_in_executor(
-                        None,
+                        executor,
                         self.voice_service.identify_speaker,
                         wav_bytes,
                         whitelist_user_ids,
                     )
-                    # Cache 2 min (giảm từ 5 min)
-                    await self.redis_service.set(cache_key, result, ttl=120)
+                    # Cache result (fire-and-forget, don't block)
+                    asyncio.create_task(
+                        asyncio.wait_for(
+                            self.redis_service.set(cache_key, result, ttl=90),
+                            timeout=REDIS_TIMEOUT_SECONDS
+                        )
+                    )
                 except Exception as exc:
                     logger.warning(f"Voice identification failed: {exc}")
                     return
@@ -870,33 +909,46 @@ class SpeechService(ISpeechService):
                 if token.strip()
             ]
         
-        # Fetch defense session users whitelist if session_id provided
-        whitelist_user_ids = None
-        if defense_session_id and self.voice_service:
-            # P3 #11: Add retry logic for whitelist fetch
-            for attempt in range(3):
-                try:
-                    whitelist_user_ids = await self.voice_service.get_defense_session_users(defense_session_id)
-                    if whitelist_user_ids:
-                        logger.info(
-                            f"🎯 Defense session {defense_session_id}: "
-                            f"Will identify only among {len(whitelist_user_ids)} users"
-                        )
-                        break
-                    else:
-                        if attempt == 2:
-                            logger.warning(f"⚠️ Failed to fetch users for defense session {defense_session_id} after 3 attempts")
-                        else:
-                            await asyncio.sleep(1 ** attempt)  # 0s, 1s, 2s
-                except Exception as e:
-                    if attempt == 2:
-                        logger.exception(f"Error fetching defense session users after 3 retries: {e}")
-                    else:
-                        logger.warning(f"Retry {attempt + 1}/3 fetching defense session users: {e}")
-                        await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
-        
-        # Session metadata
+        # Session metadata - MUST define before using
         session_id = ws.headers.get("sec-websocket-key", f"session_{id(ws)}")
+        
+        # Send immediate connected confirmation to client (before any blocking operations)
+        try:
+            await ws.send_json({
+                "type": "connected",
+                "session_id": session_id,
+                "message": "WebSocket connected, starting recognition..."
+            })
+            logger.info(f"✅ Sent connected event | session_id={session_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send connected event: {e}")
+        
+        # Fetch defense session users whitelist in background (non-blocking)
+        whitelist_user_ids = None
+        whitelist_fetch_task = None
+        
+        async def _fetch_whitelist_background():
+            """Fetch whitelist in background - fire and forget."""
+            nonlocal whitelist_user_ids
+            if not defense_session_id or not self.voice_service:
+                return
+            try:
+                # Single attempt with short timeout
+                result = await asyncio.wait_for(
+                    self.voice_service.get_defense_session_users(defense_session_id),
+                    timeout=2.0  # Reduced from 3s
+                )
+                if result:
+                    whitelist_user_ids = result
+                    logger.info(f"🎯 Whitelist loaded: {len(whitelist_user_ids)} users")
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ Whitelist fetch timeout")
+            except Exception as e:
+                logger.debug(f"Whitelist fetch skipped: {e}")
+        
+        # Start background fetch immediately (don't await)
+        if defense_session_id and self.voice_service:
+            whitelist_fetch_task = asyncio.create_task(_fetch_whitelist_background())
         session_start = datetime.utcnow()
         transcript_lines = []
         
@@ -1091,9 +1143,12 @@ class SpeechService(ISpeechService):
         reader_task = asyncio.create_task(websocket_reader())
         
         try:
-            logger.info(f"Starting STT session | session_id={session_id} | speaker={speaker_label}")
+            logger.info(f"Starting STT session | session_id={session_id}")
             
-            # Stream recognition results
+            # DON'T wait for whitelist - start recognition immediately
+            # Whitelist will be used when it becomes available
+            
+            # Stream recognition results (no blocking waits)
             async for event in self.recognize_stream_from_queue(
                 audio_queue,
                 speaker_label=speaker_label,

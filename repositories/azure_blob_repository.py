@@ -165,15 +165,19 @@ class AzureBlobRepository:
             logger.error(f"Failed to check profile existence for user {user_id}: {e}")
             return False
 
-    def list_voice_profile_ids(self) -> list[str]:
+    def list_voice_profile_ids(self, max_results: int = 500) -> list[str]:
         """List user_ids that have a profile JSON in the container.
 
         Tolerates extra nested paths by extracting the last two segments.
         Valid profile path pattern: <user_id>/profile.json
+        
+        Args:
+            max_results: Maximum number of profiles to return (default 500 to prevent timeout)
         """
         results: list[str] = []
         try:
-            for blob in self.container_client.list_blobs():
+            # Use results_per_page to limit API calls and prevent timeout
+            for blob in self.container_client.list_blobs(results_per_page=100):
                 name = blob.name  # e.g. user123/profile.json
                 if not name.endswith('/profile.json'):
                     continue
@@ -183,6 +187,10 @@ class AzureBlobRepository:
                 # Extract user_id from path: user_id/profile.json
                 user_id = parts[-2]
                 results.append(user_id)
+                # Limit results to prevent timeout
+                if len(results) >= max_results:
+                    logger.warning(f"list_voice_profile_ids truncated at {max_results} results")
+                    break
             return results
         except Exception as e:
             logger.error(f"Failed listing voice profiles in blob: {e}")

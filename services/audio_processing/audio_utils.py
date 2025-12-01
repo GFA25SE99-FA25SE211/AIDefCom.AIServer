@@ -10,7 +10,10 @@ import numpy as np
 
 
 class NoiseFilter:
-    """Simple RMS-based noise gate with soft threshold and gentle gain."""
+    """Simple RMS-based noise gate with soft threshold and gentle gain.
+    
+    Optimized for low-latency streaming - processes frames quickly.
+    """
 
     def __init__(self, sample_rate: int = 16000, voice_threshold: float = 0.002):
         """
@@ -22,10 +25,14 @@ class NoiseFilter:
         """
         self.sample_rate = sample_rate
         self.voice_threshold = voice_threshold
+        # Pre-calculated constants for faster processing
+        self._frame_size = max(1, int(0.02 * sample_rate))  # 20ms frames
+        self._threshold_scale = voice_threshold * 32768.0
+        self._atten = 0.3  # soft attenuation
 
     def reduce_noise(self, audio_data: bytes) -> bytes:
         """
-        Apply noise reduction with a soft gate and percentile-based gain normalization.
+        Apply lightweight noise reduction optimized for streaming.
 
         Args:
             audio_data: Raw PCM audio bytes (int16)
@@ -33,46 +40,49 @@ class NoiseFilter:
         Returns:
             Filtered audio bytes (int16)
         """
+        # Fast path for empty data
+        if not audio_data or len(audio_data) < 4:
+            return audio_data
+        
         # Convert to float32 samples in int16 scale
         samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
         if samples.size == 0:
             return audio_data
 
-        # === NOISE GATE (SOFT) ===
-        # 20ms frames, hop = frame_size (non-overlap) for simplicity
-        frame_size = max(1, int(0.02 * self.sample_rate))
-        # Compute per-frame RMS to estimate baseline
-        rms_vals = []
-        for start in range(0, samples.size, frame_size):
-            window = samples[start:start + frame_size]
-            if window.size == 0:
-                continue
-            rms_vals.append(float(np.sqrt(np.mean(window * window) + 1e-10)))
-        if len(rms_vals) == 0:
+        # Simplified noise gate - use vectorized operations
+        frame_size = self._frame_size
+        num_frames = samples.size // frame_size
+        
+        if num_frames == 0:
+            # Too short, just return with minimal processing
             return audio_data
-        baseline = float(np.percentile(rms_vals, 20))
-        # Set threshold slightly above baseline, keep a minimal floor
-        threshold = max(100.0, baseline * 1.2)
-        atten = 0.3  # soft attenuation for sub-threshold frames
-
-        # Apply soft gating
-        for start in range(0, samples.size, frame_size):
-            window = samples[start:start + frame_size]
-            if window.size == 0:
-                continue
-            rms = float(np.sqrt(np.mean(window * window) + 1e-10))
-            if rms < max(threshold, self.voice_threshold * 32768.0):
-                samples[start:start + frame_size] = window * atten
-
-        # === GAIN NORMALIZATION ===
-        # Normalize based on 98th percentile peak (ignore outliers)
-        peak = float(np.percentile(np.abs(samples), 98))
-        if peak > 0:
-            target_peak = 30000.0  # Target peak amplitude
-            gain = min(2.5, target_peak / peak)  # allow up to 2.5x gain
-            samples = np.clip(samples * gain, -32768, 32767)
-
-        return samples.astype(np.int16).tobytes()
+        
+        # Reshape for vectorized RMS calculation
+        truncated_size = num_frames * frame_size
+        frames = samples[:truncated_size].reshape(num_frames, frame_size)
+        
+        # Vectorized RMS calculation (much faster than loop)
+        rms_per_frame = np.sqrt(np.mean(frames * frames, axis=1) + 1e-10)
+        
+        # Fast threshold: use median instead of percentile (faster)
+        baseline = float(np.median(rms_per_frame))
+        threshold = max(100.0, baseline * 1.2, self._threshold_scale)
+        
+        # Apply soft gating using boolean mask (vectorized)
+        low_energy_mask = rms_per_frame < threshold
+        frames[low_energy_mask] *= self._atten
+        
+        # Rebuild samples
+        samples[:truncated_size] = frames.flatten()
+        
+        # Fast gain normalization using max (faster than percentile)
+        peak = float(np.max(np.abs(samples)))
+        if peak > 100:  # Only normalize if there's meaningful signal
+            gain = min(2.0, 28000.0 / peak)  # Slightly lower target for speed
+            if gain > 1.1:  # Only apply if meaningful gain
+                samples = samples * gain
+        
+        return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
 
 class AudioQualityAnalyzer:

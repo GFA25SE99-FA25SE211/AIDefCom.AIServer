@@ -125,6 +125,26 @@ class VoiceService(IVoiceService):
         # Embedding caches for performance
         self._embedding_cache: Dict[str, np.ndarray] = {}
         self._mean_cache: Dict[str, np.ndarray] = {}
+        self._profiles_preloaded: bool = False
+    
+    def preload_enrolled_profiles(self) -> int:
+        """Preload all enrolled profiles into memory cache.
+        
+        Call this on startup to avoid cold-start delays during identification.
+        Returns the number of profiles preloaded.
+        """
+        if self._profiles_preloaded:
+            return len(self._embedding_cache)
+        
+        try:
+            profiles = self._get_enrolled_profiles_batch()
+            count = len(profiles)
+            self._profiles_preloaded = True
+            logger.info(f"✅ Preloaded {count} enrolled profiles into cache")
+            return count
+        except Exception as e:
+            logger.warning(f"Failed to preload profiles: {e}")
+            return 0
     
     def _get_user_from_api(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch user info from .NET API."""
