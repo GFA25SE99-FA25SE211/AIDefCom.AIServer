@@ -125,9 +125,11 @@ class QuestionService(IQuestionService):
     ) -> dict:
         """Register a new question in Redis."""
         key = self._get_session_key(session_id)
+        logger.info(f"📝 register_question | key={key}")
         
         # Get existing questions (already parsed by RedisService!)
         questions = await self.redis_service.get(key) or []
+        logger.info(f"📋 Existing questions: {len(questions)}")
         
         # Add new question
         question = {
@@ -139,10 +141,15 @@ class QuestionService(IQuestionService):
         questions.append(question)
         
         # Save back to Redis (RedisService will auto-stringify!)
-        await self.redis_service.set(key, questions, ttl=self.session_ttl)
+        save_result = await self.redis_service.set(key, questions, ttl=self.session_ttl)
+        logger.info(f"💾 Saved {len(questions)} questions to Redis | success={save_result}")
+        
+        # Verify save worked
+        verify = await self.redis_service.get(key)
+        logger.info(f"✅ Verify after save: {len(verify) if verify else 0} questions")
         
         return {
-            'success': True,
+            'success': save_result,
             'question_id': question['id'],
             'total_questions': len(questions)
         }
@@ -171,13 +178,17 @@ class QuestionService(IQuestionService):
         Uses lock to prevent race conditions where two identical questions
         are submitted at the same time and both pass duplicate check.
         """
+        # Log session_id để debug xem có đúng defense_session_id không
+        logger.info(f"🔍 check_and_register called | session_id={session_id} | text='{question_text[:50]}'")
+        
         # Get lock for this session to ensure atomicity
         lock = self._get_session_lock(session_id)
         
         async with lock:
-            logger.info(f"🔒 Acquired lock for session {session_id} | checking: '{question_text[:50]}'")
+            logger.info(f"🔒 Acquired lock for session {session_id}")
             
             is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
+            logger.info(f"🔎 Duplicate check result: is_dup={is_dup}, similar_count={len(similar)}")
             
             registered = False
             question_id = None
@@ -186,12 +197,13 @@ class QuestionService(IQuestionService):
                 reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
                 registered = reg.get("success", False)
                 question_id = reg.get("question_id")
-                logger.info(f"✅ Registered question #{question_id} | text='{question_text[:50]}'")
+                logger.info(f"✅ Registered question #{question_id} | registered={registered}")
             else:
                 logger.info(f"🔄 Duplicate detected | text='{question_text[:50]}' | similar_count={len(similar)}")
             
             # Get total questions count (after possible registration)
             existing = await self.get_questions(session_id)
+            logger.info(f"📊 Total questions in session {session_id}: {len(existing)}")
             
             logger.info(f"🔓 Released lock for session {session_id}")
             

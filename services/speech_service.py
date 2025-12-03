@@ -168,6 +168,9 @@ class SpeechService(ISpeechService):
         Yields:
             Recognition events
         """
+        # DEBUG: Force print to see if voice_service is available
+        print(f"🔊 recognize_stream_from_queue | voice_service={self.voice_service is not None} | whitelist={whitelist_user_ids}")
+        
         logger.info(f"🎙️  Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
         loop = asyncio.get_running_loop()
 
@@ -233,13 +236,19 @@ class SpeechService(ISpeechService):
             nonlocal current_confidence_score, last_reinforce_ts, last_switch_ts
             nonlocal interruption_detected
 
+            logger.info(f"🎤 resolve_speaker_from_history called | voice_service={self.voice_service is not None}")
+            
             if self.voice_service is None:
+                logger.warning("⚠️ voice_service is None, skipping identification")
                 return
 
             async with history_lock:
                 pcm_snapshot = bytes(audio_history)
 
+            logger.info(f"🎤 Audio history: {len(pcm_snapshot)} bytes | min_required: {min_identify_bytes} bytes")
+            
             if len(pcm_snapshot) < min_identify_bytes:
+                logger.debug(f"⏳ Not enough audio yet: {len(pcm_snapshot)} < {min_identify_bytes}")
                 return
 
             # Chỉ lấy đoạn cuối để tăng tốc nhận diện
@@ -268,17 +277,22 @@ class SpeechService(ISpeechService):
                 audio_hash = hashlib.md5(wav_bytes).hexdigest()[:16]
             
             cache_key = f"speaker:id:{audio_hash}"
+            print(f"🔑 [resolve] cache_key={cache_key}")
             
             # Redis get with timeout (don't block recognition)
             cached_result = None
             try:
+                print(f"🔍 [resolve] checking Redis cache...")
                 cached_result = await asyncio.wait_for(
                     self.redis_service.get(cache_key),
                     timeout=REDIS_TIMEOUT_SECONDS
                 )
+                print(f"🔍 [resolve] Redis cache result: {cached_result is not None}")
             except asyncio.TimeoutError:
+                print(f"⏰ [resolve] Redis get timeout")
                 logger.debug(f"Redis get timeout for {cache_key}")
             except Exception as e:
+                print(f"❌ [resolve] Redis get error: {e}")
                 logger.debug(f"Redis get error: {e}")
             
             if cached_result:
@@ -287,21 +301,28 @@ class SpeechService(ISpeechService):
             else:
                 try:
                     # Use dedicated executor to avoid blocking event loop
+                    print(f"🧠 [resolve] calling voice_service.identify_speaker with whitelist={whitelist_user_ids}")
                     executor = _get_voice_executor()
+                    print(f"🧠 [resolve] got executor, running in executor...")
                     result = await loop.run_in_executor(
                         executor,
                         self.voice_service.identify_speaker,
                         wav_bytes,
                         whitelist_user_ids,
                     )
-                    # Cache result (fire-and-forget, don't block)
-                    asyncio.create_task(
-                        asyncio.wait_for(
-                            self.redis_service.set(cache_key, result, ttl=90),
-                            timeout=REDIS_TIMEOUT_SECONDS
-                        )
-                    )
+                    print(f"🧠 [resolve] identify_speaker returned: {result}")
+                    # Cache result (fire-and-forget, don't block, ignore errors)
+                    async def _cache_result_safe():
+                        try:
+                            await asyncio.wait_for(
+                                self.redis_service.set(cache_key, result, ttl=90),
+                                timeout=REDIS_TIMEOUT_SECONDS
+                            )
+                        except Exception:
+                            pass  # Ignore cache errors - not critical
+                    asyncio.create_task(_cache_result_safe())
                 except Exception as exc:
+                    print(f"❌ [resolve] voice identification failed: {exc}")
                     logger.warning(f"Voice identification failed: {exc}")
                     return
 
@@ -332,20 +353,48 @@ class SpeechService(ISpeechService):
                     if isinstance(second_score_raw, (int, float)):
                         margin = confidence_score - float(second_score_raw)
             else:
+                # FALLBACK: Use top candidate if cosine is reasonable
+                # STRICT thresholds to prevent false positives (guests recognized as enrolled users)
+                FALLBACK_COSINE_THRESHOLD = 0.40  # Increased from 0.30 - require stronger match
+                FALLBACK_MARGIN_THRESHOLD = 0.08  # Increased from 0.02 - require clear winner
+                WEAK_COSINE_THRESHOLD = 0.30      # Weak match threshold (was 0.20)
+                
                 if candidates:
                     top_candidate = candidates[0]
-                    new_name = _normalize_speaker_label(top_candidate.get("name"))
-                    new_user = top_candidate.get("user_id") or new_user
-                    score_val = top_candidate.get("cosine")
-                    if isinstance(score_val, (int, float)):
-                        confidence_score = float(score_val)
-                    confidence_level = self._score_to_confidence(confidence_score)
-                    if len(candidates) > 1:
-                        second_score_raw = candidates[1].get("cosine")
-                        if isinstance(second_score_raw, (int, float)):
-                            margin = (confidence_score or 0.0) - float(second_score_raw)
-                    forced = True
-                    logger.info(f"   ⚠️  Using top candidate (forced): {new_name} | score={confidence_score:.3f}")
+                    top_cosine = top_candidate.get("cosine", 0.0)
+                    second_cosine = candidates[1].get("cosine", 0.0) if len(candidates) > 1 else 0.0
+                    top_margin = top_cosine - second_cosine
+                    
+                    print(f"🔎 [resolve] FALLBACK check: top={top_cosine:.3f} | second={second_cosine:.3f} | margin={top_margin:.3f}")
+                    
+                    # STRICT: Accept only if BOTH conditions met
+                    # 1. Cosine > 0.40 (strong match)
+                    # 2. Margin > 0.08 (clearly better than alternatives)
+                    if top_cosine >= FALLBACK_COSINE_THRESHOLD and top_margin >= FALLBACK_MARGIN_THRESHOLD:
+                        new_name = _normalize_speaker_label(top_candidate.get("name"))
+                        new_user = top_candidate.get("user_id") or top_candidate.get("id")
+                        confidence_score = top_cosine
+                        confidence_level = self._score_to_confidence(confidence_score)
+                        margin = top_margin
+                        forced = True
+                        print(f"✅ [resolve] FALLBACK accepted: {new_name} | cosine={top_cosine:.3f} | margin={top_margin:.3f}")
+                        logger.info(f"   ✅ FALLBACK accepted: {new_name} | cosine={top_cosine:.3f} | margin={top_margin:.3f}")
+                    elif top_cosine >= WEAK_COSINE_THRESHOLD and top_margin >= (FALLBACK_MARGIN_THRESHOLD * 0.5):
+                        # Weak match - require margin >= 0.04
+                        new_name = _normalize_speaker_label(top_candidate.get("name"))
+                        new_user = top_candidate.get("user_id") or top_candidate.get("id")
+                        confidence_score = top_cosine
+                        confidence_level = "uncertain"
+                        margin = top_margin
+                        forced = True
+                        print(f"⚠️ [resolve] WEAK match: {new_name} | cosine={top_cosine:.3f} | margin={top_margin:.3f}")
+                        logger.info(f"   ⚠️ WEAK match: {new_name} | cosine={top_cosine:.3f} | margin={top_margin:.3f}")
+                    else:
+                        # Too low or margin too small - default to Khách
+                        new_name = "Khách"
+                        new_user = None
+                        print(f"❌ [resolve] Rejected: cosine={top_cosine:.3f} margin={top_margin:.3f}, defaulting to Khách")
+                        logger.info(f"   ❌ Rejected: cosine={top_cosine:.3f} margin={top_margin:.3f}, defaulting to Khách")
                 else:
                     new_name = "Khách"
                     new_user = None
@@ -408,6 +457,43 @@ class SpeechService(ISpeechService):
             
             margin_str = f"{margin:.3f}" if margin is not None else "N/A"
             logger.info(f"🎯 Decision params: name={new_name} | score={score_for_decision:.3f} | threshold={cosine_threshold:.3f} | identified={explicit_identified} | forced={forced} | margin={margin_str}")
+            
+            # ========== FALLBACK FAST-PATH ==========
+            # If forced=True (from FALLBACK logic), the speaker was already validated
+            # with stricter thresholds. Trust it and switch immediately.
+            if forced and new_name and new_name != "Khách":
+                # Accept fallback result with validation (already checked in FALLBACK block)
+                FALLBACK_MIN_SCORE = 0.30  # Match WEAK_COSINE_THRESHOLD
+                FALLBACK_MIN_MARGIN = 0.04  # Match FALLBACK_MARGIN_THRESHOLD * 0.5
+                if score_for_decision >= FALLBACK_MIN_SCORE and (margin is None or margin >= FALLBACK_MIN_MARGIN):
+                    switch_reason = f"fallback_accepted_score_{score_for_decision:.2f}"
+                    print(f"🚀 [switch] FALLBACK fast-path: {new_name} | score={score_for_decision:.3f} | margin={margin_str}")
+                    logger.info(f"🚀 FALLBACK fast-path switch to {new_name}")
+                    # Skip all other checks, go directly to switch
+                    now_ts = loop.time()
+                    async with speaker_state_lock:
+                        # Force switch - don't rely on speaker_tracker return value
+                        speaker_tracker.switch_speaker(
+                            new_speaker=new_name,
+                            new_user_id=new_user,
+                            timestamp=now_ts,
+                            confidence=score_for_decision,
+                            reason=switch_reason
+                        )
+                        # ALWAYS update current_speaker for FALLBACK
+                        current_speaker = new_name
+                        current_user_id = new_user
+                        pending_candidate = None
+                        pending_user_id = None
+                        pending_hits = 0
+                        pending_top_score = 0.0
+                        last_reinforce_ts = now_ts
+                        current_confidence_score = score_for_decision
+                        print(f"✅ [switch] current_speaker updated to: {current_speaker}")
+                        logger.info(f"🔄 Speaker switched to: {new_name} (reason={switch_reason})")
+                    return
+            
+            # ========== NORMAL STRICT PATH ==========
             # NEW: Stricter thresholds for better accuracy
             high_score_required = cosine_threshold + 0.08  # Increased from +0.06
             medium_score_required = cosine_threshold + 0.04  # Increased from +0.02
@@ -538,7 +624,10 @@ class SpeechService(ISpeechService):
             """Schedule speaker identification tasks with throttling."""
             nonlocal identify_task, last_identify_ts
 
+            print(f"📅 schedule_identification called | force={force} | blocking={blocking}")
+
             if self.voice_service is None:
+                print("❌ schedule_identification: voice_service is None!")
                 return
 
             if identify_task and not identify_task.done():
@@ -547,27 +636,39 @@ class SpeechService(ISpeechService):
                         await identify_task
                     identify_task = None
                 else:
+                    print("⏭️ schedule_identification: task already running, skipping")
                     return
 
             async with history_lock:
                 history_len = len(audio_history)
 
+            print(f"📏 schedule_identification: history_len={history_len} | min_required={min_identify_bytes}")
+
             if history_len < min_identify_bytes:
+                print("⏳ schedule_identification: not enough audio, skipping")
                 return
 
             now = loop.time()
             if not force and (now - last_identify_ts) < identify_interval:
+                print(f"⏱️ schedule_identification: throttled ({now - last_identify_ts:.2f}s < {identify_interval}s)")
                 return
+            
+            print("✅ schedule_identification: starting identification task")
 
             last_identify_ts = now
 
             async def _run_identification() -> None:
                 nonlocal identify_task
+                print("🏃 _run_identification: ENTERED")
                 try:
+                    print("🏃 _run_identification: calling resolve_speaker_from_history...")
                     await resolve_speaker_from_history()
+                    print("🏃 _run_identification: resolve_speaker_from_history COMPLETED")
                 except Exception as exc:
+                    print(f"❌ _run_identification: EXCEPTION: {exc}")
                     logger.warning(f"Identification task failed: {exc}")
                 finally:
+                    print("🏃 _run_identification: FINALLY - setting identify_task = None")
                     identify_task = None
 
             identify_task = asyncio.create_task(_run_identification())
@@ -581,6 +682,7 @@ class SpeechService(ISpeechService):
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
             """Read audio from queue, buffer for identification, and yield for Azure."""
             nonlocal frame_buffer, previous_audio_chunk, interruption_detected
+            chunks_processed = 0
 
             try:
                 while True:
@@ -588,10 +690,17 @@ class SpeechService(ISpeechService):
                     
                     # None signals end of stream
                     if audio_data is None:
+                        logger.info(f"🔚 Audio stream ended after {chunks_processed} chunks")
                         break
 
                     if not audio_data:
                         continue
+                    
+                    chunks_processed += 1
+                    if chunks_processed == 1:
+                        print(f"🎧 audio_chunk_stream: First chunk | voice_service={self.voice_service is not None}")
+                    if chunks_processed % 50 == 0:
+                        print(f"📦 audio_chunk_stream: {chunks_processed} chunks processed")
 
                     if len(audio_data) > 8192:
                         audio_data = audio_data[:8192]
@@ -652,6 +761,9 @@ class SpeechService(ISpeechService):
                             else:
                                 # Not enough audio yet, just schedule with throttle
                                 self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
+
+                        # CRITICAL: Yield control to event loop so identification tasks can run
+                        await asyncio.sleep(0)
 
                         yield chunk
 
@@ -1019,6 +1131,9 @@ class SpeechService(ISpeechService):
         # WebSocket reader task
         async def websocket_reader() -> None:
             """Read audio chunks and commands from WebSocket."""
+            nonlocal whitelist_user_ids  # Access whitelist from outer scope
+            audio_chunk_count = 0
+            
             try:
                 while not stop_event.is_set():
                     try:
@@ -1030,6 +1145,11 @@ class SpeechService(ISpeechService):
                         
                         if "bytes" in data:
                             # Audio data -> push to queue
+                            audio_chunk_count += 1
+                            if audio_chunk_count == 1:
+                                logger.info(f"🎤 First audio chunk received! size={len(data['bytes'])} bytes")
+                            elif audio_chunk_count % 100 == 0:
+                                logger.info(f"🎤 Audio chunks received: {audio_chunk_count}")
                             try:
                                 audio_queue.put_nowait(data["bytes"])
                             except asyncio.QueueFull:
@@ -1254,12 +1374,20 @@ class SpeechService(ISpeechService):
         reader_task = asyncio.create_task(websocket_reader())
         
         try:
-            logger.info(f"Starting STT session | session_id={session_id}")
+            logger.info(f"🚀 Starting STT session | session_id={session_id} | defense_session_id={defense_session_id}")
+            logger.info(f"🔧 voice_service={self.voice_service is not None} | question_service={self.question_service is not None}")
             
-            # DON'T wait for whitelist - start recognition immediately
-            # Whitelist will be used when it becomes available
+            # Wait for whitelist fetch (with short timeout) - important for speaker identification!
+            if whitelist_fetch_task and not whitelist_fetch_task.done():
+                try:
+                    await asyncio.wait_for(whitelist_fetch_task, timeout=3.0)
+                    logger.info(f"✅ Whitelist ready: {len(whitelist_user_ids) if whitelist_user_ids else 0} users | IDs={whitelist_user_ids}")
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ Whitelist fetch timeout, proceeding without whitelist")
+            else:
+                logger.info(f"📋 Whitelist status: task={whitelist_fetch_task} | user_ids={whitelist_user_ids}")
             
-            # Stream recognition results (no blocking waits)
+            # Stream recognition results
             async for event in self.recognize_stream_from_queue(
                 audio_queue,
                 speaker_label=speaker_label,

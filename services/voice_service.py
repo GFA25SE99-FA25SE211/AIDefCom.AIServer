@@ -85,15 +85,16 @@ class VoiceService(IVoiceService):
         self.embedding_dim = model_repo.get_embedding_dim()
         self.model_tag = model_repo.get_model_tag()
         
-        # Thresholds - IMPROVED for better accuracy
+        # Thresholds - RELAXED for streaming STT identification
         self.enrollment_threshold = 0.76
-        # Increased from 0.70/0.78 to 0.75/0.80 for better speaker discrimination
-        self.cosine_threshold = 0.80 if self.model_tag == "xvector" else 0.75
-        self.verification_threshold = max(self.cosine_threshold + 0.05, 0.82)
+        # RELAXED: Lowered from 0.75 to 0.55 for streaming identification
+        # Enrollment still uses strict threshold, but identification is more lenient
+        self.cosine_threshold = 0.65 if self.model_tag == "xvector" else 0.55
+        self.verification_threshold = max(self.cosine_threshold + 0.10, 0.70)
         # NEW: Margin threshold for speaker switching (prevent false switches)
         self.speaker_switch_margin = 0.06  # Top-2 margin requirement
         self.speaker_switch_hits_required = 3  # Require 3 consecutive hits
-        self.angle_cap = float(np.deg2rad(ANGLE_CAP_DEG))
+        self.angle_cap = float(np.deg2rad(60))  # RELAXED: from 45 to 60 degrees
         self.z_threshold = 2.2
         self.enroll_min_similarity = 0.63 if self.model_tag == "ecapa" else 0.68
         self.enroll_decay_per_sample = 0.035
@@ -444,18 +445,19 @@ class VoiceService(IVoiceService):
                     return None
                 
                 data = response.json()
+                logger.info(f"📦 Defense session API response: {str(data)[:300]}")
                 
                 # Extract user IDs from response
                 if "data" in data and isinstance(data["data"], list):
-                    user_ids = [user["id"] for user in data["data"] if "id" in user]
-                    logger.info(f"✅ Fetched {len(user_ids)} users from defense session {session_id}")
+                    user_ids = [str(user["id"]) for user in data["data"] if "id" in user]
+                    logger.info(f"✅ Fetched {len(user_ids)} users from defense session {session_id}: {user_ids}")
                     return user_ids
                 
                 # Try alternative response formats
                 if isinstance(data, list):
-                    user_ids = [user["id"] for user in data if isinstance(user, dict) and "id" in user]
+                    user_ids = [str(user["id"]) for user in data if isinstance(user, dict) and "id" in user]
                     if user_ids:
-                        logger.info(f"✅ Fetched {len(user_ids)} users (array format) from session {session_id}")
+                        logger.info(f"✅ Fetched {len(user_ids)} users (array format) from session {session_id}: {user_ids}")
                         return user_ids
                 
                 logger.warning(f"⚠️ Invalid response format: {str(data)[:200]}")
@@ -1067,20 +1069,33 @@ class VoiceService(IVoiceService):
         import concurrent.futures
 
         all_ids = self.profile_repo.list_profiles()
+        logger.info(f"📋 All profile IDs in repo: {all_ids}")
+        
         if whitelist_user_ids:
-            id_set = set(whitelist_user_ids)
-            target_ids = [uid for uid in all_ids if uid in id_set]
+            logger.info(f"📋 Whitelist user IDs: {whitelist_user_ids}")
+            id_set = set(str(uid) for uid in whitelist_user_ids)  # Ensure string comparison
+            target_ids = [uid for uid in all_ids if str(uid) in id_set]
+            logger.info(f"📋 Target IDs (intersection): {target_ids}")
         else:
             target_ids = all_ids
+            logger.info(f"📋 No whitelist, using all {len(target_ids)} profiles")
 
         def load_one(uid: str) -> Optional[Dict[str, Any]]:
             try:
                 profile = self.profile_repo.load_profile(uid)
-                if profile.get("enrollment_status") != "enrolled" or profile.get("enrollment_count", 0) < 3:
+                enrollment_status = profile.get("enrollment_status")
+                enrollment_count = profile.get("enrollment_count", 0)
+                
+                if enrollment_status != "enrolled" or enrollment_count < 3:
+                    logger.debug(f"⏭️ Skip {uid}: status={enrollment_status}, count={enrollment_count}")
                     return None
+                    
                 embeddings = self.profile_repo.get_embeddings(uid)
                 if not embeddings:
+                    logger.debug(f"⏭️ Skip {uid}: no embeddings")
                     return None
+                    
+                logger.info(f"✅ Loaded profile {uid}: {profile.get('name')} | {len(embeddings)} embeddings")
                 # Normalize embeddings matrix
                 mat = np.stack(embeddings, axis=0).astype(np.float32)
                 norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-6
@@ -1131,6 +1146,8 @@ class VoiceService(IVoiceService):
                 mean_angle = float(np.arccos(mean_cosine))
 
             sample_matrix = profile.get("embeddings_norm")
+            sample_count = 0  # Track sample count for logging
+            
             if sample_matrix is None:
                 # Fallback: build normalized matrix on the fly
                 sample_vecs = []
@@ -1147,6 +1164,10 @@ class VoiceService(IVoiceService):
                 if not sample_vecs and mean_vec is not None:
                     sample_vecs = [mean_vec]
                 sample_matrix = np.stack(sample_vecs, axis=0)
+                sample_count = len(sample_vecs)
+            else:
+                # sample_matrix already exists
+                sample_count = sample_matrix.shape[0] if hasattr(sample_matrix, 'shape') else 0
 
             sample_cosines = np.clip(sample_matrix @ probe_norm, -1.0, 1.0)
             max_sample_cosine = float(np.max(sample_cosines))
@@ -1173,7 +1194,7 @@ class VoiceService(IVoiceService):
                 "best_sample_angle": best_sample_angle,
                 "avg_sample_cosine": avg_sample_cosine,
                 "score_source": score_source,
-                "sample_count": len(sample_vecs),
+                "sample_count": sample_count,
             })
         
         return candidates
