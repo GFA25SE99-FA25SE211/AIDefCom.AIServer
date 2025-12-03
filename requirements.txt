@@ -9,7 +9,8 @@ httpx
 pyaudio
 torch
 torchaudio
-speechbrain
+pyannote.audio
+pytorch-lightning==2.4.0
 soundfile
 huggingface_hub
 numpy

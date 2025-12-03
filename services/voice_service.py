@@ -5,14 +5,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Protocol
 
 import httpx
 import numpy as np
 
 from core.exceptions import VoiceProfileNotFoundError, VoiceAuthenticationError, AudioValidationError
 from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
-from repositories.models.speechbrain_model import SpeechBrainModelRepository
 from services.interfaces.i_voice_service import IVoiceService
 from services.audio_processing.audio_utils import (
     AudioQualityAnalyzer,
@@ -28,16 +27,25 @@ MIN_ENROLL_SAMPLES = 3
 ANGLE_CAP_DEG = 45.0
 
 
+class EmbeddingModel(Protocol):
+    """Protocol for embedding models."""
+    embedding_dim: int
+    model_tag: str
+    sample_rate: int
+    
+    def extract_embedding(self, audio_signal: np.ndarray) -> np.ndarray: ...
+    def get_embedding_dim(self) -> int: ...
+    def get_model_tag(self) -> str: ...
+
+
 @dataclass
 class QualityThresholds:
     """Audio quality thresholds for enrollment and verification."""
     min_duration: float = 1.5  # Reduced from 2.0s for faster first-utterance identification
     min_enroll_duration: float = 10.0
-    # Balanced RMS floors for typical consumer mics
-    rms_floor_ecapa: float = 0.006  # Balanced
-    rms_floor_xvector: float = 0.008
-    voiced_floor: float = 0.15  # Balanced - allow some silence but not too much
-    snr_floor_db: float = 10.0  # Balanced - more tolerant than 15 but not too low
+    rms_floor: float = 0.005  # Very tolerant for streaming audio
+    voiced_floor: float = 0.10  # Lower threshold - allow more silence
+    snr_floor_db: float = 8.0  # Lower SNR threshold for noisy environments
     clip_ceiling: float = 0.03
 
 class VoiceService(IVoiceService):
@@ -46,7 +54,7 @@ class VoiceService(IVoiceService):
     def __init__(
         self,
         voice_profile_repo: IVoiceProfileRepository,
-        model_repo: SpeechBrainModelRepository,
+        model_repo: EmbeddingModel,
         thresholds: QualityThresholds | None = None,
         azure_blob_repo: Any = None,
         sql_server_repo: Any = None,
@@ -56,7 +64,7 @@ class VoiceService(IVoiceService):
         
         Args:
             voice_profile_repo: Interface for voice profile persistence
-            model_repo: Repository for SpeechBrain model
+            model_repo: Repository for embedding model (Pyannote/WeSpeaker)
             thresholds: Quality thresholds for audio validation
             azure_blob_repo: Optional Azure Blob Storage repository
             sql_server_repo: Optional SQL Server repository
@@ -84,18 +92,16 @@ class VoiceService(IVoiceService):
         self.embedding_dim = model_repo.get_embedding_dim()
         self.model_tag = model_repo.get_model_tag()
         
-        # Thresholds - Balanced for streaming STT identification
-        # After fixing double noise filtering, these can be more reasonable
+        # Thresholds for WeSpeaker model (256-dim embeddings)
         self.enrollment_threshold = 0.76
-        # Balanced: After fixing preprocessing, cosine should be 0.4-0.7 for correct matches
-        self.cosine_threshold = 0.50 if self.model_tag == "xvector" else 0.35
-        self.verification_threshold = max(self.cosine_threshold + 0.10, 0.50)
+        self.cosine_threshold = 0.45  # WeSpeaker typically has higher similarity scores
+        self.verification_threshold = 0.55
         # Margin threshold for speaker switching
-        self.speaker_switch_margin = 0.05  # Top-2 margin requirement
-        self.speaker_switch_hits_required = 2  # Require 2 consecutive hits for switch
-        self.angle_cap = float(np.deg2rad(75))  # Balanced: 75 degrees
-        self.z_threshold = 1.8  # Balanced
-        self.enroll_min_similarity = 0.63 if self.model_tag == "ecapa" else 0.68
+        self.speaker_switch_margin = 0.05
+        self.speaker_switch_hits_required = 2
+        self.angle_cap = float(np.deg2rad(75))
+        self.z_threshold = 1.8
+        self.enroll_min_similarity = 0.65
         self.enroll_decay_per_sample = 0.035
         
         # Adaptive gain and relax controls (from Config via environment)
@@ -107,11 +113,16 @@ class VoiceService(IVoiceService):
             self.gain_max: float = float(getattr(_AppConfig, "VOICE_GAIN_MAX", 10.0))
             self.dynamic_rms_relax: bool = bool(getattr(_AppConfig, "VOICE_DYNAMIC_RMS_RELAX", True))
             # Override threshold dataclass values from environment if present
-            self.thresholds.rms_floor_ecapa = float(getattr(_AppConfig, "VOICE_RMS_FLOOR_ECAPA", self.thresholds.rms_floor_ecapa))
-            self.thresholds.rms_floor_xvector = float(getattr(_AppConfig, "VOICE_RMS_FLOOR_XVECTOR", self.thresholds.rms_floor_xvector))
+            self.thresholds.rms_floor = float(getattr(_AppConfig, "VOICE_RMS_FLOOR", self.thresholds.rms_floor))
             self.thresholds.voiced_floor = float(getattr(_AppConfig, "VOICE_VOICED_FLOOR", self.thresholds.voiced_floor))
             self.thresholds.snr_floor_db = float(getattr(_AppConfig, "VOICE_SNR_FLOOR_DB", self.thresholds.snr_floor_db))
             self.thresholds.clip_ceiling = float(getattr(_AppConfig, "VOICE_CLIP_CEILING", self.thresholds.clip_ceiling))
+        except Exception:
+            # Safe fallbacks
+            self.gain_target_pctl = 98
+            self.gain_target_peak = 0.80
+            self.gain_max = 10.0
+            self.dynamic_rms_relax = True
         except Exception:
             # Safe fallbacks
             self.gain_target_pctl = 98
@@ -206,6 +217,33 @@ class VoiceService(IVoiceService):
             del self._session_profiles_cache[defense_session_id]
             logger.info(f"🧹 Cleared profile cache for session {defense_session_id}")
     
+    def _invalidate_user_caches(self, user_id: str) -> None:
+        """Invalidate all caches for a user after enrollment/update.
+        
+        This forces the next identification to reload fresh embeddings from storage.
+        """
+        # Clear embedding cache
+        if user_id in self._embedding_cache:
+            del self._embedding_cache[user_id]
+            logger.info(f"🧹 Invalidated embedding cache for {user_id}")
+        
+        # Clear mean cache
+        if user_id in self._mean_cache:
+            del self._mean_cache[user_id]
+            logger.info(f"🧹 Invalidated mean cache for {user_id}")
+        
+        # Clear from all session caches (user may have re-enrolled during session)
+        for session_id, profiles in list(self._session_profiles_cache.items()):
+            for i, profile in enumerate(profiles):
+                if profile.get("user_id") == user_id:
+                    del profiles[i]
+                    logger.info(f"🧹 Removed {user_id} from session {session_id} cache (will reload on next use)")
+                    break
+        
+        # Reset preloaded flag so next global load will refresh
+        self._profiles_preloaded = False
+        logger.info(f"🔄 Reset profiles preloaded flag - will reload on next startup/request")
+
     def identify_speaker_with_cache(
         self,
         audio_bytes: bytes,
@@ -536,6 +574,9 @@ class VoiceService(IVoiceService):
             except Exception as e:
                 logger.warning(f"Failed to update profile stats for {user_id}: {e}")
                 # Non-fatal, continue
+            
+            # CRITICAL: Invalidate caches for this user to force reload with new embeddings
+            self._invalidate_user_caches(user_id)
             
             # Update enrollment status
             enrollment_count = len(embeddings)
@@ -1154,7 +1195,7 @@ class VoiceService(IVoiceService):
         rescued = False
         gain_scale = 1.0
         pctl = 0.0
-        if pre_rms < (self.thresholds.rms_floor_ecapa if self.model_tag == "ecapa" else self.thresholds.rms_floor_xvector):
+        if pre_rms < self.thresholds.rms_floor:
             abs_sig = np.abs(signal_norm)
             pctl = float(np.percentile(abs_sig, self.gain_target_pctl)) if abs_sig.size else 0.0
             if pctl > 1e-6:
@@ -1176,11 +1217,7 @@ class VoiceService(IVoiceService):
         rms, voiced_ratio, snr_db, clipping_ratio = self.quality_analyzer.estimate_quality(signal_norm)
         
         # Check quality thresholds
-        rms_floor = (
-            self.thresholds.rms_floor_ecapa
-            if self.model_tag == "ecapa"
-            else self.thresholds.rms_floor_xvector
-        )
+        rms_floor = self.thresholds.rms_floor
         
         quality_ok = True
         reason = None
@@ -1415,13 +1452,19 @@ class VoiceService(IVoiceService):
         probe_norm = probe / (np.linalg.norm(probe) + 1e-6)
         candidates = []
         
+        logger.info(f"🔍 Calculating scores for {len(profiles)} profiles | probe_dim={probe.shape} | expected_dim={self.embedding_dim}")
+        
         for profile in profiles:
             mean_vec = profile.get("mean_embedding_norm")
             mean_cosine = None
             mean_angle = None
+            profile_dim = mean_vec.size if isinstance(mean_vec, np.ndarray) else 0
+            
             if isinstance(mean_vec, np.ndarray) and mean_vec.size == self.embedding_dim:
                 mean_cosine = float(np.clip(np.dot(probe_norm, mean_vec), -1.0, 1.0))
                 mean_angle = float(np.arccos(mean_cosine))
+            elif isinstance(mean_vec, np.ndarray):
+                logger.warning(f"⚠️ DIMENSION MISMATCH: Profile '{profile.get('name')}' has dim={profile_dim}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
 
             sample_matrix = profile.get("embeddings_norm")
             sample_count = 0  # Track sample count for logging
@@ -1440,12 +1483,24 @@ class VoiceService(IVoiceService):
                 if not sample_vecs and mean_vec is None:
                     continue
                 if not sample_vecs and mean_vec is not None:
-                    sample_vecs = [mean_vec]
+                    # mean_vec dimension already checked above
+                    if mean_vec.size == self.embedding_dim:
+                        sample_vecs = [mean_vec]
+                    else:
+                        logger.warning(f"⚠️ SKIP: Profile '{profile.get('name')}' has incompatible dim={mean_vec.size}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
+                        continue
+                if not sample_vecs:
+                    continue
                 sample_matrix = np.stack(sample_vecs, axis=0)
                 sample_count = len(sample_vecs)
             else:
-                # sample_matrix already exists
+                # sample_matrix already exists - check dimension compatibility
                 sample_count = sample_matrix.shape[0] if hasattr(sample_matrix, 'shape') else 0
+                if hasattr(sample_matrix, 'shape') and len(sample_matrix.shape) >= 2:
+                    sample_dim = sample_matrix.shape[1]
+                    if sample_dim != self.embedding_dim:
+                        logger.warning(f"⚠️ SKIP: Profile '{profile.get('name')}' has preloaded embeddings with dim={sample_dim}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
+                        continue
 
             sample_cosines = np.clip(sample_matrix @ probe_norm, -1.0, 1.0)
             max_sample_cosine = float(np.max(sample_cosines))
@@ -1460,6 +1515,9 @@ class VoiceService(IVoiceService):
             score = max(mean_cosine, max_sample_cosine)
             score_source = "mean" if score == mean_cosine else "sample"
             angle = mean_angle if score_source == "mean" else best_sample_angle
+            
+            # DEBUG: Log actual scores for each profile
+            logger.info(f"📊 Profile '{profile.get('name')}' | mean_cos={mean_cosine:.3f} | max_sample_cos={max_sample_cosine:.3f} | score={score:.3f} | samples={sample_count}")
             
             candidates.append({
                 "id": profile["user_id"],

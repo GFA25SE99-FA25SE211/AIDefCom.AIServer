@@ -68,8 +68,7 @@ class Config:
     MAX_ENROLLMENT_COUNT: int = 3  # Maximum enrollment samples per user
     
     # Voice Authentication Thresholds (tunable via env vars)
-    VOICE_COSINE_THRESHOLD_XVECTOR: float = float(os.getenv("VOICE_COSINE_THRESHOLD_XVECTOR", "0.80"))
-    VOICE_COSINE_THRESHOLD_ECAPA: float = float(os.getenv("VOICE_COSINE_THRESHOLD_ECAPA", "0.75"))
+    VOICE_COSINE_THRESHOLD: float = float(os.getenv("VOICE_COSINE_THRESHOLD", "0.45"))
     VOICE_SPEAKER_LOCK_DECAY_SECONDS: float = float(os.getenv("VOICE_SPEAKER_LOCK_DECAY_SECONDS", "5.0"))
     VOICE_SPEAKER_SWITCH_MARGIN: float = float(os.getenv("VOICE_SPEAKER_SWITCH_MARGIN", "0.06"))
     VOICE_SPEAKER_SWITCH_HITS_REQUIRED: int = int(os.getenv("VOICE_SPEAKER_SWITCH_HITS_REQUIRED", "3"))
@@ -91,14 +90,12 @@ class Config:
     MAX_AUDIO_BYTES: int = MAX_AUDIO_SIZE_MB * 1024 * 1024
 
     # Voice quality thresholds (override defaults if needed)
-    VOICE_MIN_DURATION: float = float(os.getenv("VOICE_MIN_DURATION", "2.0"))
+    VOICE_MIN_DURATION: float = float(os.getenv("VOICE_MIN_DURATION", "1.5"))
     VOICE_MIN_ENROLL_DURATION: float = float(os.getenv("VOICE_MIN_ENROLL_DURATION", "10.0"))
-    # Slightly more permissive defaults to avoid false "quiet" detections; can be tightened via .env
-    VOICE_RMS_FLOOR_ECAPA: float = float(os.getenv("VOICE_RMS_FLOOR_ECAPA", "0.008"))
-    VOICE_RMS_FLOOR_XVECTOR: float = float(os.getenv("VOICE_RMS_FLOOR_XVECTOR", "0.010"))
-    VOICE_VOICED_FLOOR: float = float(os.getenv("VOICE_VOICED_FLOOR", "0.15"))
-    VOICE_SNR_FLOOR_DB: float = float(os.getenv("VOICE_SNR_FLOOR_DB", "12.0"))
-    VOICE_CLIP_CEILING: float = float(os.getenv("VOICE_CLIP_CEILING", "0.02"))
+    VOICE_RMS_FLOOR: float = float(os.getenv("VOICE_RMS_FLOOR", "0.005"))
+    VOICE_VOICED_FLOOR: float = float(os.getenv("VOICE_VOICED_FLOOR", "0.10"))
+    VOICE_SNR_FLOOR_DB: float = float(os.getenv("VOICE_SNR_FLOOR_DB", "8.0"))
+    VOICE_CLIP_CEILING: float = float(os.getenv("VOICE_CLIP_CEILING", "0.03"))
 
     # Adaptive gain/relax controls
     VOICE_GAIN_TARGET_PCTL: int = int(os.getenv("VOICE_GAIN_TARGET_PCTL", "98"))

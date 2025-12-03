@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import warnings
 from contextlib import asynccontextmanager
+
+# Suppress torchcodec warnings before any pyannote imports
+warnings.filterwarnings("ignore", message=".*torchcodec.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*libtorchcodec.*", category=UserWarning)
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,14 +72,14 @@ async def background_warmup():
         except Exception as e:
             print(f"⚠️ [Warmup] Redis warmup skipped: {e}")
         
-        # Stage 2: Load SpeechBrain model (heaviest - ~400MB) - IN THREAD POOL
+        # Stage 2: Load embedding model (Pyannote/WeSpeaker) - IN THREAD POOL
         _warmup_status = {"stage": "loading_voice_model", "progress": 20, "error": None}
         print("🔄 [Warmup] Loading voice model...")
         start = time.time()
         
         def _load_voice_model():
-            from api.dependencies import get_speechbrain_model_repository
-            return get_speechbrain_model_repository()
+            from api.dependencies import get_embedding_model_repository
+            return get_embedding_model_repository()
         
         await asyncio.wait_for(_run_sync(_load_voice_model), timeout=120.0)
         gc.collect()
