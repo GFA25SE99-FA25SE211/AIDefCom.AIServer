@@ -72,7 +72,7 @@ async def enroll_voice(
     **REST API:** `POST /voice/users/{user_id}/enroll`
     
     **Process:**
-    1. Nhận audio và trích xuất embedding (SpeechBrain ECAPA-TDNN)
+    1. Nhận audio và trích xuất embedding (Pyannote/WeSpeaker)
     2. Lưu embedding + metadata (cloud storage)
     3. Cập nhật số mẫu; complete khi đạt `min_required` (3)
 

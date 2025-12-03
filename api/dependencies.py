@@ -8,7 +8,7 @@ from functools import lru_cache
 from app.config import Config
 from repositories.azure_speech_repository import AzureSpeechRepository
 from repositories.cloud_voice_profile_repository import CloudVoiceProfileRepository
-from repositories.models.speechbrain_model import SpeechBrainModelRepository
+from repositories.models.embedding_model import EmbeddingModelRepository
 from repositories.azure_blob_repository import AzureBlobRepository
 from repositories.sql_server_repository import SQLServerRepository
 from repositories.interfaces.i_sql_server_repository import ISQLServerRepository
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Singleton instances
 _azure_speech_repo: ISpeechRepository | None = None
 _cloud_voice_profile_repo: IVoiceProfileRepository | None = None
-_speechbrain_model_repo: SpeechBrainModelRepository | None = None
+_embedding_model_repo: EmbeddingModelRepository | None = None
 _azure_blob_repo: AzureBlobRepository | None = None
 _sql_server_repo: ISQLServerRepository | None = None
 _voice_service: IVoiceService | None = None
@@ -68,15 +68,14 @@ def get_voice_profile_repository() -> IVoiceProfileRepository:
 
 
 @lru_cache()
-def get_speechbrain_model_repository() -> SpeechBrainModelRepository:
-    """Get SpeechBrain model repository instance."""
-    global _speechbrain_model_repo
-    if _speechbrain_model_repo is None:
-        _speechbrain_model_repo = SpeechBrainModelRepository(
-            models_dir=Config.MODELS_DIR,
+def get_embedding_model_repository() -> EmbeddingModelRepository:
+    """Get speaker embedding model repository instance (Pyannote/WeSpeaker)."""
+    global _embedding_model_repo
+    if _embedding_model_repo is None:
+        _embedding_model_repo = EmbeddingModelRepository(
             sample_rate=Config.SAMPLE_RATE,
         )
-    return _speechbrain_model_repo
+    return _embedding_model_repo
 
 
 @lru_cache()
@@ -152,8 +151,7 @@ def get_voice_service() -> IVoiceService:
         thresholds = QualityThresholds(
             min_duration=Config.VOICE_MIN_DURATION,
             min_enroll_duration=Config.VOICE_MIN_ENROLL_DURATION,
-            rms_floor_ecapa=Config.VOICE_RMS_FLOOR_ECAPA,
-            rms_floor_xvector=Config.VOICE_RMS_FLOOR_XVECTOR,
+            rms_floor=Config.VOICE_RMS_FLOOR,
             voiced_floor=Config.VOICE_VOICED_FLOOR,
             snr_floor_db=Config.VOICE_SNR_FLOOR_DB,
             clip_ceiling=Config.VOICE_CLIP_CEILING,
@@ -161,7 +159,7 @@ def get_voice_service() -> IVoiceService:
 
         _voice_service = VoiceService(
             voice_profile_repo=get_voice_profile_repository(),
-            model_repo=get_speechbrain_model_repository(),
+            model_repo=get_embedding_model_repository(),  # Use factory-created model
             thresholds=thresholds,
             azure_blob_repo=get_azure_blob_repository(),
             sql_server_repo=get_sql_server_repository(),

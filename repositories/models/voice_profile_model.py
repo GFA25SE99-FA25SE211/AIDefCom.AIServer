@@ -43,7 +43,7 @@ class VoiceProfile(BaseModel):
     def validate_embeddings(cls, v: List[List[float]], values):
         """Validate embedding dimensions - warn but don't fail for mismatches.
         
-        This allows loading profiles created with different models (e.g., xvector vs ecapa).
+        This allows loading profiles created with different embedding dimensions.
         The VoiceService will handle dimension mismatches at runtime.
         """
         dim = values.get("embedding_dim")
