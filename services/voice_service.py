@@ -31,15 +31,14 @@ ANGLE_CAP_DEG = 45.0
 @dataclass
 class QualityThresholds:
     """Audio quality thresholds for enrollment and verification."""
-    min_duration: float = 2.0  # Lowered from 5.0 for streaming compatibility
+    min_duration: float = 1.5  # Reduced from 2.0s for faster first-utterance identification
     min_enroll_duration: float = 10.0
-    # Lower RMS floors to reduce false "nói nhỏ" (quiet speech) detections on typical consumer mics.
-    # Can still be overridden via environment (Config VOICE_RMS_FLOOR_*).
-    rms_floor_ecapa: float = 0.008  # was 0.012
-    rms_floor_xvector: float = 0.010  # was 0.015
-    voiced_floor: float = 0.20
-    snr_floor_db: float = 15.0
-    clip_ceiling: float = 0.02
+    # Balanced RMS floors for typical consumer mics
+    rms_floor_ecapa: float = 0.006  # Balanced
+    rms_floor_xvector: float = 0.008
+    voiced_floor: float = 0.15  # Balanced - allow some silence but not too much
+    snr_floor_db: float = 10.0  # Balanced - more tolerant than 15 but not too low
+    clip_ceiling: float = 0.03
 
 class VoiceService(IVoiceService):
     """Voice authentication business logic service."""
@@ -85,17 +84,17 @@ class VoiceService(IVoiceService):
         self.embedding_dim = model_repo.get_embedding_dim()
         self.model_tag = model_repo.get_model_tag()
         
-        # Thresholds - RELAXED for streaming STT identification
+        # Thresholds - Balanced for streaming STT identification
+        # After fixing double noise filtering, these can be more reasonable
         self.enrollment_threshold = 0.76
-        # RELAXED: Lowered from 0.75 to 0.55 for streaming identification
-        # Enrollment still uses strict threshold, but identification is more lenient
-        self.cosine_threshold = 0.65 if self.model_tag == "xvector" else 0.55
-        self.verification_threshold = max(self.cosine_threshold + 0.10, 0.70)
-        # NEW: Margin threshold for speaker switching (prevent false switches)
-        self.speaker_switch_margin = 0.06  # Top-2 margin requirement
-        self.speaker_switch_hits_required = 3  # Require 3 consecutive hits
-        self.angle_cap = float(np.deg2rad(60))  # RELAXED: from 45 to 60 degrees
-        self.z_threshold = 2.2
+        # Balanced: After fixing preprocessing, cosine should be 0.4-0.7 for correct matches
+        self.cosine_threshold = 0.50 if self.model_tag == "xvector" else 0.35
+        self.verification_threshold = max(self.cosine_threshold + 0.10, 0.50)
+        # Margin threshold for speaker switching
+        self.speaker_switch_margin = 0.05  # Top-2 margin requirement
+        self.speaker_switch_hits_required = 2  # Require 2 consecutive hits for switch
+        self.angle_cap = float(np.deg2rad(75))  # Balanced: 75 degrees
+        self.z_threshold = 1.8  # Balanced
         self.enroll_min_similarity = 0.63 if self.model_tag == "ecapa" else 0.68
         self.enroll_decay_per_sample = 0.035
         
@@ -127,6 +126,8 @@ class VoiceService(IVoiceService):
         self._embedding_cache: Dict[str, np.ndarray] = {}
         self._mean_cache: Dict[str, np.ndarray] = {}
         self._profiles_preloaded: bool = False
+        # Session-specific profile cache (populated by preload_session_profiles)
+        self._session_profiles_cache: Dict[str, List[Dict[str, Any]]] = {}
     
     def preload_enrolled_profiles(self) -> int:
         """Preload all enrolled profiles into memory cache.
@@ -146,6 +147,218 @@ class VoiceService(IVoiceService):
         except Exception as e:
             logger.warning(f"Failed to preload profiles: {e}")
             return 0
+    
+    def preload_session_profiles(
+        self, 
+        defense_session_id: str,
+        user_ids: List[str],
+        user_info_map: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Preload và cache profiles cho một defense session.
+        Gọi 1 lần khi bắt đầu session, dùng lại suốt phiên.
+        
+        Args:
+            defense_session_id: ID của defense session
+            user_ids: List of user IDs in this session
+            user_info_map: Optional dict mapping user_id -> {"name", "role", "display_name"}
+                           If provided, profiles will use display_name for speaker identification
+        
+        Returns:
+            List of profiles với embeddings đã normalize, sẵn sàng cho identification
+        """
+        # Check if already cached
+        cache_key = defense_session_id
+        if cache_key in self._session_profiles_cache:
+            cached = self._session_profiles_cache[cache_key]
+            logger.info(f"🔥 Using cached profiles for session {defense_session_id}: {len(cached)} profiles")
+            return cached
+        
+        # Load profiles for this session
+        profiles = self._get_enrolled_profiles_batch(user_ids)
+        
+        # Override profile names with display_name from user_info_map (if provided)
+        if user_info_map:
+            for profile in profiles:
+                user_id = profile.get("user_id")
+                if user_id and user_id in user_info_map:
+                    info = user_info_map[user_id]
+                    # Use display_name: "Tên (Vai trò)" for speaker identification
+                    profile["name"] = info.get("display_name") or info.get("name") or profile.get("name")
+                    profile["role"] = info.get("role", "")
+                    logger.debug(f"   Profile {user_id} -> display_name: {profile['name']}")
+        
+        # Cache for this session
+        self._session_profiles_cache[cache_key] = profiles
+        
+        logger.info(f"🔥 Preloaded {len(profiles)} profiles for session {defense_session_id}")
+        for p in profiles:
+            logger.info(f"   - {p.get('user_id')}: {p.get('name')}")
+        return profiles
+    
+    def get_session_profiles(self, defense_session_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Get cached profiles for a session, or None if not preloaded."""
+        return self._session_profiles_cache.get(defense_session_id)
+    
+    def clear_session_cache(self, defense_session_id: str) -> None:
+        """Clear cached profiles for a session (call when session ends)."""
+        if defense_session_id in self._session_profiles_cache:
+            del self._session_profiles_cache[defense_session_id]
+            logger.info(f"🧹 Cleared profile cache for session {defense_session_id}")
+    
+    def identify_speaker_with_cache(
+        self,
+        audio_bytes: bytes,
+        preloaded_profiles: List[Dict[str, Any]],
+        pre_filtered: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Identify speaker using pre-loaded profiles (no DB/Blob I/O).
+        Much faster than identify_speaker() for streaming use cases.
+        
+        Args:
+            audio_bytes: Audio to identify
+            preloaded_profiles: Output from preload_session_profiles()
+            pre_filtered: True if audio already noise-filtered
+            
+        Returns:
+            Identification result (same format as identify_speaker)
+        """
+        # Process audio
+        try:
+            embedding, quality = self._process_audio(audio_bytes, skip_noise_filter=pre_filtered)
+        except Exception as e:
+            logger.exception("Audio processing failed during identify_with_cache")
+            return {
+                "type": "identify",
+                "success": False,
+                "identified": False,
+                "speaker_id": None,
+                "speaker_name": None,
+                "score": 0.0,
+                "confidence": 0.0,
+                "message": f"Failed to process audio: {e}",
+            }
+        
+        # Check quality
+        if not quality.get("ok"):
+            return {
+                "type": "identify",
+                "success": False,
+                "identified": False,
+                "speaker_id": None,
+                "speaker_name": None,
+                "score": 0.0,
+                "confidence": 0.0,
+                "message": quality.get("reason", "Audio quality check failed"),
+                "quality": quality,
+            }
+        
+        if not preloaded_profiles:
+            return {
+                "type": "identify",
+                "success": False,
+                "identified": False,
+                "speaker_id": None,
+                "speaker_name": None,
+                "score": 0.0,
+                "confidence": 0.0,
+                "message": "No enrolled profiles in session cache",
+                "quality": quality,
+            }
+        
+        # Calculate scores using cached profiles (NO DB/Blob I/O!)
+        candidates = self._calculate_candidate_scores(embedding, preloaded_profiles)
+        logger.debug(f"🔍 Identify (cached): {len(candidates)} candidates scored")
+        
+        if not candidates:
+            return {
+                "type": "identify",
+                "success": False,
+                "identified": False,
+                "speaker_id": None,
+                "speaker_name": None,
+                "score": 0.0,
+                "confidence": 0.0,
+                "message": "No valid embeddings in cached profiles",
+                "quality": quality,
+            }
+        
+        # Sort by cosine similarity
+        candidates.sort(key=lambda x: x["cosine"], reverse=True)
+        best = candidates[0]
+        
+        # Calculate z-score for cohort analysis
+        cohort_scores = [c["cosine"] for c in candidates[1:]]
+        if cohort_scores:
+            cohort_mean = float(np.mean(cohort_scores))
+            cohort_std = float(np.std(cohort_scores))
+            if cohort_std < 1e-5:
+                cohort_std = 1e-5
+            zscore = (best["cosine"] - cohort_mean) / cohort_std
+        else:
+            zscore = None
+        cohort_size = len(cohort_scores)
+        
+        # Decision logic (same as identify_speaker)
+        accepted, reasons = self._accept_identification(best, zscore, cohort_size)
+        
+        logger.info(
+            "🔍 Best candidate (cached): %s | cosine=%.3f | angle=%.1f° | accepted=%s",
+            best.get("name"),
+            best.get("cosine", 0),
+            float(np.rad2deg(best.get("angle", 0))),
+            accepted,
+        )
+        
+        # Format candidates for response
+        all_candidates = [
+            {
+                "name": c.get("name"),
+                "id": c.get("id"),
+                "user_id": c.get("user_id"),
+                "cosine": c.get("cosine"),
+                "mean_cosine": c.get("mean_cosine"),
+                "max_sample_cosine": c.get("max_sample_cosine"),
+                "angle_deg": float(np.rad2deg(c.get("angle", 0))),
+                "score_source": c.get("score_source", "mean"),
+            }
+            for c in candidates[:5]
+        ]
+        
+        if accepted:
+            confidence = self._score_confidence(best["cosine"])
+            return {
+                "type": "identify",
+                "success": True,
+                "identified": True,
+                "speaker_id": best.get("id"),
+                "speaker": best.get("name"),
+                "user_id": best.get("user_id") or best.get("id"),
+                "score": best.get("cosine"),
+                "confidence": confidence,
+                "angular_dist": best.get("angle"),
+                "zscore": float(zscore) if zscore is not None else None,
+                "quality": quality,
+                "candidates": all_candidates,
+                "message": "Speaker identified successfully (cached)",
+            }
+        
+        return {
+            "type": "identify",
+            "success": False,
+            "identified": False,
+            "speaker_id": None,
+            "speaker_name": None,
+            "score": best.get("cosine"),
+            "confidence": 0.0,
+            "angular_dist": best.get("angle"),
+            "zscore": float(zscore) if zscore is not None else None,
+            "message": "Voice does not match any enrolled user",
+            "reasons": reasons,
+            "quality": quality,
+            "candidates": all_candidates,
+        }
     
     def _get_user_from_api(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch user info from .NET API."""
@@ -420,6 +633,21 @@ class VoiceService(IVoiceService):
         Returns:
             List of user IDs or None if failed
         """
+        result = await self.get_defense_session_users_with_info(session_id)
+        if result is None:
+            return None
+        return list(result.keys())
+    
+    async def get_defense_session_users_with_info(self, session_id: str) -> Optional[Dict[str, Dict[str, str]]]:
+        """Fetch user info (id, name, role) from defense session.
+        
+        Args:
+            session_id: Defense session ID
+            
+        Returns:
+            Dict mapping user_id -> {"name": "...", "role": "...", "display_name": "Tên (Vai trò)"}
+            or None if failed
+        """
         from app.config import Config
         
         if not Config.AUTH_SERVICE_BASE_URL:
@@ -445,22 +673,58 @@ class VoiceService(IVoiceService):
                     return None
                 
                 data = response.json()
-                logger.info(f"📦 Defense session API response: {str(data)[:300]}")
+                logger.info(f"📦 Defense session API response: {str(data)[:500]}")
                 
-                # Extract user IDs from response
+                users_info: Dict[str, Dict[str, str]] = {}
+                
+                # Extract user info from response
+                users_list = []
                 if "data" in data and isinstance(data["data"], list):
-                    user_ids = [str(user["id"]) for user in data["data"] if "id" in user]
-                    logger.info(f"✅ Fetched {len(user_ids)} users from defense session {session_id}: {user_ids}")
-                    return user_ids
+                    users_list = data["data"]
+                elif isinstance(data, list):
+                    users_list = data
                 
-                # Try alternative response formats
-                if isinstance(data, list):
-                    user_ids = [str(user["id"]) for user in data if isinstance(user, dict) and "id" in user]
-                    if user_ids:
-                        logger.info(f"✅ Fetched {len(user_ids)} users (array format) from session {session_id}: {user_ids}")
-                        return user_ids
+                for user in users_list:
+                    if not isinstance(user, dict) or "id" not in user:
+                        continue
+                    
+                    user_id = str(user["id"])
+                    # Try to get name from various fields
+                    name = (
+                        user.get("fullName") or 
+                        user.get("name") or 
+                        user.get("displayName") or 
+                        user.get("userName") or
+                        user_id
+                    )
+                    # Try to get role
+                    role = (
+                        user.get("role") or 
+                        user.get("roleName") or 
+                        user.get("roleInSession") or
+                        user.get("position") or
+                        ""
+                    )
+                    
+                    # Create display name: "Tên (Vai trò)" or just "Tên"
+                    if role:
+                        display_name = f"{name} ({role})"
+                    else:
+                        display_name = name
+                    
+                    users_info[user_id] = {
+                        "name": name,
+                        "role": role,
+                        "display_name": display_name,
+                    }
                 
-                logger.warning(f"⚠️ Invalid response format: {str(data)[:200]}")
+                if users_info:
+                    logger.info(f"✅ Fetched {len(users_info)} users from defense session {session_id}")
+                    for uid, info in users_info.items():
+                        logger.debug(f"   - {uid}: {info['display_name']}")
+                    return users_info
+                
+                logger.warning(f"⚠️ No valid users in response: {str(data)[:200]}")
                 return None
                 
         except httpx.ConnectError as e:
@@ -473,19 +737,21 @@ class VoiceService(IVoiceService):
             logger.warning(f"⚠️ Error fetching defense session users: {e}")
             return None
     
-    def identify_speaker(self, audio_bytes: bytes, whitelist_user_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    def identify_speaker(self, audio_bytes: bytes, whitelist_user_ids: Optional[List[str]] = None, pre_filtered: bool = False) -> Dict[str, Any]:
         """
         Identify speaker from audio.
         
         Args:
             audio_bytes: Audio data (WAV or PCM)
+            whitelist_user_ids: Optional list of user IDs to filter
+            pre_filtered: If True, audio has already been noise-filtered (skip filtering)
         
         Returns:
             Identification result
         """
-        # Process audio
+        # Process audio - skip noise filter if already filtered
         try:
-            embedding, quality = self._process_audio(audio_bytes)
+            embedding, quality = self._process_audio(audio_bytes, skip_noise_filter=pre_filtered)
         except Exception as e:
             logger.exception("Audio processing failed during identify")
             return {
@@ -838,16 +1104,28 @@ class VoiceService(IVoiceService):
     
     # Private helper methods
     
-    def _process_audio(self, audio_bytes: bytes) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Process audio and extract embedding with quality check."""
+    def _process_audio(self, audio_bytes: bytes, skip_noise_filter: bool = False) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Process audio and extract embedding with quality check.
+        
+        Args:
+            audio_bytes: Raw audio bytes (WAV or PCM)
+            skip_noise_filter: If True, skip noise filtering (audio already filtered)
+        """
         # Convert to mono
         signal, sr = bytes_to_mono(audio_bytes)
         
-        # Apply noise filter (works on int16 PCM)
-        filtered = self.noise_filter.reduce_noise(
-            (signal.astype(np.float32)).astype(np.int16).tobytes()
-        )
-        signal_filtered = np.frombuffer(filtered, dtype=np.int16).astype(np.float32)
+        # Apply noise filter ONLY if not already filtered
+        # CRITICAL: Double filtering destroys voice characteristics!
+        if skip_noise_filter:
+            # Audio already filtered by speech_service, just convert to float32
+            signal_filtered = signal.astype(np.float32)
+            logger.debug("Skipping noise filter (pre-filtered audio)")
+        else:
+            # Apply noise filter (works on int16 PCM)
+            filtered = self.noise_filter.reduce_noise(
+                (signal.astype(np.float32)).astype(np.int16).tobytes()
+            )
+            signal_filtered = np.frombuffer(filtered, dtype=np.int16).astype(np.float32)
         
         # Resample if needed
         signal_filtered = resample_audio(signal_filtered, sr, self.noise_filter.sample_rate)
@@ -1209,6 +1487,9 @@ class VoiceService(IVoiceService):
         reasons = []
         accepted = True
         
+        # Log current thresholds for debugging
+        logger.info(f"🔧 Thresholds: cosine={self.cosine_threshold} | angle_cap={np.rad2deg(self.angle_cap):.1f}° | z={self.z_threshold}")
+        
         if candidate["cosine"] < self.cosine_threshold:
             accepted = False
             reasons.append(f"low_cosine ({candidate['cosine']:.3f} < {self.cosine_threshold})")
@@ -1217,7 +1498,8 @@ class VoiceService(IVoiceService):
             accepted = False
             reasons.append(f"angle_cap ({np.rad2deg(candidate['angle']):.1f}° > {np.rad2deg(self.angle_cap):.1f}°)")
         
-        if zscore is not None and cohort_size >= 2 and zscore < self.z_threshold:
+        # RELAXED: Only reject on zscore if cohort >= 3 (more reliable)
+        if zscore is not None and cohort_size >= 3 and zscore < self.z_threshold:
             accepted = False
             reasons.append(f"zscore ({zscore:.2f} < {self.z_threshold})")
         

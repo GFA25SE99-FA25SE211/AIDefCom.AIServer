@@ -35,11 +35,12 @@ from repositories.interfaces.i_redis_service import IRedisService
 
 logger = logging.getLogger(__name__)
 
-# Constants - Optimized for faster response on production
-IDENTIFY_MIN_SECONDS = 0.8  # Reduced from 1.2s for faster initial identification
-IDENTIFY_WINDOW_SECONDS = 2.0  # Reduced from 2.5s for quicker speaker changes
-HISTORY_SECONDS = 3.0  # Reduced from 4s - less memory, faster processing
-IDENTIFY_INTERVAL_SECONDS = 0.4  # Reduced from 0.5s for more responsive updates
+# Constants - Optimized for faster initial identification
+# CRITICAL: First utterance should be identified quickly (within 2-3s)
+IDENTIFY_MIN_SECONDS = 2.0  # Trigger identification as soon as we have 2s (minimum for voice_service)
+IDENTIFY_WINDOW_SECONDS = 3.0  # Use 3s window (balance between accuracy and speed)
+HISTORY_SECONDS = 5.0  # Keep 5s history for context
+IDENTIFY_INTERVAL_SECONDS = 0.3  # Check every 300ms for faster response
 
 # Redis operation timeout (don't let cache slow down recognition)
 REDIS_TIMEOUT_SECONDS = 0.5  # Max 500ms for any Redis operation
@@ -154,6 +155,8 @@ class SpeechService(ISpeechService):
         extra_phrases: Iterable[str] | None = None,
         apply_noise_filter: bool = True,
         whitelist_user_ids: Optional[List[str]] = None,
+        defense_session_id: Optional[str] = None,
+        user_info_map: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Stream speech recognition from audio queue (instead of WebSocket).
@@ -164,15 +167,41 @@ class SpeechService(ISpeechService):
             extra_phrases: Additional phrase hints
             apply_noise_filter: Whether to apply noise filtering
             whitelist_user_ids: Optional list of user IDs to filter identification (defense session)
+            defense_session_id: Optional defense session ID for profile preloading
+            user_info_map: Optional dict mapping user_id -> {name, role, display_name}
         
         Yields:
             Recognition events
         """
         # DEBUG: Force print to see if voice_service is available
-        print(f"🔊 recognize_stream_from_queue | voice_service={self.voice_service is not None} | whitelist={whitelist_user_ids}")
+        print(f"🔊 recognize_stream_from_queue | voice_service={self.voice_service is not None} | whitelist={whitelist_user_ids} | session={defense_session_id}")
         
         logger.info(f"🎙️  Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
         loop = asyncio.get_running_loop()
+        
+        # OPTIMIZATION: Preload voice profiles for defense session
+        # This loads embeddings ONCE at session start, eliminating DB/Blob I/O per identification
+        # Pass user_info_map so profiles use display_name (Tên (Vai trò)) instead of just name
+        preloaded_profiles: Optional[List[Dict[str, Any]]] = None
+        if self.voice_service and defense_session_id and whitelist_user_ids:
+            try:
+                # Use functools.partial to pass user_info_map as keyword argument
+                import functools
+                preload_fn = functools.partial(
+                    self.voice_service.preload_session_profiles,
+                    defense_session_id,
+                    whitelist_user_ids,
+                    user_info_map=user_info_map,
+                )
+                preloaded_profiles = await loop.run_in_executor(
+                    _get_voice_executor(),
+                    preload_fn,
+                )
+                print(f"✅ Preloaded {len(preloaded_profiles)} voice profiles for session {defense_session_id}")
+                logger.info(f"✅ Preloaded {len(preloaded_profiles)} voice profiles for session {defense_session_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to preload profiles: {e}, will fallback to on-demand loading")
+                preloaded_profiles = None
 
         current_speaker = _normalize_speaker_label(speaker_label)
         current_user_id: Optional[str] = None
@@ -251,12 +280,26 @@ class SpeechService(ISpeechService):
                 logger.debug(f"⏳ Not enough audio yet: {len(pcm_snapshot)} < {min_identify_bytes}")
                 return
 
-            # Chỉ lấy đoạn cuối để tăng tốc nhận diện
+            # Lấy đoạn audio cuối (voice_service yêu cầu >= 1.5s)
             samples = np.frombuffer(pcm_snapshot, dtype=np.int16)
-            window_samples = int(self.sample_rate * IDENTIFY_WINDOW_SECONDS)
+            window_samples = int(self.sample_rate * IDENTIFY_WINDOW_SECONDS)  # 3.0s
             if samples.size > window_samples:
                 samples = samples[-window_samples:]
+            
+            # Kiểm tra có đủ 1.5s không (min for voice_service)
+            duration_sec = len(samples) / self.sample_rate
+            if duration_sec < 1.5:
+                print(f"⏳ [resolve] Audio too short: {duration_sec:.2f}s < 1.5s required")
+                logger.debug(f"⏳ Audio too short for identification: {duration_sec:.2f}s < 1.5s")
+                return
+            
+            # Tính RMS để log chất lượng audio
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+            print(f"🎯 [resolve] Sending audio: {duration_sec:.2f}s | {len(samples)} samples | rms={rms:.1f}")
+            logger.debug(f"🎯 Audio for identification: {duration_sec:.2f}s, rms={rms:.1f}")
+            
             wav_bytes = pcm_to_wav(samples.tobytes(), sample_rate=self.sample_rate)
+            print(f"📦 [resolve] WAV bytes: {len(wav_bytes)} bytes")
             
             # Check cache first - hash full audio to avoid collisions
             try:
@@ -301,15 +344,32 @@ class SpeechService(ISpeechService):
             else:
                 try:
                     # Use dedicated executor to avoid blocking event loop
-                    print(f"🧠 [resolve] calling voice_service.identify_speaker with whitelist={whitelist_user_ids}")
                     executor = _get_voice_executor()
-                    print(f"🧠 [resolve] got executor, running in executor...")
-                    result = await loop.run_in_executor(
-                        executor,
-                        self.voice_service.identify_speaker,
-                        wav_bytes,
-                        whitelist_user_ids,
-                    )
+                    
+                    # CRITICAL: Pass pre_filtered=True because audio already went through
+                    # noise_filter in audio_chunk_stream. Double filtering destroys voice features!
+                    
+                    if preloaded_profiles is not None:
+                        # FAST PATH: Use preloaded profiles - no DB/Blob I/O!
+                        print(f"⚡ [resolve] using preloaded profiles ({len(preloaded_profiles)} profiles)")
+                        def _identify_with_cache():
+                            return self.voice_service.identify_speaker_with_cache(
+                                wav_bytes,
+                                preloaded_profiles=preloaded_profiles,
+                                pre_filtered=True  # Audio already noise-filtered
+                            )
+                        result = await loop.run_in_executor(executor, _identify_with_cache)
+                    else:
+                        # SLOW PATH: Load profiles on-demand
+                        print(f"🧠 [resolve] calling voice_service.identify_speaker with whitelist={whitelist_user_ids}")
+                        def _identify_with_prefilter():
+                            return self.voice_service.identify_speaker(
+                                wav_bytes,
+                                whitelist_user_ids=whitelist_user_ids,
+                                pre_filtered=True  # Audio already noise-filtered
+                            )
+                        result = await loop.run_in_executor(executor, _identify_with_prefilter)
+                    
                     print(f"🧠 [resolve] identify_speaker returned: {result}")
                     # Cache result (fire-and-forget, don't block, ignore errors)
                     async def _cache_result_safe():
@@ -354,10 +414,10 @@ class SpeechService(ISpeechService):
                         margin = confidence_score - float(second_score_raw)
             else:
                 # FALLBACK: Use top candidate if cosine is reasonable
-                # STRICT thresholds to prevent false positives (guests recognized as enrolled users)
-                FALLBACK_COSINE_THRESHOLD = 0.40  # Increased from 0.30 - require stronger match
-                FALLBACK_MARGIN_THRESHOLD = 0.08  # Increased from 0.02 - require clear winner
-                WEAK_COSINE_THRESHOLD = 0.30      # Weak match threshold (was 0.20)
+                # After fixing double noise filtering, these thresholds should work properly
+                FALLBACK_COSINE_THRESHOLD = 0.30  # Balanced: accept moderate matches
+                FALLBACK_MARGIN_THRESHOLD = 0.06  # Top must be 6% better than 2nd
+                WEAK_COSINE_THRESHOLD = 0.22      # Weak match threshold
                 
                 if candidates:
                     top_candidate = candidates[0]
@@ -460,11 +520,11 @@ class SpeechService(ISpeechService):
             
             # ========== FALLBACK FAST-PATH ==========
             # If forced=True (from FALLBACK logic), the speaker was already validated
-            # with stricter thresholds. Trust it and switch immediately.
+            # with balanced thresholds. Trust it and switch immediately.
             if forced and new_name and new_name != "Khách":
-                # Accept fallback result with validation (already checked in FALLBACK block)
-                FALLBACK_MIN_SCORE = 0.30  # Match WEAK_COSINE_THRESHOLD
-                FALLBACK_MIN_MARGIN = 0.04  # Match FALLBACK_MARGIN_THRESHOLD * 0.5
+                # Accept fallback result with validation
+                FALLBACK_MIN_SCORE = 0.22  # Match WEAK_COSINE_THRESHOLD
+                FALLBACK_MIN_MARGIN = 0.04  # Balanced margin
                 if score_for_decision >= FALLBACK_MIN_SCORE and (margin is None or margin >= FALLBACK_MIN_MARGIN):
                     switch_reason = f"fallback_accepted_score_{score_for_decision:.2f}"
                     print(f"🚀 [switch] FALLBACK fast-path: {new_name} | score={score_for_decision:.3f} | margin={margin_str}")
@@ -745,22 +805,25 @@ class SpeechService(ISpeechService):
                                 del audio_history[:overflow]
                             history_len = len(audio_history)
 
-                            # Always schedule identification if we have enough audio
-                            # This ensures we detect speaker changes quickly
+                            # CHỈ schedule identification khi thực sự cần
+                            # Để Azure "result" là trigger chính → giảm CPU load
                             if history_len >= min_identify_bytes:
-                                # Force more often if:
-                                # 1. No speaker identified yet
-                                # 2. Current speaker is "Khách" (uncertain)
-                                # 3. Interruption detected
-                                force_identify = (
+                                # CHỈ force khi:
+                                # 1. Chưa biết ai nói (current_user_id is None)
+                                # 2. Đang ở "Khách" (chưa xác định được)
+                                # 3. Vừa detect interruption (có người chen vào)
+                                needs_identify = (
                                     current_user_id is None or
                                     current_speaker == "Khách" or
                                     interruption_detected
                                 )
-                                self._create_tracked_task(background_tasks, schedule_identification(force=force_identify, blocking=False))
-                            else:
-                                # Not enough audio yet, just schedule with throttle
-                                self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
+                                if needs_identify:
+                                    self._create_tracked_task(
+                                        background_tasks,
+                                        schedule_identification(force=True, blocking=False)
+                                    )
+                                # ELSE: Không gọi ở đây - để Azure result trigger
+                            # Không cần gọi khi chưa đủ audio
 
                         # CRITICAL: Yield control to event loop so identification tasks can run
                         await asyncio.sleep(0)
@@ -796,15 +859,21 @@ class SpeechService(ISpeechService):
                     event_type = event.get("type")
 
                     if event_type == "result":
+                        # Nhận diện khi có câu nói hoàn chỉnh (result)
                         await schedule_identification(force=True, blocking=True)
                         result_count += 1
                         # Log background tasks every 10 results
                         if result_count % 10 == 0:
                             logger.info(f"[Performance] Active tasks: {len(background_tasks)}, Results: {result_count}")
                     elif event_type == "partial":
-                        self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
-                    else:
-                        self._create_tracked_task(background_tasks, schedule_identification(force=False, blocking=False))
+                        # IMPORTANT: Retry identification on partials if speaker is still "Khách"
+                        # This ensures first utterance gets identified as soon as we have enough audio
+                        if current_speaker == "Khách" or current_user_id is None:
+                            # Non-blocking retry - don't slow down partial updates
+                            self._create_tracked_task(
+                                background_tasks,
+                                schedule_identification(force=True, blocking=False)
+                            )
 
                     event["speaker"] = current_speaker
                     if current_user_id:
@@ -929,6 +998,14 @@ class SpeechService(ISpeechService):
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
                 background_tasks.clear()
+            
+            # Cleanup preloaded voice profiles cache for this session
+            if defense_session_id and self.voice_service:
+                try:
+                    self.voice_service.clear_session_cache(defense_session_id)
+                    logger.info(f"🧹 Cleared voice profile cache for session {defense_session_id}")
+                except Exception as e:
+                    logger.debug(f"Failed to clear session cache: {e}")
 
             logger.info("Recognition stream ended")
 
@@ -1054,23 +1131,27 @@ class SpeechService(ISpeechService):
             logger.warning(f"Failed to send connected event: {e}")
         
         # Fetch defense session users whitelist in background (non-blocking)
-        whitelist_user_ids = None
+        whitelist_user_ids: Optional[List[str]] = None
+        user_info_map: Optional[Dict[str, Dict[str, str]]] = None  # Map user_id -> {name, role, display_name}
         whitelist_fetch_task = None
         
         async def _fetch_whitelist_background():
-            """Fetch whitelist in background - fire and forget."""
-            nonlocal whitelist_user_ids
+            """Fetch whitelist with user info in background - fire and forget."""
+            nonlocal whitelist_user_ids, user_info_map
             if not defense_session_id or not self.voice_service:
                 return
             try:
-                # Single attempt with short timeout
+                # Fetch users with full info (name, role, display_name)
                 result = await asyncio.wait_for(
-                    self.voice_service.get_defense_session_users(defense_session_id),
-                    timeout=2.0  # Reduced from 3s
+                    self.voice_service.get_defense_session_users_with_info(defense_session_id),
+                    timeout=2.0
                 )
                 if result:
-                    whitelist_user_ids = result
-                    logger.info(f"🎯 Whitelist loaded: {len(whitelist_user_ids)} users")
+                    user_info_map = result
+                    whitelist_user_ids = list(result.keys())
+                    logger.info(f"🎯 Whitelist loaded: {len(whitelist_user_ids)} users with display names")
+                    for uid, info in user_info_map.items():
+                        logger.debug(f"   - {uid}: {info.get('display_name')}")
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ Whitelist fetch timeout")
             except Exception as e:
@@ -1388,11 +1469,14 @@ class SpeechService(ISpeechService):
                 logger.info(f"📋 Whitelist status: task={whitelist_fetch_task} | user_ids={whitelist_user_ids}")
             
             # Stream recognition results
+            # Pass defense_session_id and user_info_map to enable voice profile preloading with display names
             async for event in self.recognize_stream_from_queue(
                 audio_queue,
                 speaker_label=speaker_label,
                 extra_phrases=extra_phrases,
                 whitelist_user_ids=whitelist_user_ids,
+                defense_session_id=defense_session_id,
+                user_info_map=user_info_map,
             ):
                 # Check stop condition
                 if stop_event.is_set():
