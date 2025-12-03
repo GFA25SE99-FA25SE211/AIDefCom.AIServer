@@ -1163,7 +1163,8 @@ class SpeechService(ISpeechService):
         session_start = datetime.utcnow()
         transcript_lines = []
         
-        # === LOAD EXISTING TRANSCRIPT FROM CACHE (resume after reload) ===
+        # === LOAD EXISTING TRANSCRIPT FROM CACHE AND SEND TO CLIENT ===
+        # This ensures client gets latest transcript when reconnecting/reloading
         if defense_session_id and self.redis_service:
             try:
                 existing = await asyncio.wait_for(
@@ -1171,18 +1172,31 @@ class SpeechService(ISpeechService):
                     timeout=2.0
                 )
                 if existing and isinstance(existing, dict):
-                    transcript_lines = existing.get("lines", [])
-                    original_start = existing.get("start_time")
-                    if original_start:
-                        try:
-                            session_start = datetime.fromisoformat(original_start)
-                        except Exception:
-                            pass
-                    logger.info(f"📂 Resumed transcript | defense_session_id={defense_session_id} | existing_lines={len(transcript_lines)}")
+                    cached_lines = existing.get("lines", [])
+                    if cached_lines:
+                        # Gửi transcript đã cache cho client
+                        await ws.send_json({
+                            "type": "cached_transcript",
+                            "defense_session_id": defense_session_id,
+                            "lines": cached_lines,
+                            "start_time": existing.get("start_time"),
+                            "message": f"Loaded {len(cached_lines)} lines from cache"
+                        })
+                        logger.info(f"📦 Sent cached transcript to client | lines={len(cached_lines)}")
+                        
+                        # Load vào biến local để tiếp tục append
+                        transcript_lines = cached_lines
+                        original_start = existing.get("start_time")
+                        if original_start:
+                            try:
+                                session_start = datetime.fromisoformat(original_start)
+                            except Exception:
+                                pass
+                        logger.info(f"📂 Resumed transcript | defense_session_id={defense_session_id} | existing_lines={len(transcript_lines)}")
             except asyncio.TimeoutError:
-                logger.debug("Timeout loading existing transcript")
+                logger.debug("Timeout loading cached transcript")
             except Exception as e:
-                logger.debug(f"No existing transcript: {e}")
+                logger.debug(f"No cached transcript: {e}")
         
         # === FLAG: Only save to DB when explicitly requested ===
         # Set to True when: session:end command OR save:transcript command
