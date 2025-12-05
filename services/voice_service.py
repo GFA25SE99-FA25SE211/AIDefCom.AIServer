@@ -1195,6 +1195,81 @@ class VoiceService(IVoiceService):
             "message": "Voice match" if verified else "Voice does not match claimed identity",
         }
     
+    def reset_enrollment(self, user_id: str) -> Dict[str, Any]:
+        """
+        Reset enrollment for user - delete Azure blob profile and clear database link.
+        
+        Args:
+            user_id: User identifier to reset
+            
+        Returns:
+            Dict with success, message, details
+        """
+        try:
+            results = {
+                "user_id": user_id,
+                "blob_deleted": False,
+                "db_cleared": False,
+                "cache_cleared": False,
+            }
+            
+            # 1. Delete profile from Azure Blob Storage
+            try:
+                blob_deleted = self.profile_repo.delete_profile(user_id)
+                results["blob_deleted"] = blob_deleted
+                if blob_deleted:
+                    logger.info(f"✅ Deleted blob profile for user {user_id}")
+                else:
+                    logger.warning(f"⚠️ Blob profile not found for user {user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete blob profile for {user_id}: {e}")
+                results["blob_error"] = str(e)
+            
+            # 2. Clear VoiceSamplePath in SQL database
+            try:
+                if self.sql_server_repo:
+                    # Set to empty string to clear the link
+                    db_updated = self.sql_server_repo.update_voice_sample_path(user_id, "")
+                    results["db_cleared"] = db_updated
+                    if db_updated:
+                        logger.info(f"✅ Cleared VoiceSamplePath in DB for user {user_id}")
+                    else:
+                        logger.warning(f"⚠️ Failed to clear DB path for user {user_id}")
+                else:
+                    results["db_cleared"] = None  # No SQL repo configured
+                    logger.info("SQL repository not configured, skipping DB update")
+            except Exception as e:
+                logger.warning(f"Failed to clear DB path for {user_id}: {e}")
+                results["db_error"] = str(e)
+            
+            # 3. Invalidate all caches for this user
+            try:
+                self._invalidate_user_caches(user_id)
+                results["cache_cleared"] = True
+                logger.info(f"✅ Invalidated caches for user {user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to invalidate caches for {user_id}: {e}")
+                results["cache_error"] = str(e)
+            
+            # Determine overall success
+            success = results["blob_deleted"] or results.get("blob_error") is None
+            
+            return {
+                "success": success,
+                "user_id": user_id,
+                "message": f"Enrollment reset {'successful' if success else 'partially failed'} for user {user_id}",
+                "details": results,
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error resetting enrollment for user {user_id}: {e}")
+            return {
+                "success": False,
+                "user_id": user_id,
+                "error": str(e),
+                "message": f"Failed to reset enrollment: {e}",
+            }
+
     def list_all_profiles(self) -> List[Dict[str, Any]]:
         """List all voice profiles."""
         profiles = []

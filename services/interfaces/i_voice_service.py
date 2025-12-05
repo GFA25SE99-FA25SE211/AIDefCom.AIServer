@@ -65,6 +65,19 @@ class IVoiceService(ABC):
         pass
     
     @abstractmethod
+    def reset_enrollment(self, user_id: str) -> Dict[str, Any]:
+        """
+        Reset enrollment for user - delete profile and clear database link.
+        
+        Args:
+            user_id: User identifier to reset
+            
+        Returns:
+            Dict with success, message
+        """
+        pass
+    
+    @abstractmethod
     def get_defense_session_users(self, session_id: str) -> Optional[List[str]]:
         """
         Fetch whitelist of user IDs from defense session.

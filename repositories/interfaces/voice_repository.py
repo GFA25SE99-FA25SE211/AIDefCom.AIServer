@@ -63,3 +63,15 @@ class IVoiceProfileRepository(ABC):
     def list_profiles(self) -> List[str]:
         """List all user IDs with voice profiles."""
         pass
+    
+    @abstractmethod
+    def delete_profile(self, user_id: str) -> bool:
+        """Delete voice profile for user.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        pass
