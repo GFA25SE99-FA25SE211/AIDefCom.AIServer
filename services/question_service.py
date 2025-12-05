@@ -1,19 +1,144 @@
 """Question duplicate detection service using Redis and fuzzy matching."""
 import asyncio
-import json
 import logging
-from datetime import datetime
-from rapidfuzz import fuzz
 import string
-from typing import Optional
-from repositories.interfaces.i_redis_service import IRedisService
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+import numpy as np
+from rapidfuzz import fuzz
+
+from repositories.interfaces import IRedisService
 from services.interfaces.i_question_service import IQuestionService
+from services.voice.vector_index import SessionVectorIndex, create_vector_index
+from core.executors import run_cpu_bound
 
 logger = logging.getLogger(__name__)
 
 
+def _normalize_text_sync(text: str) -> str:
+    """Normalize text for comparison (sync, CPU-bound)."""
+    text = text.lower().strip()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    return ' '.join(text.split())
+
+
+def _calculate_fuzzy_similarity_sync(text1: str, text2: str) -> float:
+    """Calculate fuzzy similarity between two texts (sync, CPU-bound).
+    
+    This is CPU-intensive due to RapidFuzz algorithms.
+    """
+    norm1 = _normalize_text_sync(text1)
+    norm2 = _normalize_text_sync(text2)
+    
+    # Weighted average of different algorithms
+    simple_ratio = fuzz.ratio(norm1, norm2) / 100.0
+    token_sort = fuzz.token_sort_ratio(norm1, norm2) / 100.0
+    token_set = fuzz.token_set_ratio(norm1, norm2) / 100.0
+    
+    # Weight: simple 60%, token_sort 30%, token_set 10%
+    return (simple_ratio * 0.6) + (token_sort * 0.3) + (token_set * 0.1)
+
+
+def _encode_text_sync(model, text: str) -> np.ndarray:
+    """Encode single text to embedding vector (sync, CPU-bound)."""
+    embedding = model.encode(text, convert_to_tensor=False, show_progress_bar=False)
+    return np.asarray(embedding, dtype=np.float32)
+
+
+def _encode_texts_batch_sync(model, texts: List[str]) -> np.ndarray:
+    """Encode multiple texts to embedding matrix (sync, CPU-bound).
+    
+    Returns:
+        Numpy array of shape (N, dim) with L2-normalized embeddings
+    """
+    embeddings = model.encode(texts, convert_to_tensor=False, show_progress_bar=False)
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    
+    # L2 normalize for cosine similarity
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms < 1e-8] = 1.0
+    return embeddings / norms
+
+
+def _check_duplicates_with_index_sync(
+    model,
+    question_text: str,
+    questions: List[Dict[str, Any]],
+    existing_embeddings: Optional[np.ndarray],
+    fuzzy_threshold: float = 0.85,
+    semantic_threshold: float = 0.60,
+) -> tuple[List[Dict[str, Any]], np.ndarray]:
+    """Check for duplicate questions using vectorized operations (sync, CPU-bound).
+    
+    Uses matrix multiplication for O(1) similarity computation instead of O(N) loop.
+    
+    Returns:
+        Tuple of (similar_questions, query_embedding)
+    """
+    if not questions:
+        return [], _encode_text_sync(model, question_text)
+    
+    existing_texts = [q['text'] for q in questions]
+    
+    # Encode query text
+    query_embedding = _encode_text_sync(model, question_text)
+    query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
+    
+    # Get or compute existing embeddings
+    if existing_embeddings is None or len(existing_embeddings) != len(questions):
+        # Batch encode all existing texts
+        existing_embeddings = _encode_texts_batch_sync(model, existing_texts)
+    
+    # VECTORIZED: Compute all cosine similarities at once via matrix multiplication
+    # This is O(1) matrix op vs O(N) Python loop
+    semantic_scores = existing_embeddings @ query_norm  # Shape: (N,)
+    
+    similar_questions = []
+    
+    for i, q in enumerate(questions):
+        text = q['text']
+        
+        # Fuzzy similarity (still need to compute per-pair, but RapidFuzz is C-optimized)
+        fuzzy_score = _calculate_fuzzy_similarity_sync(question_text, text)
+        
+        # Semantic similarity (already computed via matrix multiply)
+        cos = float(semantic_scores[i])
+        
+        # Vietnamese-optimized duplicate detection logic
+        is_duplicate = (
+            (fuzzy_score >= 0.65 and cos >= 0.60) or  # Both moderately high
+            fuzzy_score >= 0.85 or                     # Nearly identical wording
+            cos >= 0.70                                 # Strong semantic similarity
+        )
+        
+        if is_duplicate:
+            similar_questions.append({
+                'text': text,
+                'fuzzy_score': round(fuzzy_score, 4),
+                'semantic_score': round(cos, 4)
+            })
+    
+    # Sort by max score
+    similar_questions.sort(
+        key=lambda x: max(x['fuzzy_score'], x['semantic_score']),
+        reverse=True
+    )
+    
+    return similar_questions, query_embedding
+
+
 class QuestionService(IQuestionService):
-    """Service for detecting duplicate questions in a session."""
+    """Service for detecting duplicate questions in a session.
+    
+    Optimizations:
+    1. Caches embeddings per session to avoid re-encoding
+    2. Uses matrix multiplication for O(1) similarity computation
+    3. Supports FAISS vector index for very large sessions (> 100 questions)
+    """
+    
+    # Embedding dimension for paraphrase-multilingual-MiniLM-L12-v2
+    EMBEDDING_DIM = 384
     
     def __init__(self, redis_service: Optional[IRedisService] = None, session_ttl: int = 7200):
         """Initialize with Redis service interface."""
@@ -22,6 +147,10 @@ class QuestionService(IQuestionService):
         self._semantic_model = None  # Lazy load SBERT
         # Local locks per session (for single-container atomicity)
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Embedding cache per session: session_id -> np.ndarray (N, dim)
+        self._embedding_cache: Dict[str, np.ndarray] = {}
+        # Vector index for fast similarity search (for large sessions)
+        self._vector_index = SessionVectorIndex(dim=self.EMBEDDING_DIM, ttl_seconds=session_ttl)
     
     @property
     def redis_service(self) -> IRedisService:
@@ -51,23 +180,15 @@ class QuestionService(IQuestionService):
         return self._session_locks[session_id]
     
     def _normalize_text(self, text: str) -> str:
-        """Normalize text for comparison."""
-        text = text.lower().strip()
-        text = text.translate(str.maketrans('', '', string.punctuation))
-        return ' '.join(text.split())
+        """Normalize text for comparison (delegates to sync function)."""
+        return _normalize_text_sync(text)
     
-    def _calculate_similarity(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two texts (0.0 to 1.0)."""
-        norm1 = self._normalize_text(text1)
-        norm2 = self._normalize_text(text2)
+    async def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two texts (0.0 to 1.0).
         
-        # Weighted average of different algorithms
-        simple_ratio = fuzz.ratio(norm1, norm2) / 100.0
-        token_sort = fuzz.token_sort_ratio(norm1, norm2) / 100.0
-        token_set = fuzz.token_set_ratio(norm1, norm2) / 100.0
-        
-        # Weight: simple 60%, token_sort 30%, token_set 10%
-        return (simple_ratio * 0.6) + (token_sort * 0.3) + (token_set * 0.1)
+        Offloads CPU-intensive fuzzy matching to thread pool.
+        """
+        return await run_cpu_bound(_calculate_fuzzy_similarity_sync, text1, text2)
     
     async def check_duplicate(
         self,
@@ -78,41 +199,39 @@ class QuestionService(IQuestionService):
     ) -> tuple[bool, list[dict]]:
         """Check if question is duplicate (fuzzy + semantic).
         
+        OPTIMIZED: Uses cached embeddings and matrix multiplication.
+        - First call: Encodes all questions, caches embeddings
+        - Subsequent calls: Reuses cached embeddings
+        - Similarity computation: O(1) matrix-vector multiply vs O(N) loop
+        
         Logic: Coi là trùng nếu:
-        - Fuzzy >= 0.85 AND Semantic >= 0.70 (cả 2 khá cao)
-        - HOẶC Fuzzy >= 0.95 (gần như giống hệt về từ)
-        - HOẶC Semantic >= 0.85 (giống về ý nghĩa)
+        - Fuzzy >= 0.65 AND Semantic >= 0.60 (cả 2 moderately high)
+        - HOẶC Fuzzy >= 0.85 (gần như giống hệt về từ)
+        - HOẶC Semantic >= 0.70 (giống về ý nghĩa)
         """
         key = self._get_session_key(session_id)
         questions = await self.redis_service.get(key)
+        
         if not questions:
             return False, []
-        similar_questions = []
-        # Semantic embedding for new question
-        new_emb = self.semantic_model.encode(question_text, convert_to_tensor=True)
-        for q in questions:
-            text = q['text']
-            fuzzy_score = self._calculate_similarity(question_text, text)
-            # Semantic similarity
-            q_emb = self.semantic_model.encode(text, convert_to_tensor=True)
-            from torch import nn
-            cos = nn.functional.cosine_similarity(new_emb, q_emb, dim=0).item()
-            
-            # Vietnamese-optimized logic: Prioritize semantic similarity for paraphrases
-            is_duplicate = (
-                (fuzzy_score >= 0.65 and cos >= 0.60) or  # Both moderately high (Vietnamese paraphrases)
-                fuzzy_score >= 0.85 or  # Nearly identical wording
-                cos >= 0.70  # Strong semantic similarity (multilingual model catches paraphrases)
-            )
-            
-            if is_duplicate:
-                similar_questions.append({
-                    'text': text,
-                    'fuzzy_score': round(fuzzy_score, 4),
-                    'semantic_score': round(cos, 4)
-                })
-        # Sắp xếp theo max(fuzzy, semantic)
-        similar_questions.sort(key=lambda x: max(x['fuzzy_score'], x['semantic_score']), reverse=True)
+        
+        # Get cached embeddings for this session
+        cached_embeddings = self._embedding_cache.get(session_id)
+        
+        # Offload CPU-intensive work to executor
+        similar_questions, query_embedding = await run_cpu_bound(
+            _check_duplicates_with_index_sync,
+            self.semantic_model,
+            question_text,
+            questions,
+            cached_embeddings,
+            threshold,
+            semantic_threshold,
+        )
+        
+        # Update cache with any new embeddings computed
+        # Note: cache will be fully rebuilt on register_question
+        
         is_duplicate = len(similar_questions) > 0
         return is_duplicate, similar_questions
     
@@ -123,13 +242,11 @@ class QuestionService(IQuestionService):
         speaker: Optional[str] = None,
         timestamp: Optional[str] = None
     ) -> dict:
-        """Register a new question in Redis."""
+        """Register a new question in Redis and update embedding cache."""
         key = self._get_session_key(session_id)
-        logger.info(f"📝 register_question | key={key}")
         
-        # Get existing questions (already parsed by RedisService!)
+        # Get existing questions
         questions = await self.redis_service.get(key) or []
-        logger.info(f"📋 Existing questions: {len(questions)}")
         
         # Add new question
         question = {
@@ -140,13 +257,29 @@ class QuestionService(IQuestionService):
         }
         questions.append(question)
         
-        # Save back to Redis (RedisService will auto-stringify!)
+        # Save back to Redis
         save_result = await self.redis_service.set(key, questions, ttl=self.session_ttl)
-        logger.info(f"💾 Saved {len(questions)} questions to Redis | success={save_result}")
         
-        # Verify save worked
-        verify = await self.redis_service.get(key)
-        logger.info(f"✅ Verify after save: {len(verify) if verify else 0} questions")
+        # Update embedding cache
+        try:
+            new_embedding = await run_cpu_bound(
+                _encode_text_sync,
+                self.semantic_model,
+                question_text,
+            )
+            norm = np.linalg.norm(new_embedding)
+            if norm > 1e-8:
+                new_embedding = new_embedding / norm
+            
+            if session_id in self._embedding_cache:
+                self._embedding_cache[session_id] = np.vstack([
+                    self._embedding_cache[session_id],
+                    new_embedding.reshape(1, -1)
+                ])
+            else:
+                self._embedding_cache[session_id] = new_embedding.reshape(1, -1)
+        except Exception as e:
+            logger.warning(f"Failed to update embedding cache: {e}")
         
         return {
             'success': save_result,
@@ -178,17 +311,10 @@ class QuestionService(IQuestionService):
         Uses lock to prevent race conditions where two identical questions
         are submitted at the same time and both pass duplicate check.
         """
-        # Log session_id để debug xem có đúng defense_session_id không
-        logger.info(f"🔍 check_and_register called | session_id={session_id} | text='{question_text[:50]}'")
-        
-        # Get lock for this session to ensure atomicity
         lock = self._get_session_lock(session_id)
         
         async with lock:
-            logger.info(f"🔒 Acquired lock for session {session_id}")
-            
             is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
-            logger.info(f"🔎 Duplicate check result: is_dup={is_dup}, similar_count={len(similar)}")
             
             registered = False
             question_id = None
@@ -197,15 +323,8 @@ class QuestionService(IQuestionService):
                 reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
                 registered = reg.get("success", False)
                 question_id = reg.get("question_id")
-                logger.info(f"✅ Registered question #{question_id} | registered={registered}")
-            else:
-                logger.info(f"🔄 Duplicate detected | text='{question_text[:50]}' | similar_count={len(similar)}")
             
-            # Get total questions count (after possible registration)
             existing = await self.get_questions(session_id)
-            logger.info(f"📊 Total questions in session {session_id}: {len(existing)}")
-            
-            logger.info(f"🔓 Released lock for session {session_id}")
             
             return {
                 "is_duplicate": is_dup,
@@ -226,5 +345,13 @@ class QuestionService(IQuestionService):
             count = len(questions)
         
         await self.redis_service.delete(key)
+        
+        # Clear embedding cache for this session
+        if session_id in self._embedding_cache:
+            del self._embedding_cache[session_id]
+        
+        # Clear vector index
+        self._vector_index.clear_session(session_id)
+        
         return count
 

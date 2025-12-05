@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 from typing import Any, Dict, Optional, Set
 from weakref import WeakSet
 
@@ -16,6 +18,29 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
+
+# Stable container ID for multi-pod deployments
+# Priority: CONTAINER_ID env > HOSTNAME env > socket.gethostname() > fallback
+# This MUST be stable across the lifetime of the container instance
+_CONTAINER_ID: Optional[str] = None
+
+
+def get_container_id() -> str:
+    """Get stable container ID for this instance.
+    
+    Uses environment variable or hostname - both are stable for container lifetime.
+    Falls back to a generated ID only if both are unavailable.
+    """
+    global _CONTAINER_ID
+    if _CONTAINER_ID is None:
+        _CONTAINER_ID = (
+            os.getenv("CONTAINER_ID") 
+            or os.getenv("HOSTNAME") 
+            or socket.gethostname()
+            or f"container_{os.getpid()}"
+        )
+        logger.info(f"Container ID initialized: {_CONTAINER_ID}")
+    return _CONTAINER_ID
 
 
 class SessionRoomManager:
@@ -115,10 +140,11 @@ class SessionRoomManager:
         if self._redis_service:
             channel = f"transcript:room:{defense_session_id}"
             try:
-                # Add source marker to prevent echo back to same container
+                # Add source marker using STABLE container ID to prevent echo
+                # This ID must be consistent across the container's lifetime
                 message_with_meta = {
                     **message,
-                    "_source_container_id": id(self),  # Unique per container instance
+                    "_source_container_id": get_container_id(),  # Stable container ID
                 }
                 # Fire-and-forget: don't await, don't block
                 asyncio.create_task(self._publish_to_redis(channel, message_with_meta))
@@ -197,7 +223,7 @@ class SessionRoomManager:
                     return
                 
                 logger.info(f"📡 Started Redis subscriber for room {defense_session_id}")
-                my_container_id = id(self)  # This container's unique ID
+                my_container_id = get_container_id()  # Stable container ID
                 
                 async for message in pubsub.listen():
                     if message["type"] == "message":
@@ -207,10 +233,19 @@ class SessionRoomManager:
                             # Skip messages from same container (already broadcast locally)
                             source_container_id = data.pop("_source_container_id", None)
                             if source_container_id == my_container_id:
+                                logger.debug(
+                                    f"Skipping own message | room={defense_session_id} | "
+                                    f"source={source_container_id}"
+                                )
                                 continue  # Skip - already handled locally
                             
                             # Remove other meta fields
                             data.pop("_exclude_ws_id", None)
+                            
+                            logger.debug(
+                                f"Received cross-container message | room={defense_session_id} | "
+                                f"from={source_container_id} | my_id={my_container_id}"
+                            )
                             
                             # Broadcast to local connections (from OTHER containers)
                             await self._broadcast_local(defense_session_id, data, exclude_ws=None)

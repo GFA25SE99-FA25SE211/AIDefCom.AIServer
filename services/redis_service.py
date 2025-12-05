@@ -10,7 +10,7 @@ from typing import Any, Optional
 import redis.asyncio as aioredis
 
 from app.config import Config
-from repositories.interfaces.i_redis_service import IRedisService
+from repositories.interfaces import IRedisService
 
 logger = logging.getLogger(__name__)
 

@@ -16,8 +16,7 @@ class IVoiceProfileRepository(ABC):
     
     @abstractmethod
     def load_profile(self, user_id: str) -> Dict[str, Any]:
-        """
-        Load voice profile with caching.
+        """Load voice profile with caching.
         
         Raises:
             VoiceProfileNotFoundError: If profile not found

@@ -17,6 +17,10 @@ from api.schemas.voice_schemas import (
     VerificationResponse,
     ErrorResponse,
 )
+from services.audio.streaming_upload import (
+    stream_upload_to_temp_file,
+    StreamingUploadError,
+)
 
 from app.config import Config
 
@@ -25,11 +29,11 @@ router = APIRouter(prefix="/voice", tags=["voice-auth"])
 logger = logging.getLogger(__name__)
 
 
-def _validate_audio_file(upload: UploadFile, raw: bytes) -> None:
-    """Validate uploaded audio file."""
-    if not raw:
+def _validate_audio_file_size(file_size: int) -> None:
+    """Validate audio file size."""
+    if file_size == 0:
         raise ValueError("Empty audio")
-    if len(raw) > Config.MAX_AUDIO_BYTES:
+    if file_size > Config.MAX_AUDIO_BYTES:
         raise ValueError(f"Audio too large (>{Config.MAX_AUDIO_SIZE_MB}MB)")
 
 
@@ -83,49 +87,59 @@ async def enroll_voice(
     - Ít nhiễu nền, giọng nói rõ
     """
     try:
-        # Read audio data with timeout
+        # Stream audio to temp file to avoid OOM with large files
         try:
-            audio_data = await asyncio.wait_for(audio_file.read(), timeout=30.0)
+            async with stream_upload_to_temp_file(
+                audio_file,
+                max_size=Config.MAX_AUDIO_BYTES,
+                suffix=".wav",
+            ) as temp_path:
+                # Read from temp file (already on disk, not in RAM)
+                audio_data = temp_path.read_bytes()
+                file_size = len(audio_data)
+                
+                try:
+                    _validate_audio_file_size(file_size)
+                except ValueError as ve:
+                    logger.error(f"Audio validation error: {ve}")
+                    return JSONResponse(content={"error": str(ve)}, status_code=400)
+                
+                # Run enrollment in background thread with timeout
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            voice_service.enroll_voice,
+                            user_id,
+                            audio_data
+                        ),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"Enrollment timeout for user {user_id}")
+                    return JSONResponse(
+                        content={
+                            "error": "Enrollment processing timeout. Please try again.",
+                            "user_id": user_id
+                        },
+                        status_code=504
+                    )
+                finally:
+                    # Force garbage collection to free memory
+                    del audio_data
+                    gc.collect()
+                
+        except StreamingUploadError as sue:
+            logger.error(f"Streaming upload error for user {user_id}: {sue}")
+            return JSONResponse(
+                content={"error": str(sue), "user_id": user_id},
+                status_code=400
+            )
         except asyncio.TimeoutError:
-            logger.error(f"Timeout reading audio file for user {user_id}")
+            logger.error(f"Timeout streaming audio file for user {user_id}")
             return JSONResponse(
                 content={"error": "Timeout reading audio file", "user_id": user_id},
                 status_code=408
             )
-        
-        if not audio_data:
-            logger.error("Empty audio data received for enroll_voice")
-            return JSONResponse(content={"error": "Empty audio data"}, status_code=400)
-        
-        try:
-            _validate_audio_file(audio_file, audio_data)
-        except ValueError as ve:
-            logger.error(f"Audio validation error: {ve}")
-            return JSONResponse(content={"error": str(ve)}, status_code=400)
-        
-        # Run enrollment in background thread with timeout
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    voice_service.enroll_voice,
-                    user_id,
-                    audio_data
-                ),
-                timeout=60.0
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Enrollment timeout for user {user_id}")
-            return JSONResponse(
-                content={
-                    "error": "Enrollment processing timeout. Please try again.",
-                    "user_id": user_id
-                },
-                status_code=504
-            )
-        finally:
-            # Force garbage collection to free memory
-            del audio_data
-            gc.collect()
         
         # Check if there's an error in the result
         if "error" in result:
@@ -180,7 +194,7 @@ async def enroll_voice(
 )
 async def identify_speaker(
     audio_file: UploadFile = File(..., description="Audio file for speaker identification (WAV/MP3/FLAC, max 10MB)"),
-    voice_service: VoiceService = Depends(get_voice_service),
+    voice_service: IVoiceService = Depends(get_voice_service),
 ):
     """Identify speaker from voice sample.
     
@@ -199,16 +213,37 @@ async def identify_speaker(
     - `speaker_id`, `speaker_name` (nếu match)
     """
     try:
-        audio_data = await audio_file.read()
+        # Stream audio to temp file to avoid OOM with large files
         try:
-            _validate_audio_file(audio_file, audio_data)
-        except ValueError as ve:
-            return JSONResponse(content={"error": str(ve)}, status_code=400)
+            async with stream_upload_to_temp_file(
+                audio_file,
+                max_size=Config.MAX_AUDIO_BYTES,
+                suffix=".wav",
+            ) as temp_path:
+                audio_data = temp_path.read_bytes()
+                file_size = len(audio_data)
+                
+                try:
+                    _validate_audio_file_size(file_size)
+                except ValueError as ve:
+                    return JSONResponse(content={"error": str(ve)}, status_code=400)
+                
+                try:
+                    result = await asyncio.to_thread(
+                        voice_service.identify_speaker,
+                        audio_data
+                    )
+                finally:
+                    del audio_data
+                    gc.collect()
+                    
+        except StreamingUploadError as sue:
+            return JSONResponse(content={"error": str(sue)}, status_code=400)
         
-        result = voice_service.identify_speaker(audio_data)
         status = 200 if result.get("success") else 400
         return JSONResponse(content=result, status_code=status)
     except Exception as exc:
+        logger.exception(f"Error in identify_speaker: {exc}")
         return JSONResponse(content={"error": str(exc)}, status_code=500)
 
 
@@ -246,7 +281,7 @@ async def identify_speaker(
 async def verify_voice(
     user_id: str = Path(..., description="User ID to verify voice against"),
     audio_file: UploadFile = File(..., description="Audio file for verification (WAV/MP3/FLAC, max 10MB)"),
-    voice_service: VoiceService = Depends(get_voice_service),
+    voice_service: IVoiceService = Depends(get_voice_service),
 ):
     """Verify if audio matches a specific user's voice profile.
     
@@ -269,16 +304,38 @@ async def verify_voice(
     - Phát hiện giả mạo giọng nói
     """
     try:
-        audio_data = await audio_file.read()
+        # Stream audio to temp file to avoid OOM with large files
         try:
-            _validate_audio_file(audio_file, audio_data)
-        except ValueError as ve:
-            return JSONResponse(content={"error": str(ve)}, status_code=400)
+            async with stream_upload_to_temp_file(
+                audio_file,
+                max_size=Config.MAX_AUDIO_BYTES,
+                suffix=".wav",
+            ) as temp_path:
+                audio_data = temp_path.read_bytes()
+                file_size = len(audio_data)
+                
+                try:
+                    _validate_audio_file_size(file_size)
+                except ValueError as ve:
+                    return JSONResponse(content={"error": str(ve)}, status_code=400)
+                
+                try:
+                    result = await asyncio.to_thread(
+                        voice_service.verify_voice,
+                        user_id,
+                        audio_data
+                    )
+                finally:
+                    del audio_data
+                    gc.collect()
+                    
+        except StreamingUploadError as sue:
+            return JSONResponse(content={"error": str(sue)}, status_code=400)
         
-        result = voice_service.verify_voice(user_id, audio_data)
         status = 200 if result.get("success") else 400
         return JSONResponse(content=result, status_code=status)
     except Exception as exc:
+        logger.exception(f"Error in verify_voice for user {user_id}: {exc}")
         return JSONResponse(content={"error": str(exc)}, status_code=500)
 
 

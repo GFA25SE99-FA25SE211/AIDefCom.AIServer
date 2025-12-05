@@ -1,14 +1,12 @@
-"""Interface for SQL Server repository operations (AppUser + transcripts)."""
+"""SQL Server Repository Interface."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
 
 class ISQLServerRepository(ABC):
-    """Abstract interface for SQL Server data access used by services.
-    Provides user voice path management and transcript persistence.
-    """
+    """Interface for SQL Server data access."""
 
     @classmethod
     @abstractmethod
@@ -29,7 +27,7 @@ class ISQLServerRepository(ABC):
 
     @abstractmethod
     def get_voice_sample_path(self, user_id: str) -> Optional[str]:
-        """Return stored blob URL for user's voice sample if any."""
+        """Return stored blob URL for user's voice sample."""
         raise NotImplementedError
 
     @abstractmethod

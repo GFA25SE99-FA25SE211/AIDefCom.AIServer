@@ -1,0 +1,119 @@
+{
+  "_comment": "Vietnamese phrase hints for Azure Speech recognition. Add domain-specific vocabulary here.",
+  "common_words": [
+    "xin chào", "cảm ơn", "vâng ạ", "dạ vâng", "được ạ", "không ạ",
+    "vâng", "dạ", "ạ", "nhé", "nha", "à", "ừ", "ờ",
+    "thế này", "như vậy", "tại vì", "bởi vì", "cho nên", "vì vậy",
+    "tuy nhiên", "mặc dù", "ngoài ra", "hơn nữa",
+    "đầu tiên", "tiếp theo", "cuối cùng",
+    "ví dụ", "chẳng hạn", "cụ thể", "nói chung", "tóm lại", "kết luận"
+  ],
+  "regional_northern": [
+    "giời ơi", "thế à", "thế ạ", "cơ mà", "ấy mà",
+    "nhỉ", "chứ", "đấy", "kia", "này", "thôi", "rồi", "đi", "nào", "sao"
+  ],
+  "regional_central": [
+    "răng", "rứa", "chi", "mô", "ni", "nớ", "tê", "hè", "chừ", "bây chừ",
+    "eng", "ả", "mệ", "bọ", "tau", "mi", "choa", "bay",
+    "có chi mô", "biết chi mô", "làm răng", "răng rứa"
+  ],
+  "regional_southern": [
+    "hông", "đâu có", "có hông", "dzậy", "dzô", "trời ơi",
+    "ủa", "hả", "hen", "nghen", "nè", "đó", "đây nè",
+    "sao ta", "gì ta", "gì dzậy", "chi dzậy",
+    "được hông", "biết hông", "có gì đâu",
+    "hổng có", "hổng biết", "hổng hiểu",
+    "quá trời", "quá xá", "dữ lắm", "ghê quá"
+  ],
+  "contractions": [
+    "bít", "hỉu", "đc", "ko", "z", "gòi", "chưa gì", "chưa chi"
+  ],
+  "question_words": [
+    "cái gì", "là gì", "như thế nào", "tại sao", "vì sao",
+    "bao nhiêu", "bao lâu", "khi nào", "ở đâu", "ai", "của ai"
+  ],
+  "pronouns": [
+    "tôi", "mình", "em", "anh", "chị", "bạn", "các bạn",
+    "chúng tôi", "chúng ta", "chúng em",
+    "thầy", "cô", "giáo viên", "giảng viên", "sinh viên", "học sinh"
+  ],
+  "academic_defense": [
+    "capstone project", "graduation thesis", "thesis defense",
+    "bảo vệ khóa luận", "bảo vệ đồ án", "bảo vệ luận văn", "đề tài tốt nghiệp",
+    "hội đồng bảo vệ", "ủy viên phản biện", "chủ tịch hội đồng", "thư ký hội đồng",
+    "giảng viên hướng dẫn", "student presentation", "slide trình bày",
+    "evaluation form", "phiếu chấm điểm", "assessment rubric",
+    "project report", "bản báo cáo", "final defense", "final presentation",
+    "thuyết trình", "feedback", "nhận xét của giảng viên",
+    "điểm trung bình", "overall score", "grading system", "rubric criteria"
+  ],
+  "software_architecture": [
+    "three layer architecture", "three tier architecture", "multi layer system",
+    "clean architecture", "domain driven design", "DDD pattern",
+    "repository pattern", "unit of work", "dependency injection",
+    "application layer", "infrastructure layer", "domain layer", "API layer",
+    "REST API", "web service", "microservices", "micro service",
+    "event driven architecture", "message queue", "event bus", "signalR",
+    "real time communication", "communication protocol", "socket connection",
+    "websocket endpoint", "event handler", "pipeline processing",
+    "data flow diagram", "system architecture diagram", "use case diagram",
+    "sequence diagram", "activity diagram",
+    "biểu đồ hệ thống", "kiến trúc phần mềm", "thiết kế hệ thống", "mô hình 3 lớp"
+  ],
+  "backend_database": [
+    "C Sharp", "dot net core", "ASP dot net API", "entity framework core", "ef core",
+    "SQL Server", "database schema", "stored procedure", "foreign key",
+    "migration", "seeding data", "auto mapper", "data transfer object", "DTO",
+    "repository", "controller", "service layer", "dependency injection container",
+    "jwt authentication", "authorization policy", "role based access control", "RBAC",
+    "middleware", "background service", "worker queue", "caching layer",
+    "redis cache", "memory cache", "azure redis cache", "azure sql database",
+    "connection string", "app settings", "environment variable"
+  ],
+  "ai_speech_nlp": [
+    "speech recognition", "speech to text", "text to speech",
+    "voice authentication", "speaker diarization", "real time transcription",
+    "true text punctuation", "azure speech service",
+    "pyannote audio", "wespeaker model", "mfcc feature extraction",
+    "voice embedding", "speaker verification",
+    "machine learning", "deep learning", "neural network",
+    "inference model", "model serving", "AI inference", "predictive model",
+    "ai microservice", "service for inference",
+    "tách giọng nói", "xác thực giọng nói", "chuyển giọng nói thành văn bản",
+    "tự động chấm điểm", "phân tích nội dung bài nói", "phân loại vai trò người nói",
+    "giọng giảng viên", "giọng sinh viên"
+  ],
+  "devops_cloud": [
+    "docker", "docker compose", "containerization", "container registry",
+    "azure app service", "azure blob storage", "azure api management",
+    "azure static web app", "azure devops", "github actions",
+    "CI CD pipeline", "continuous integration", "continuous deployment",
+    "cloud infrastructure", "cloud deployment", "virtual machine",
+    "load balancer", "reverse proxy", "nginx configuration",
+    "api gateway", "gateway routing", "environment configuration",
+    "monitoring and logging", "application insight", "telemetry data"
+  ],
+  "frontend_ux": [
+    "react", "react native", "next js", "frontend application",
+    "state management", "redux toolkit", "component", "tailwind css",
+    "ui design", "responsive layout", "authentication flow", "api integration",
+    "frontend to backend", "jwt token", "form validation", "real time update",
+    "websocket client", "user dashboard", "admin dashboard", "notification center",
+    "chat interface", "speech input", "voice chat", "AI chatbot"
+  ],
+  "project_management": [
+    "project timeline", "work breakdown structure", "WBS",
+    "kanban board", "Jira issue", "GitHub repository", "commit history",
+    "version control", "release note", "deployment schedule", "demo day",
+    "milestone", "project budget", "team collaboration",
+    "phân công công việc", "tiến độ dự án", "kế hoạch bảo vệ",
+    "deadline", "cập nhật tiến độ", "báo cáo hàng tuần"
+  ],
+  "evaluation_communication": [
+    "question and answer", "Q and A session", "phần hỏi đáp", "thắc mắc",
+    "ý kiến phản biện", "câu hỏi của giảng viên", "phần trả lời của sinh viên",
+    "clarification", "feedback", "recommendation",
+    "điểm số", "chấm điểm", "nhận xét", "đề xuất cải thiện",
+    "final score", "grade sheet"
+  ]
+}

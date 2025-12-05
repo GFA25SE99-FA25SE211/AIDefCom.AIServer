@@ -11,14 +11,15 @@ import httpx
 import numpy as np
 
 from core.exceptions import VoiceProfileNotFoundError, VoiceAuthenticationError, AudioValidationError
-from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
+from repositories.interfaces import IVoiceProfileRepository
 from services.interfaces.i_voice_service import IVoiceService
-from services.audio_processing.audio_utils import (
+from services.audio.utils import (
     AudioQualityAnalyzer,
     NoiseFilter,
     bytes_to_mono,
     resample_audio,
 )
+from services.voice.score_normalizer import ScoreNormalizer, get_score_normalizer
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +124,6 @@ class VoiceService(IVoiceService):
             self.gain_target_peak = 0.80
             self.gain_max = 10.0
             self.dynamic_rms_relax = True
-        except Exception:
-            # Safe fallbacks
-            self.gain_target_pctl = 98
-            self.gain_target_peak = 0.80
-            self.gain_max = 10.0
-            self.dynamic_rms_relax = True
         
         logger.info(
             f"Voice Service initialized | model={self.model_tag} | dim={self.embedding_dim}"
@@ -139,6 +134,12 @@ class VoiceService(IVoiceService):
         self._profiles_preloaded: bool = False
         # Session-specific profile cache (populated by preload_session_profiles)
         self._session_profiles_cache: Dict[str, List[Dict[str, Any]]] = {}
+        
+        # Score normalizer for S-Norm (Adaptive Symmetric Normalization)
+        self._score_normalizer = get_score_normalizer(embedding_dim=self.embedding_dim)
+        # S-Norm thresholds
+        self.snorm_threshold = 1.5  # S-Norm score threshold (in std units)
+        self.use_snorm = True  # Enable S-Norm by default
     
     def preload_enrolled_profiles(self) -> int:
         """Preload all enrolled profiles into memory cache.
@@ -182,7 +183,16 @@ class VoiceService(IVoiceService):
         cache_key = defense_session_id
         if cache_key in self._session_profiles_cache:
             cached = self._session_profiles_cache[cache_key]
-            logger.info(f"🔥 Using cached profiles for session {defense_session_id}: {len(cached)} profiles")
+            
+            # Update display names if user_info_map provided (may have been fetched after initial cache)
+            if user_info_map:
+                for profile in cached:
+                    user_id = profile.get("user_id")
+                    if user_id and user_id in user_info_map:
+                        info = user_info_map[user_id]
+                        profile["name"] = info.get("display_name") or info.get("name") or profile.get("name")
+                        profile["role"] = info.get("role", "")
+            
             return cached
         
         # Load profiles for this session
@@ -197,14 +207,10 @@ class VoiceService(IVoiceService):
                     # Use display_name: "Tên (Vai trò)" for speaker identification
                     profile["name"] = info.get("display_name") or info.get("name") or profile.get("name")
                     profile["role"] = info.get("role", "")
-                    logger.debug(f"   Profile {user_id} -> display_name: {profile['name']}")
         
         # Cache for this session
         self._session_profiles_cache[cache_key] = profiles
         
-        logger.info(f"🔥 Preloaded {len(profiles)} profiles for session {defense_session_id}")
-        for p in profiles:
-            logger.info(f"   - {p.get('user_id')}: {p.get('name')}")
         return profiles
     
     def get_session_profiles(self, defense_session_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -307,7 +313,6 @@ class VoiceService(IVoiceService):
         
         # Calculate scores using cached profiles (NO DB/Blob I/O!)
         candidates = self._calculate_candidate_scores(embedding, preloaded_profiles)
-        logger.debug(f"🔍 Identify (cached): {len(candidates)} candidates scored")
         
         if not candidates:
             return {
@@ -338,8 +343,20 @@ class VoiceService(IVoiceService):
             zscore = None
         cohort_size = len(cohort_scores)
         
-        # Decision logic (same as identify_speaker)
-        accepted, reasons = self._accept_identification(best, zscore, cohort_size)
+        # Build speaker embeddings map for S-Norm
+        speaker_embeddings = {}
+        for profile in preloaded_profiles:
+            user_id = profile.get("user_id")
+            mean_emb = profile.get("mean_embedding_norm")
+            if user_id and mean_emb is not None:
+                speaker_embeddings[user_id] = mean_emb
+        
+        # Decision logic with S-Norm for small cohorts
+        accepted, reasons = self._accept_identification(
+            best, zscore, cohort_size,
+            probe_embedding=embedding,
+            speaker_embeddings=speaker_embeddings,
+        )
         
         logger.info(
             "🔍 Best candidate (cached): %s | cosine=%.3f | angle=%.1f° | accepted=%s",
@@ -418,6 +435,109 @@ class VoiceService(IVoiceService):
             logger.warning(f"Failed to fetch user info from API | user_id={user_id} | error={e}")
             return None
     
+    def _check_voice_uniqueness(
+        self, 
+        embedding: np.ndarray, 
+        exclude_user_id: str,
+        similarity_threshold: float = 0.70
+    ) -> Dict[str, Any]:
+        """
+        Check if voice embedding is unique (not too similar to existing enrolled users).
+        
+        This prevents enrollment of duplicate/similar voices which cause identification confusion.
+        
+        Args:
+            embedding: New voice embedding to check
+            exclude_user_id: User ID to exclude from check (the user being enrolled)
+            similarity_threshold: Max allowed similarity with other users (default 0.70)
+        
+        Returns:
+            Dict with:
+                - unique: True if voice is unique enough
+                - similar_to: List of similar user IDs if not unique
+                - max_similarity: Highest similarity score found
+                - message: Human-readable message
+        """
+        try:
+            # Normalize input embedding
+            probe = np.asarray(embedding, dtype=np.float32).reshape(-1)
+            probe_norm = probe / (np.linalg.norm(probe) + 1e-6)
+            
+            # Get all enrolled profiles
+            all_profiles = self.profile_repo.list_profiles()
+            similar_users = []
+            max_sim = 0.0
+            max_sim_user = None
+            
+            for uid in all_profiles:
+                if uid == exclude_user_id:
+                    continue
+                
+                try:
+                    profile = self.profile_repo.load_profile(uid)
+                    if profile.get("enrollment_status") != "enrolled":
+                        continue
+                    
+                    embeddings = self.profile_repo.get_embeddings(uid)
+                    if not embeddings or len(embeddings) == 0:
+                        continue
+                    
+                    # Calculate similarity with mean embedding
+                    mat = np.array(embeddings, dtype=np.float32)
+                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                    norm_mat = mat / (norms + 1e-6)
+                    mean_emb = np.mean(norm_mat, axis=0)
+                    mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-6)
+                    
+                    similarity = float(np.dot(probe_norm, mean_emb))
+                    
+                    if similarity > max_sim:
+                        max_sim = similarity
+                        max_sim_user = uid
+                    
+                    if similarity > similarity_threshold:
+                        user_name = profile.get("name", uid)
+                        similar_users.append({
+                            "user_id": uid,
+                            "name": user_name,
+                            "similarity": round(similarity, 3),
+                        })
+                        
+                except Exception as e:
+                    logger.warning(f"Error checking similarity with {uid}: {e}")
+                    continue
+            
+            if similar_users:
+                # Sort by similarity descending
+                similar_users.sort(key=lambda x: x["similarity"], reverse=True)
+                top_match = similar_users[0]
+                return {
+                    "unique": False,
+                    "similar_to": similar_users,
+                    "max_similarity": max_sim,
+                    "max_similarity_user": max_sim_user,
+                    "message": f"Giọng nói quá giống với user '{top_match['name']}' (similarity: {top_match['similarity']:.0%}). Vui lòng ghi âm lại với giọng tự nhiên của bạn.",
+                }
+            
+            return {
+                "unique": True,
+                "similar_to": [],
+                "max_similarity": max_sim,
+                "max_similarity_user": max_sim_user,
+                "message": "Voice is unique",
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error in voice uniqueness check: {e}")
+            # On error, allow enrollment to proceed (fail-open)
+            return {
+                "unique": True,
+                "similar_to": [],
+                "max_similarity": 0.0,
+                "message": "Uniqueness check skipped due to error",
+                "error": str(e),
+            }
+
     def get_or_create_profile(self, user_id: str, name: str | None = None) -> Dict[str, Any]:
         """
         Get existing profile or create new one.
@@ -552,6 +672,20 @@ class VoiceService(IVoiceService):
                     "consistency": consistency,
                     "quality": quality,
                 }
+            
+            # Check voice uniqueness - prevent enrolling voice too similar to existing users
+            # Only check on first sample (subsequent samples should be consistent with first)
+            current_count = profile.get("enrollment_count", 0)
+            if current_count == 0:
+                uniqueness = self._check_voice_uniqueness(embedding, user_id)
+                if not uniqueness["unique"]:
+                    return {
+                        "error": uniqueness["message"],
+                        "error_code": "VOICE_NOT_UNIQUE",
+                        "id": user_id,
+                        "uniqueness": uniqueness,
+                        "quality": quality,
+                    }
             
             # Add sample to profile
             try:
@@ -760,9 +894,6 @@ class VoiceService(IVoiceService):
                     }
                 
                 if users_info:
-                    logger.info(f"✅ Fetched {len(users_info)} users from defense session {session_id}")
-                    for uid, info in users_info.items():
-                        logger.debug(f"   - {uid}: {info['display_name']}")
                     return users_info
                 
                 logger.warning(f"⚠️ No valid users in response: {str(data)[:200]}")
@@ -874,8 +1005,20 @@ class VoiceService(IVoiceService):
             zscore = None
         cohort_size = len(cohort_scores)
         
-        # Decision logic
-        accepted, reasons = self._accept_identification(best, zscore, cohort_size)
+        # Build speaker embeddings map for S-Norm
+        speaker_embeddings = {}
+        for profile in enrolled_profiles:
+            user_id = profile.get("user_id")
+            mean_emb = profile.get("mean_embedding_norm")
+            if user_id and mean_emb is not None:
+                speaker_embeddings[user_id] = mean_emb
+        
+        # Decision logic with S-Norm for small cohorts
+        accepted, reasons = self._accept_identification(
+            best, zscore, cohort_size,
+            probe_embedding=embedding,
+            speaker_embeddings=speaker_embeddings,
+        )
         logger.info(
             "🔍 Best candidate: %s | cosine=%.3f | angle=%.1f° | source=%s | zscore=%s | accepted=%s",
             best["name"],
@@ -1160,7 +1303,6 @@ class VoiceService(IVoiceService):
         if skip_noise_filter:
             # Audio already filtered by speech_service, just convert to float32
             signal_filtered = signal.astype(np.float32)
-            logger.debug("Skipping noise filter (pre-filtered audio)")
         else:
             # Apply noise filter (works on int16 PCM)
             filtered = self.noise_filter.reduce_noise(
@@ -1207,10 +1349,6 @@ class VoiceService(IVoiceService):
             # Recenter after rescue attempt
             if signal_norm.size:
                 signal_norm -= np.mean(signal_norm)
-            logger.debug(
-                "Gain rescue attempt | pre_rms=%.6f pctl%d=%.6f scale=%.2f rescued=%s",
-                pre_rms, self.gain_target_pctl, pctl, gain_scale, rescued,
-            )
         
         # Calculate quality metrics
         duration = len(signal_norm) / self.noise_filter.sample_rate
@@ -1252,13 +1390,6 @@ class VoiceService(IVoiceService):
                 quality_ok = True
                 reason = None
                 rms_relaxed = True
-            else:
-                logger.debug(
-                    "Dynamic RMS relax NOT applied | voiced=%.2f need>=%.2f snr=%.1f need>=%.1f duration=%.2fs rescued=%s",
-                    voiced_ratio, max(self.thresholds.voiced_floor - 0.07, 0.12),
-                    snr_db, self.thresholds.snr_floor_db - 7.0,
-                    duration, rescued,
-                )
 
         quality = {
             "rms": rms,
@@ -1402,15 +1533,12 @@ class VoiceService(IVoiceService):
                 enrollment_count = profile.get("enrollment_count", 0)
                 
                 if enrollment_status != "enrolled" or enrollment_count < 3:
-                    logger.debug(f"⏭️ Skip {uid}: status={enrollment_status}, count={enrollment_count}")
                     return None
                     
                 embeddings = self.profile_repo.get_embeddings(uid)
                 if not embeddings:
-                    logger.debug(f"⏭️ Skip {uid}: no embeddings")
                     return None
                     
-                logger.info(f"✅ Loaded profile {uid}: {profile.get('name')} | {len(embeddings)} embeddings")
                 # Normalize embeddings matrix
                 mat = np.stack(embeddings, axis=0).astype(np.float32)
                 norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-6
@@ -1448,26 +1576,35 @@ class VoiceService(IVoiceService):
         probe: np.ndarray,
         profiles: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Calculate similarity scores for all candidate profiles."""
+        """Calculate similarity scores for all candidate profiles.
+        
+        OPTIMIZED: Uses matrix multiplication instead of Python loop.
+        
+        Algorithm:
+        1. Stack all profile embeddings into a single matrix
+        2. Compute all similarities via single matrix-vector multiply: O(1)
+        3. Aggregate scores per profile using vectorized operations
+        
+        Complexity: O(total_embeddings) matrix ops vs O(N * samples) Python loop
+        """
         probe_norm = probe / (np.linalg.norm(probe) + 1e-6)
-        candidates = []
         
         logger.info(f"🔍 Calculating scores for {len(profiles)} profiles | probe_dim={probe.shape} | expected_dim={self.embedding_dim}")
         
+        # Build mapping: profile_index -> (start_idx, end_idx) in stacked matrix
+        profile_ranges: List[Tuple[int, int, Dict[str, Any]]] = []
+        all_embeddings_list: List[np.ndarray] = []
+        current_idx = 0
+        
         for profile in profiles:
-            mean_vec = profile.get("mean_embedding_norm")
-            mean_cosine = None
-            mean_angle = None
-            profile_dim = mean_vec.size if isinstance(mean_vec, np.ndarray) else 0
-            
-            if isinstance(mean_vec, np.ndarray) and mean_vec.size == self.embedding_dim:
-                mean_cosine = float(np.clip(np.dot(probe_norm, mean_vec), -1.0, 1.0))
-                mean_angle = float(np.arccos(mean_cosine))
-            elif isinstance(mean_vec, np.ndarray):
-                logger.warning(f"⚠️ DIMENSION MISMATCH: Profile '{profile.get('name')}' has dim={profile_dim}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
-
             sample_matrix = profile.get("embeddings_norm")
-            sample_count = 0  # Track sample count for logging
+            mean_vec = profile.get("mean_embedding_norm")
+            
+            # Validate dimensions
+            if mean_vec is not None and isinstance(mean_vec, np.ndarray):
+                if mean_vec.size != self.embedding_dim:
+                    logger.warning(f"⚠️ SKIP: Profile '{profile.get('name')}' has incompatible dim={mean_vec.size}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
+                    continue
             
             if sample_matrix is None:
                 # Fallback: build normalized matrix on the fly
@@ -1480,48 +1617,67 @@ class VoiceService(IVoiceService):
                     if norm < 1e-6:
                         continue
                     sample_vecs.append(arr / norm)
+                
                 if not sample_vecs and mean_vec is None:
                     continue
                 if not sample_vecs and mean_vec is not None:
-                    # mean_vec dimension already checked above
-                    if mean_vec.size == self.embedding_dim:
-                        sample_vecs = [mean_vec]
-                    else:
-                        logger.warning(f"⚠️ SKIP: Profile '{profile.get('name')}' has incompatible dim={mean_vec.size}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
-                        continue
+                    sample_vecs = [mean_vec]
                 if not sample_vecs:
                     continue
+                    
                 sample_matrix = np.stack(sample_vecs, axis=0)
-                sample_count = len(sample_vecs)
             else:
-                # sample_matrix already exists - check dimension compatibility
-                sample_count = sample_matrix.shape[0] if hasattr(sample_matrix, 'shape') else 0
+                # Validate preloaded matrix dimensions
                 if hasattr(sample_matrix, 'shape') and len(sample_matrix.shape) >= 2:
                     sample_dim = sample_matrix.shape[1]
                     if sample_dim != self.embedding_dim:
                         logger.warning(f"⚠️ SKIP: Profile '{profile.get('name')}' has preloaded embeddings with dim={sample_dim}, expected={self.embedding_dim}. RE-ENROLLMENT REQUIRED!")
                         continue
-
-            sample_cosines = np.clip(sample_matrix @ probe_norm, -1.0, 1.0)
-            max_sample_cosine = float(np.max(sample_cosines))
-            avg_sample_cosine = float(np.mean(sample_cosines))
-            best_sample_index = int(np.argmax(sample_cosines))
-            best_sample_angle = float(np.arccos(sample_cosines[best_sample_index]))
             
-            if mean_cosine is None:
+            n_samples = sample_matrix.shape[0]
+            profile_ranges.append((current_idx, current_idx + n_samples, profile))
+            all_embeddings_list.append(sample_matrix)
+            current_idx += n_samples
+        
+        if not all_embeddings_list:
+            return []
+        
+        # VECTORIZED: Stack all embeddings into single matrix
+        all_embeddings = np.vstack(all_embeddings_list)  # Shape: (total_samples, dim)
+        
+        # VECTORIZED: Single matrix-vector multiply for ALL similarities
+        all_similarities = np.clip(all_embeddings @ probe_norm, -1.0, 1.0)  # Shape: (total_samples,)
+        
+        # Aggregate scores per profile
+        candidates = []
+        
+        for start_idx, end_idx, profile in profile_ranges:
+            sample_scores = all_similarities[start_idx:end_idx]
+            sample_count = len(sample_scores)
+            
+            max_sample_cosine = float(np.max(sample_scores))
+            avg_sample_cosine = float(np.mean(sample_scores))
+            best_sample_index = int(np.argmax(sample_scores))
+            best_sample_angle = float(np.arccos(np.clip(sample_scores[best_sample_index], -1.0, 1.0)))
+            
+            # Mean embedding score
+            mean_vec = profile.get("mean_embedding_norm")
+            if mean_vec is not None and isinstance(mean_vec, np.ndarray) and mean_vec.size == self.embedding_dim:
+                mean_cosine = float(np.clip(np.dot(probe_norm, mean_vec), -1.0, 1.0))
+                mean_angle = float(np.arccos(mean_cosine))
+            else:
                 mean_cosine = max_sample_cosine
                 mean_angle = float(np.arccos(np.clip(mean_cosine, -1.0, 1.0)))
             
+            # Use best of mean or sample scores
             score = max(mean_cosine, max_sample_cosine)
             score_source = "mean" if score == mean_cosine else "sample"
             angle = mean_angle if score_source == "mean" else best_sample_angle
             
-            # DEBUG: Log actual scores for each profile
-            logger.info(f"📊 Profile '{profile.get('name')}' | mean_cos={mean_cosine:.3f} | max_sample_cos={max_sample_cosine:.3f} | score={score:.3f} | samples={sample_count}")
-            
             candidates.append({
                 "id": profile["user_id"],
                 "name": profile.get("name", profile["user_id"]),
+                "user_id": profile.get("user_id"),
                 "cosine": score,
                 "angle": angle,
                 "mean_cosine": mean_cosine,
@@ -1540,14 +1696,26 @@ class VoiceService(IVoiceService):
         candidate: Dict[str, Any],
         zscore: Optional[float],
         cohort_size: int,
+        probe_embedding: Optional[np.ndarray] = None,
+        speaker_embeddings: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[bool, List[str]]:
-        """Determine if identification should be accepted."""
+        """Determine if identification should be accepted.
+        
+        Uses Adaptive S-Norm when cohort is small (1-2 speakers) for more
+        reliable score calibration. Falls back to traditional z-score
+        for larger cohorts.
+        
+        Args:
+            candidate: Best candidate dict with scores
+            zscore: Z-score from cohort analysis (may be None for small cohorts)
+            cohort_size: Number of speakers in current session
+            probe_embedding: Test utterance embedding (for S-Norm)
+            speaker_embeddings: Dict of speaker_id -> mean_embedding (for S-Norm)
+        """
         reasons = []
         accepted = True
         
-        # Log current thresholds for debugging
-        logger.info(f"🔧 Thresholds: cosine={self.cosine_threshold} | angle_cap={np.rad2deg(self.angle_cap):.1f}° | z={self.z_threshold}")
-        
+        # Always check raw cosine threshold first
         if candidate["cosine"] < self.cosine_threshold:
             accepted = False
             reasons.append(f"low_cosine ({candidate['cosine']:.3f} < {self.cosine_threshold})")
@@ -1556,12 +1724,47 @@ class VoiceService(IVoiceService):
             accepted = False
             reasons.append(f"angle_cap ({np.rad2deg(candidate['angle']):.1f}° > {np.rad2deg(self.angle_cap):.1f}°)")
         
-        # RELAXED: Only reject on zscore if cohort >= 3 (more reliable)
-        if zscore is not None and cohort_size >= 3 and zscore < self.z_threshold:
+        # Use S-Norm for small cohorts (more reliable than z-score)
+        if self.use_snorm and cohort_size <= 2 and probe_embedding is not None and speaker_embeddings is not None:
+            speaker_id = candidate.get("id") or candidate.get("user_id")
+            speaker_emb = speaker_embeddings.get(speaker_id)
+            
+            if speaker_emb is not None:
+                try:
+                    snorm_result = self._score_normalizer.s_normalize(
+                        raw_score=candidate["cosine"],
+                        probe_embedding=probe_embedding,
+                        speaker_embedding=speaker_emb,
+                        speaker_id=speaker_id,
+                    )
+                    
+                    s_score = snorm_result["s_score"]
+                    candidate["s_score"] = s_score
+                    candidate["z_norm_score"] = snorm_result["z_score"]
+                    candidate["t_norm_score"] = snorm_result["t_score"]
+                    
+                    logger.info(
+                        f"📊 S-Norm: raw={candidate['cosine']:.3f} | "
+                        f"z_norm={snorm_result['z_score']:.2f} | "
+                        f"t_norm={snorm_result['t_score']:.2f} | "
+                        f"s_score={s_score:.2f}"
+                    )
+                    
+                    # S-Norm threshold check (in std units)
+                    if accepted and s_score < self.snorm_threshold:
+                        accepted = False
+                        reasons.append(f"snorm_low ({s_score:.2f} < {self.snorm_threshold})")
+                    
+                except Exception as e:
+                    logger.warning(f"S-Norm computation failed: {e}")
+                    # Fall through to z-score check
+        
+        # Traditional z-score for larger cohorts (3+ speakers)
+        elif zscore is not None and cohort_size >= 3 and zscore < self.z_threshold:
             accepted = False
             reasons.append(f"zscore ({zscore:.2f} < {self.z_threshold})")
         
-        logger.info(f"🔍 Accept check: accepted={accepted} | reasons={reasons}")
+        logger.info(f"🔍 Accept check: accepted={accepted} | cohort_size={cohort_size} | reasons={reasons}")
         return accepted, reasons
     
     def _score_confidence(self, cosine: float) -> str:
