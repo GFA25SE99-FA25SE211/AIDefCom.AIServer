@@ -408,3 +408,73 @@ async def get_enrollment_status(
             content={"error": str(exc), "user_id": user_id},
             status_code=500
         )
+
+
+@router.delete(
+    "/users/{user_id}/enrollment",
+    summary="Reset enrollment",
+    description=(
+        "Reset (xóa) toàn bộ enrollment của user. "
+        "Xóa file profile.json trên Azure Blob và clear link trong database. "
+        "User sẽ cần enroll lại từ đầu."
+    ),
+    responses={
+        200: {
+            "description": "Reset successful",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "user_id": "USR001",
+                        "message": "Enrollment reset successful for user USR001",
+                        "details": {
+                            "blob_deleted": True,
+                            "db_cleared": True,
+                            "cache_cleared": True
+                        }
+                    }
+                }
+            },
+        },
+        400: {"description": "Reset failed"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def reset_enrollment(
+    user_id: str = Path(..., description="User ID to reset enrollment"),
+    voice_service: IVoiceService = Depends(get_voice_service),
+):
+    """Reset enrollment for a specific user.
+    
+    **REST API:** `DELETE /voice/users/{user_id}/enrollment`
+    
+    **Process:**
+    1. Xóa file profile.json trên Azure Blob Storage
+    2. Clear VoiceSamplePath trong SQL database
+    3. Invalidate tất cả caches liên quan
+    
+    **Use Cases:**
+    - User muốn enroll lại với giọng mới
+    - Admin cần reset enrollment cho user
+    - Xử lý trường hợp enrollment bị lỗi
+    """
+    try:
+        result = await asyncio.to_thread(
+            voice_service.reset_enrollment,
+            user_id
+        )
+        
+        status_code = 200 if result.get("success") else 400
+        return JSONResponse(content=result, status_code=status_code)
+        
+    except Exception as exc:
+        logger.exception(f"Error resetting enrollment for user {user_id}: {exc}")
+        return JSONResponse(
+            content={
+                "success": False,
+                "error": str(exc),
+                "user_id": user_id,
+                "message": f"Failed to reset enrollment: {exc}"
+            },
+            status_code=500
+        )
