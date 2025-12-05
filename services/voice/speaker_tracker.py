@@ -11,6 +11,21 @@ from typing import List, Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 
+def _get_speaker_config():
+    """Get speaker tracking config with fallback defaults."""
+    try:
+        from app.config import Config
+        return {
+            "max_speakers": Config.SPEAKER_MAX_CONCURRENT,
+            "inactivity_timeout": Config.SPEAKER_INACTIVITY_TIMEOUT_SECONDS,
+        }
+    except Exception:
+        return {
+            "max_speakers": 4,
+            "inactivity_timeout": 30.0,
+        }
+
+
 @dataclass
 class SpeakerSegment:
     """Represents a speaking segment by one speaker."""
@@ -70,16 +85,17 @@ class MultiSpeakerTracker:
     - Speaker statistics
     """
     
-    def __init__(self, max_speakers: int = 4, inactivity_timeout: float = 30.0):
+    def __init__(self, max_speakers: int | None = None, inactivity_timeout: float | None = None):
         """
         Initialize multi-speaker tracker.
         
         Args:
-            max_speakers: Maximum number of concurrent speakers to track
-            inactivity_timeout: Time in seconds before speaker is considered inactive
+            max_speakers: Maximum number of concurrent speakers to track (default from Config)
+            inactivity_timeout: Time in seconds before speaker is considered inactive (default from Config)
         """
-        self.max_speakers = max_speakers
-        self.inactivity_timeout = inactivity_timeout
+        config = _get_speaker_config()
+        self.max_speakers = max_speakers if max_speakers is not None else config["max_speakers"]
+        self.inactivity_timeout = inactivity_timeout if inactivity_timeout is not None else config["inactivity_timeout"]
         
         # Current active speaker
         self.active_speaker: str = "Khách"
@@ -95,8 +111,6 @@ class MultiSpeakerTracker:
         # Speaking segments
         self.segments: List[SpeakerSegment] = []
         self.current_segment: Optional[SpeakerSegment] = None
-        
-        logger.info(f"MultiSpeakerTracker initialized | max_speakers={max_speakers}")
     
     def switch_speaker(
         self,
@@ -129,12 +143,6 @@ class MultiSpeakerTracker:
         if self.current_segment:
             self.current_segment.end_time = timestamp
             self.segments.append(self.current_segment)
-            
-            duration = self.current_segment.duration()
-            logger.info(
-                f"🔚 Segment ended | speaker={self.active_speaker} | "
-                f"duration={duration:.2f}s | text_len={len(self.current_segment.text)}"
-            )
         
         # Switch speaker
         old_speaker = self.active_speaker
@@ -156,11 +164,6 @@ class MultiSpeakerTracker:
         
         # Update state
         self._update_speaker_state(new_speaker, new_user_id, timestamp, confidence)
-        
-        logger.info(
-            f"🔄 Speaker switched | {old_speaker} → {new_speaker} | "
-            f"reason={reason} | confidence={confidence:.3f if confidence else 'N/A'}"
-        )
         
         return True
     
@@ -297,10 +300,5 @@ class MultiSpeakerTracker:
             self.current_segment.end_time = timestamp
             self.segments.append(self.current_segment)
             self.current_segment = None
-        
-        logger.info(
-            f"📊 Session finalized | segments={len(self.segments)} | "
-            f"speakers={len(self.speaker_states)}"
-        )
         
         return self.segments

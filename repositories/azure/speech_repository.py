@@ -1,0 +1,425 @@
+"""Azure Speech Repository - Azure Speech SDK wrapper for speech recognition."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+from typing import Any, AsyncGenerator, AsyncIterable, Dict, Iterable, List, Sequence
+
+import azure.cognitiveservices.speech as speechsdk
+
+from core.exceptions import AzureSpeechError
+from repositories.interfaces.speech_repository import ISpeechRepository
+from repositories.models.speech_config import SpeechRecognitionConfig
+from services.audio.utils import pcm_to_wav
+
+logger = logging.getLogger(__name__)
+
+
+def _load_phrase_hints_from_file(file_path: str) -> List[str]:
+    """Load phrase hints from JSON file."""
+    if not file_path or not os.path.exists(file_path):
+        return []
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        phrases: List[str] = []
+        for key, value in data.items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, list):
+                phrases.extend([p for p in value if isinstance(p, str)])
+        
+        logger.info(f"Loaded {len(phrases)} phrase hints from {file_path}")
+        return phrases
+    except Exception as e:
+        logger.error(f"Error loading phrase hints from {file_path}: {e}")
+        return []
+
+
+_FALLBACK_PHRASE_HINTS: Sequence[str] = (
+    "xin chào", "cảm ơn", "vâng ạ", "dạ vâng", "được ạ", "không ạ",
+    "bảo vệ khóa luận", "bảo vệ đồ án", "hội đồng bảo vệ",
+    "REST API", "microservices", "database", "repository pattern",
+)
+
+
+def _get_default_phrase_hints() -> Sequence[str]:
+    """Get default phrase hints from config file or fallback."""
+    try:
+        from app.config import Config
+        if Config.PHRASE_HINTS_FILE:
+            hints = _load_phrase_hints_from_file(Config.PHRASE_HINTS_FILE)
+            if hints:
+                return tuple(hints)
+        default_path = os.path.join(Config.PROJECT_ROOT, "data", "phrase_hints.json")
+        if os.path.exists(default_path):
+            hints = _load_phrase_hints_from_file(default_path)
+            if hints:
+                return tuple(hints)
+    except Exception as e:
+        logger.warning(f"Failed to load phrase hints from config: {e}")
+    
+    return _FALLBACK_PHRASE_HINTS
+
+
+class AzureSpeechRepository(ISpeechRepository):
+    """Repository for Azure Speech Service operations."""
+    
+    _PROVIDER_NAME: str = "azure"
+    _SUPPORTED_LANGUAGES: tuple[str, ...] = (
+        "vi-VN", "en-US", "en-GB", "ja-JP", "ko-KR",
+        "zh-CN", "zh-TW", "th-TH", "fr-FR", "de-DE",
+    )
+    
+    def get_provider_name(self) -> str:
+        return self._PROVIDER_NAME
+    
+    def get_supported_languages(self) -> list[str]:
+        return list(self._SUPPORTED_LANGUAGES)
+    
+    def configure(self, config: SpeechRecognitionConfig) -> None:
+        """Apply provider-agnostic configuration to Azure Speech."""
+        if config.language and config.language in self._SUPPORTED_LANGUAGES:
+            self.language = config.language
+            self.speech_config.speech_recognition_language = config.language
+        
+        if config.sample_rate:
+            self.sample_rate = config.sample_rate
+        
+        if config.provider_options:
+            opts = config.provider_options
+            if "segmentation_silence_ms" in opts:
+                self.speech_config.set_property(
+                    speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                    str(opts["segmentation_silence_ms"])
+                )
+            if "initial_silence_ms" in opts:
+                self.speech_config.set_property(
+                    speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+                    str(opts["initial_silence_ms"])
+                )
+            if "end_silence_ms" in opts:
+                self.speech_config.set_property(
+                    speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+                    str(opts["end_silence_ms"])
+                )
+            if "stable_partial_threshold" in opts:
+                self.speech_config.set_property(
+                    speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold,
+                    str(opts["stable_partial_threshold"])
+                )
+        
+        if config.phrase_hints:
+            self.default_phrase_hints = tuple(config.phrase_hints)
+        
+        logger.info(
+            f"Azure Speech reconfigured | language={self.language} | "
+            f"sample_rate={self.sample_rate} | hints={len(self.default_phrase_hints)}"
+        )
+    
+    def __init__(
+        self,
+        subscription_key: str,
+        region: str,
+        language: str = "vi-VN",
+        default_phrase_hints: Sequence[str] | None = None,
+        sample_rate: int = 16000,
+        segmentation_silence_ms: int | None = None,
+        initial_silence_ms: int | None = None,
+        end_silence_ms: int | None = None,
+        stable_partial_threshold: int | None = None,
+    ) -> None:
+        """Initialize Azure Speech repository."""
+        try:
+            from app.config import Config
+            _segmentation_silence = segmentation_silence_ms or Config.AZURE_SPEECH_SEGMENTATION_SILENCE_MS
+            _initial_silence = initial_silence_ms or Config.AZURE_SPEECH_INITIAL_SILENCE_MS
+            _end_silence = end_silence_ms or Config.AZURE_SPEECH_END_SILENCE_MS
+            _stable_threshold = stable_partial_threshold or Config.AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD
+        except Exception:
+            _segmentation_silence = segmentation_silence_ms or 600
+            _initial_silence = initial_silence_ms or 5000
+            _end_silence = end_silence_ms or 400
+            _stable_threshold = stable_partial_threshold or 4
+        
+        self.speech_key = subscription_key
+        self.subscription_key = subscription_key
+        self.region = region
+        self.language = language
+        self.sample_rate = sample_rate
+        self.default_phrase_hints: Sequence[str] = (
+            tuple(default_phrase_hints) if default_phrase_hints else _get_default_phrase_hints()
+        )
+        
+        self.speech_config = speechsdk.SpeechConfig(subscription=subscription_key, region=region)
+        self.speech_config.speech_recognition_language = language
+        self.speech_config.output_format = speechsdk.OutputFormat.Detailed
+        
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
+            "CONVERSATION"
+        )
+        
+        self.speech_config.set_property(
+            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+            str(_segmentation_silence)
+        )
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+            str(_initial_silence)
+        )
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+            str(_end_silence)
+        )
+        
+        try:
+            self.speech_config.set_property(
+                speechsdk.PropertyId.SpeechServiceResponse_PostProcessingOption,
+                "TrueText",
+            )
+        except AttributeError:
+            self.speech_config.set_property_by_name(
+                "SpeechServiceResponse_PostProcessingOption", "TrueText"
+            )
+        
+        self.speech_config.set_profanity(speechsdk.ProfanityOption.Masked)
+        
+        try:
+            self.speech_config.request_word_level_timestamps()
+        except Exception:
+            pass
+        
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold,
+            str(_stable_threshold)
+        )
+        
+        try:
+            self.speech_config.enable_dictation()
+        except Exception:
+            pass
+        
+        logger.info(
+            f"Azure Speech Repository initialized | language={language} | region={region} | "
+            f"sr={sample_rate}Hz | hints={len(self.default_phrase_hints)}"
+        )
+    
+    async def recognize_continuous_async(
+        self,
+        audio_stream: Any,
+        speaker: str,
+        extra_phrases: Sequence[str] | None = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Implement interface method for continuous recognition."""
+        if hasattr(audio_stream, "__aiter__") and not isinstance(audio_stream, speechsdk.audio.PushAudioInputStream):
+            async for evt in self.recognize_stream(audio_stream, extra_phrases=extra_phrases):
+                yield evt
+            return
+
+        fmt = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=self.sample_rate,
+            bits_per_sample=16,
+            channels=1,
+        )
+        try:
+            if not isinstance(audio_stream, speechsdk.audio.PushAudioInputStream):
+                push_stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
+                if hasattr(audio_stream, "read"):
+                    data = audio_stream.read()
+                    if data:
+                        push_stream.write(data)
+                audio_stream = push_stream
+        except Exception as exc:
+            logger.warning(f"Failed to adapt audio_stream: {exc}")
+            if hasattr(audio_stream, "__aiter__"):
+                async for evt in self.recognize_stream(audio_stream, extra_phrases=extra_phrases):
+                    yield evt
+                return
+            raise
+
+        audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config,
+        )
+
+        all_hints = list(self.default_phrase_hints)
+        if extra_phrases:
+            all_hints.extend(extra_phrases)
+        if speaker:
+            lowered = speaker.lower()
+            if lowered not in {"khách", "guest", "unknown"}:
+                all_hints.append(speaker)
+        if all_hints:
+            phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+            for phrase in all_hints:
+                with contextlib.suppress(Exception):
+                    phrase_list.addPhrase(phrase)
+
+        event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
+
+        def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            text = evt.result.text.strip()
+            if text:
+                event_queue.put_nowait({"type": "partial", "text": text})
+
+        def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = evt.result.text.strip()
+                if text:
+                    event_queue.put_nowait({"type": "result", "text": text})
+            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                event_queue.put_nowait({"type": "nomatch"})
+
+        def on_canceled(evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+            if evt.reason == speechsdk.CancellationReason.Error:
+                logger.error(f"Azure Speech error: {evt.error_details}")
+                event_queue.put_nowait({"type": "error", "error": evt.error_details})
+            event_queue.put_nowait(None)
+
+        def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
+            event_queue.put_nowait(None)
+
+        recognizer.recognizing.connect(on_recognizing)
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_session_stopped)
+
+        recognizer.start_continuous_recognition_async()
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            with contextlib.suppress(Exception):
+                recognizer.stop_continuous_recognition_async()
+    
+    async def recognize_stream(
+        self,
+        audio_source: AsyncIterable[bytes],
+        extra_phrases: Iterable[str] | None = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream speech recognition from an async audio source."""
+        fmt = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=self.sample_rate,
+            bits_per_sample=16,
+            channels=1,
+        )
+        push_stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
+        audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
+        
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config,
+        )
+        
+        all_hints = list(self.default_phrase_hints)
+        if extra_phrases:
+            all_hints.extend(extra_phrases)
+        
+        if all_hints:
+            phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+            for phrase in all_hints:
+                phrase_list.addPhrase(phrase)
+        
+        event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
+        
+        def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            text = evt.result.text.strip()
+            if text:
+                event_queue.put_nowait({"type": "partial", "text": text})
+        
+        def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = evt.result.text.strip()
+                if text:
+                    event_queue.put_nowait({"type": "result", "text": text})
+            elif evt.result.reason == speechsdk.ResultReason.NoMatch:
+                event_queue.put_nowait({"type": "nomatch"})
+        
+        def on_canceled(evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+            if evt.reason == speechsdk.CancellationReason.Error:
+                logger.error(f"Azure Speech error: {evt.error_details}")
+                event_queue.put_nowait({"type": "error", "error": evt.error_details})
+            event_queue.put_nowait(None)
+        
+        def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
+            event_queue.put_nowait(None)
+        
+        recognizer.recognizing.connect(on_recognizing)
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_session_stopped)
+        
+        recognizer.start_continuous_recognition_async()
+        
+        audio_task = asyncio.create_task(
+            self._pump_audio(audio_source, push_stream)
+        )
+        
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                yield event
+        finally:
+            recognizer.stop_continuous_recognition_async()
+            audio_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await audio_task
+
+    async def _pump_audio(
+        self,
+        audio_source: AsyncIterable[bytes],
+        push_stream: speechsdk.audio.PushAudioInputStream,
+    ) -> None:
+        """Forward audio chunks into Azure's push stream."""
+        try:
+            async for chunk in audio_source:
+                if not chunk:
+                    continue
+                push_stream.write(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Audio streaming interrupted: {exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                push_stream.close()
+    
+    def recognize_once(self, audio_bytes: bytes) -> str:
+        """Perform one-shot speech recognition on audio bytes."""
+        if not audio_bytes.startswith(b"RIFF"):
+            audio_bytes = pcm_to_wav(audio_bytes, self.sample_rate)
+        
+        audio_stream = speechsdk.audio.PushAudioInputStream()
+        audio_stream.write(audio_bytes)
+        audio_stream.close()
+        
+        audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config,
+        )
+        
+        result = recognizer.recognize_once()
+        
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            return result.text.strip()
+        elif result.reason == speechsdk.ResultReason.NoMatch:
+            return ""
+        elif result.reason == speechsdk.ResultReason.Canceled:
+            cancellation = result.cancellation_details
+            raise AzureSpeechError(f"Recognition canceled: {cancellation.reason} - {cancellation.error_details}")
+        else:
+            raise AzureSpeechError(f"Unexpected result reason: {result.reason}")

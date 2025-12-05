@@ -73,6 +73,32 @@ class Config:
     VOICE_SPEAKER_SWITCH_MARGIN: float = float(os.getenv("VOICE_SPEAKER_SWITCH_MARGIN", "0.06"))
     VOICE_SPEAKER_SWITCH_HITS_REQUIRED: int = int(os.getenv("VOICE_SPEAKER_SWITCH_HITS_REQUIRED", "3"))
     
+    # Speaker Identification Algorithm Thresholds (tunable via env vars)
+    # These control how the system identifies and switches between speakers
+    SPEAKER_IDENTIFY_MIN_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_MIN_SECONDS", "2.0"))
+    SPEAKER_IDENTIFY_WINDOW_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_WINDOW_SECONDS", "3.0"))
+    SPEAKER_HISTORY_SECONDS: float = float(os.getenv("SPEAKER_HISTORY_SECONDS", "5.0"))
+    SPEAKER_IDENTIFY_INTERVAL_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_INTERVAL_SECONDS", "0.3"))
+    SPEAKER_REDIS_TIMEOUT_SECONDS: float = float(os.getenv("SPEAKER_REDIS_TIMEOUT_SECONDS", "0.5"))
+    
+    # Fallback cosine thresholds for speaker identification
+    SPEAKER_FALLBACK_COSINE_THRESHOLD: float = float(os.getenv("SPEAKER_FALLBACK_COSINE_THRESHOLD", "0.30"))
+    SPEAKER_FALLBACK_MARGIN_THRESHOLD: float = float(os.getenv("SPEAKER_FALLBACK_MARGIN_THRESHOLD", "0.06"))
+    SPEAKER_WEAK_COSINE_THRESHOLD: float = float(os.getenv("SPEAKER_WEAK_COSINE_THRESHOLD", "0.22"))
+    
+    # Multi-speaker tracker settings
+    SPEAKER_MAX_CONCURRENT: int = int(os.getenv("SPEAKER_MAX_CONCURRENT", "4"))
+    SPEAKER_INACTIVITY_TIMEOUT_SECONDS: float = float(os.getenv("SPEAKER_INACTIVITY_TIMEOUT_SECONDS", "30.0"))
+    
+    # Azure Speech recognition timeouts (ms)
+    AZURE_SPEECH_SEGMENTATION_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_SEGMENTATION_SILENCE_MS", "600"))
+    AZURE_SPEECH_INITIAL_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_INITIAL_SILENCE_MS", "5000"))
+    AZURE_SPEECH_END_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_END_SILENCE_MS", "400"))
+    AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD: int = int(os.getenv("AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD", "4"))
+    
+    # Path to phrase hints file (JSON array of strings)
+    PHRASE_HINTS_FILE: str = os.getenv("PHRASE_HINTS_FILE", "")
+    
     # Application
     APP_TITLE: str = "AIDefCom AI Service"
     APP_DESCRIPTION: str = "Speech-to-Text + Voice Authentication"
@@ -136,13 +162,13 @@ class Config:
                         parts[k.strip().lower()] = v.strip()
                 # Map common keys only if not already set
                 if not cls.SQL_SERVER_HOST:
-                    cls.SQL_SERVER_HOST = parts.get("server", "")
+                    cls.SQL_SERVER_HOST = parts.get("server", "") or parts.get("data source", "")
                 if not cls.SQL_SERVER_DATABASE:
-                    cls.SQL_SERVER_DATABASE = parts.get("database", "")
+                    cls.SQL_SERVER_DATABASE = parts.get("database", "") or parts.get("initial catalog", "")
                 if not cls.SQL_SERVER_USERNAME:
-                    cls.SQL_SERVER_USERNAME = parts.get("user id", "")
+                    cls.SQL_SERVER_USERNAME = parts.get("user id", "") or parts.get("uid", "")
                 if not cls.SQL_SERVER_PASSWORD:
-                    cls.SQL_SERVER_PASSWORD = parts.get("password", "")
+                    cls.SQL_SERVER_PASSWORD = parts.get("password", "") or parts.get("pwd", "")
 
 
 # Validate configuration on import

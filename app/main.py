@@ -165,6 +165,14 @@ async def lifespan(app: FastAPI):
     """Lifespan manager with non-blocking warmup for ACA compatibility."""
     print("🚀 Starting AIDefCom AI Service...")
     
+    # Initialize database connection pool (non-blocking, just creates the pool)
+    try:
+        from repositories.database import DatabasePool
+        DatabasePool.initialize()
+        print("✅ Database connection pool initialized")
+    except Exception as e:
+        print(f"⚠️ Database pool initialization skipped: {e}")
+    
     # Start background warmup (non-blocking - allows health check to pass immediately)
     warmup_task = asyncio.create_task(background_warmup())
     
@@ -173,6 +181,20 @@ async def lifespan(app: FastAPI):
     # Cleanup
     warmup_task.cancel()
     print("👋 Shutting down...")
+    
+    # Shutdown database connection pool
+    try:
+        from repositories.database import DatabasePool
+        DatabasePool.shutdown()
+    except Exception as e:
+        print(f"⚠️ Error shutting down database pool: {e}")
+    
+    # Shutdown all thread pool executors
+    try:
+        from core.executors import shutdown_executors
+        shutdown_executors()
+    except Exception as e:
+        print(f"⚠️ Error shutting down executors: {e}")
 
 
 # Create FastAPI app with lifespan manager
@@ -250,6 +272,7 @@ async def health_check():
                 get_azure_blob_repository,
                 get_azure_speech_repository
             )
+            from repositories.database import DatabasePool
             
             health_status = await get_comprehensive_health(
                 redis_service=get_redis_service(),
@@ -258,6 +281,9 @@ async def health_check():
                 speech_repo=get_azure_speech_repository()
             )
             health_status["warmup"] = _warmup_status
+            
+            # Add database pool status
+            health_status["database_pool"] = DatabasePool.get_pool_status()
             
             status_code = 200 if health_status["status"] == "healthy" else 503
             return Response(

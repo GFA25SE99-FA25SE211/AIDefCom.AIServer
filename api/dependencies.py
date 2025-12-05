@@ -6,23 +6,22 @@ import logging
 from functools import lru_cache
 
 from app.config import Config
-from repositories.azure_speech_repository import AzureSpeechRepository
-from repositories.cloud_voice_profile_repository import CloudVoiceProfileRepository
-from repositories.models.embedding_model import EmbeddingModelRepository
-from repositories.azure_blob_repository import AzureBlobRepository
-from repositories.sql_server_repository import SQLServerRepository
-from repositories.interfaces.i_sql_server_repository import ISQLServerRepository
+
+# New import paths
+from repositories.azure import AzureSpeechRepository, AzureBlobRepository
+from repositories.voice import CloudVoiceProfileRepository
+from repositories.sql import SQLServerRepository
+from repositories.interfaces import ISQLServerRepository, IVoiceProfileRepository, ISpeechRepository
+from services.voice import EmbeddingModel
+
 from services.speech_service import SpeechService
 from services.voice_service import VoiceService, QualityThresholds
 from services.question_service import QuestionService
 from services.redis_service import get_redis_service
 
-# Import interfaces
 from services.interfaces.i_voice_service import IVoiceService
 from services.interfaces.i_speech_service import ISpeechService
 from services.interfaces.i_question_service import IQuestionService
-from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
-from repositories.interfaces.i_speech_repository import ISpeechRepository
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +29,13 @@ logger = logging.getLogger(__name__)
 # Singleton instances
 _azure_speech_repo: ISpeechRepository | None = None
 _cloud_voice_profile_repo: IVoiceProfileRepository | None = None
-_embedding_model_repo: EmbeddingModelRepository | None = None
+_embedding_model: EmbeddingModel | None = None
 _azure_blob_repo: AzureBlobRepository | None = None
 _sql_server_repo: ISQLServerRepository | None = None
 _voice_service: IVoiceService | None = None
 _speech_service: ISpeechService | None = None
 _question_service: IQuestionService | None = None
+
 
 
 @lru_cache()
@@ -68,14 +68,16 @@ def get_voice_profile_repository() -> IVoiceProfileRepository:
 
 
 @lru_cache()
-def get_embedding_model_repository() -> EmbeddingModelRepository:
-    """Get speaker embedding model repository instance (Pyannote/WeSpeaker)."""
-    global _embedding_model_repo
-    if _embedding_model_repo is None:
-        _embedding_model_repo = EmbeddingModelRepository(
-            sample_rate=Config.SAMPLE_RATE,
-        )
-    return _embedding_model_repo
+def get_embedding_model() -> EmbeddingModel:
+    """Get speaker embedding model instance (Pyannote/WeSpeaker)."""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = EmbeddingModel(sample_rate=Config.SAMPLE_RATE)
+    return _embedding_model
+
+
+# Backward compatibility alias
+get_embedding_model_repository = get_embedding_model
 
 
 @lru_cache()
@@ -159,7 +161,7 @@ def get_voice_service() -> IVoiceService:
 
         _voice_service = VoiceService(
             voice_profile_repo=get_voice_profile_repository(),
-            model_repo=get_embedding_model_repository(),  # Use factory-created model
+            model_repo=get_embedding_model(),
             thresholds=thresholds,
             azure_blob_repo=get_azure_blob_repository(),
             sql_server_repo=get_sql_server_repository(),

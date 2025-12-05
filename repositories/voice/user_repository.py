@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 import requests
 
@@ -19,31 +19,18 @@ class UserRepository:
         self.timeout = timeout
 
     def get_user_by_id(self, user_id: str) -> Optional[Dict]:
-        """Fetch user by ID from .NET backend.
-
-        Args:
-            user_id: Identity user id (AspNetUsers.Id)
-        Returns:
-            Dict with user fields or None if not found
-        """
+        """Fetch user by ID from .NET backend."""
         url = f"{self.base_url}/auth/users/{user_id}"
         try:
             resp = requests.get(url, timeout=self.timeout, verify=self.verify_ssl)
             if resp.status_code == 200:
                 try:
                     return resp.json()
-                except Exception as e:
-                    logger.warning(f"User API returned non-JSON | id={user_id} | err={e}")
+                except Exception:
                     return None
             if resp.status_code == 404:
-                logger.info(f"User not found | id={user_id}")
                 return None
-            logger.warning(
-                "User API error | id=%s | status=%s | body=%s",
-                user_id,
-                resp.status_code,
-                (resp.text[:500] if resp.text else ""),
-            )
+            logger.warning(f"User API error | id={user_id} | status={resp.status_code}")
             return None
         except requests.RequestException as e:
             logger.error(f"User API request failed | id={user_id} | error={e}")

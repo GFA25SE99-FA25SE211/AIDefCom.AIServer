@@ -1,24 +1,20 @@
-"""Cloud Voice Profile Repository - Stores profiles exclusively in Azure Blob.
-
-Replaces local file-based VoiceProfileRepository with Azure Blob Storage backend.
-Now includes L1 (memory), L2 (Redis), L3 (Blob) caching hierarchy.
-"""
+"""Cloud Voice Profile Repository - Stores profiles in Azure Blob with caching."""
 
 from __future__ import annotations
 
-import json
 import logging
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from cachetools import LRUCache
 
 from core.exceptions import VoiceProfileNotFoundError
-from repositories.azure_blob_repository import AzureBlobRepository
-from repositories.interfaces.i_voice_profile_repository import IVoiceProfileRepository
-from repositories.interfaces.i_redis_service import IRedisService
-from repositories.models.voice_profile_model import VoiceProfile as VoiceProfileModel
-import asyncio
+from repositories.azure.blob_repository import AzureBlobRepository
+from repositories.interfaces.voice_repository import IVoiceProfileRepository
+from repositories.interfaces.redis_service import IRedisService
+from repositories.models.voice_profile import VoiceProfile as VoiceProfileModel
 
 logger = logging.getLogger(__name__)
 
@@ -28,54 +24,41 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
 
     def __init__(self, blob_repo: AzureBlobRepository, redis_service: Optional[IRedisService] = None) -> None:
         self.blob_repo = blob_repo
-        # Do not call DI factories here (DIP). If redis_service is None, L2 caching is disabled gracefully.
         self.redis_service = redis_service
         
-        # L1 Cache: In-memory LRU for hot profiles (max 100 profiles ~5MB)
+        # L1 Cache: In-memory LRU (max 100 profiles ~5MB)
         self._memory_cache: LRUCache = LRUCache(maxsize=100)
-        
-        # L2 Cache: Redis (5 min TTL)
-        self._redis_ttl = 300
+        self._redis_ttl = 300  # L2 Cache TTL: 5 min
         
         logger.info("CloudVoiceProfileRepository initialized with L1/L2/L3 caching")
 
-    # Helper utilities mirror local repo behavior
     def _iso_now(self) -> str:
-        from datetime import datetime
         return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    # Interface methods expected by VoiceService
     def profile_exists(self, user_id: str) -> bool:
         return self.blob_repo.profile_exists_in_blob(user_id)
 
     def load_profile(self, user_id: str) -> Dict[str, Any]:
-        """Load profile with L1/L3 cache hierarchy (sync).
-        Uses L1 memory cache, then L3 Blob.
-        Redis L2 cache is only used in async context via load_profile_async.
-        """
-        # L1: Memory cache (hot profiles)
+        """Load profile with L1/L3 cache hierarchy."""
+        # L1: Memory cache
         if user_id in self._memory_cache:
-            logger.debug(f"L1 cache hit: {user_id}")
             return self._memory_cache[user_id]
         
-        # L3: Azure Blob (source of truth) - skip Redis in sync context to avoid deadlock
+        # L3: Azure Blob
         try:
             data = self.blob_repo.download_voice_profile(user_id)
             if data is None:
                 raise VoiceProfileNotFoundError(f"Profile not found for user: {user_id}")
             
-            # Validate and populate L1 cache
             try:
                 model = VoiceProfileModel(**data)
                 data = model.dict()
             except Exception as ve:
                 logger.warning(f"VoiceProfile validation failed for {user_id}: {ve}")
+            
             self._memory_cache[user_id] = data
-            logger.debug(f"L3 blob fetch + L1 cache updated: {user_id}")
             return data
         except Exception as e:
-            logger.error(f"Failed to load profile from blob: {user_id} | {e}")
-            # Fallback: check if L1 has stale data (better than nothing)
             if user_id in self._memory_cache:
                 logger.warning(f"Using stale L1 cache for {user_id}")
                 return self._memory_cache[user_id]
@@ -83,13 +66,8 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
 
     def save_profile(self, user_id: str, profile_data: Dict[str, Any]) -> None:
         profile_data["updated_at"] = self._iso_now()
-        # Upload JSON via blob repo (overwrite)
         self.blob_repo.upload_voice_profile(user_id, profile_data)
-        
-        # Invalidate L1 cache only (Redis invalidation happens in async context)
         self._memory_cache.pop(user_id, None)
-        
-        logger.debug(f"Profile saved + L1 cache invalidated: {user_id}")
 
     def create_profile(self, user_id: str, name: str, embedding_dim: int) -> Dict[str, Any]:
         profile_data = {
@@ -108,14 +86,14 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
             "enrollment_count": 0,
         }
         self.save_profile(user_id, profile_data)
-        logger.info("Cloud profile created | user_id=%s", user_id)
+        logger.info(f"Cloud profile created | user_id={user_id}")
         return profile_data
 
     def delete_profile(self, user_id: str) -> bool:
         try:
             return self.blob_repo.delete_voice_profile(user_id)
         except Exception as e:
-            logger.error("Failed to delete cloud profile | user_id=%s | error=%s", user_id, e)
+            logger.error(f"Failed to delete cloud profile | user_id={user_id} | error={e}")
             return False
 
     def list_profiles(self) -> List[str]:
@@ -129,7 +107,6 @@ class CloudVoiceProfileRepository(IVoiceProfileRepository):
         metrics: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         profile = self.load_profile(user_id)
-        import uuid
         sample = {
             "sample_id": str(uuid.uuid4()),
             "session_id": session_id or "default",
