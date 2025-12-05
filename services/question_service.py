@@ -105,14 +105,20 @@ def _check_duplicates_with_index_sync(
         # Semantic similarity (already computed via matrix multiply)
         cos = float(semantic_scores[i])
         
-        # Vietnamese-optimized duplicate detection logic
+        # Debug logging
+        logger.info(f"🔍 Q: '{question_text[:40]}' vs '{text[:40]}' | fuzzy={fuzzy_score:.2f} | sem={cos:.2f}")
+        
+        # Vietnamese-optimized duplicate detection:
+        # - Use PASSED thresholds, not hardcoded values
+        # - Lower thresholds for Vietnamese (shorter sentences, similar words)
         is_duplicate = (
-            (fuzzy_score >= 0.65 and cos >= 0.60) or  # Both moderately high
-            fuzzy_score >= 0.85 or                     # Nearly identical wording
-            cos >= 0.70                                 # Strong semantic similarity
+            (fuzzy_score >= 0.55 and cos >= semantic_threshold) or  # Both moderately high
+            fuzzy_score >= fuzzy_threshold or                        # Nearly identical wording
+            cos >= semantic_threshold + 0.10                         # Strong semantic similarity
         )
         
         if is_duplicate:
+            logger.info(f"✅ DUPLICATE: fuzzy={fuzzy_score:.2f} sem={cos:.2f}")
             similar_questions.append({
                 'text': text,
                 'fuzzy_score': round(fuzzy_score, 4),
@@ -194,8 +200,8 @@ class QuestionService(IQuestionService):
         self,
         session_id: str,
         question_text: str,
-        threshold: float = 0.85,
-        semantic_threshold: float = 0.85
+        threshold: float = 0.75,
+        semantic_threshold: float = 0.55
     ) -> tuple[bool, list[dict]]:
         """Check if question is duplicate (fuzzy + semantic).
         
@@ -205,9 +211,9 @@ class QuestionService(IQuestionService):
         - Similarity computation: O(1) matrix-vector multiply vs O(N) loop
         
         Logic: Coi là trùng nếu:
-        - Fuzzy >= 0.65 AND Semantic >= 0.60 (cả 2 moderately high)
-        - HOẶC Fuzzy >= 0.85 (gần như giống hệt về từ)
-        - HOẶC Semantic >= 0.70 (giống về ý nghĩa)
+        - Fuzzy >= 0.55 AND Semantic >= threshold (cả 2 moderately high)
+        - HOẶC Fuzzy >= fuzzy_threshold (gần như giống hệt về từ)
+        - HOẶC Semantic >= threshold + 0.10 (giống về ý nghĩa)
         """
         key = self._get_session_key(session_id)
         questions = await self.redis_service.get(key)
@@ -303,8 +309,8 @@ class QuestionService(IQuestionService):
         question_text: str,
         speaker: str = "Khách",
         timestamp: str = None,
-        threshold: float = 0.85,
-        semantic_threshold: float = 0.85
+        threshold: float = 0.75,
+        semantic_threshold: float = 0.55
     ) -> dict:
         """Atomic: check duplicate and register if unique.
         
