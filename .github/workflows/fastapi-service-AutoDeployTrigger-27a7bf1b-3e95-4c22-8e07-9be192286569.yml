@@ -43,3 +43,23 @@ jobs:
           imageToDeploy: hitech2605/fastapi-service:${{ github.sha }}
           containerAppName: fastapi-service
           resourceGroup: AIDefCom
+
+          # Environment Variables
+          environmentVariables: >-
+            AZURE_SPEECH_KEY=secretref:azure-speech-key
+            AZURE_SPEECH_REGION=southeastasia
+            AZURE_SPEECH_CUSTOM_ENDPOINT_ID=
+            REDIS_HOST=aidefcom.redis.cache.windows.net
+            REDIS_PORT=6380
+            REDIS_PASSWORD=secretref:redis-password
+            REDIS_SSL=true
+            REDIS_DB=0
+            REDIS_TTL_SECONDS=86400
+            AZURE_STORAGE_CONNECTION_STRING=secretref:azure-storage-connection-string
+            AZURE_BLOB_CONTAINER_NAME=voice-sample
+            VOICE_PROFILE_STORAGE_MODE=blob
+            SQL_SERVER_CONNECTION_STRING=secretref:sql-server-connection-string
+            AUTH_SERVICE_BASE_URL=https://aidefcomapi.azurewebsites.net
+            AUTH_SERVICE_VERIFY_SSL=true
+            AUTH_SERVICE_TIMEOUT=30
+            HF_TOKEN=secretref:hf-token
