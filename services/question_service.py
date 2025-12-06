@@ -218,8 +218,15 @@ class QuestionService(IQuestionService):
         key = self._get_session_key(session_id)
         questions = await self.redis_service.get(key)
         
+        print(f"🔍 [Q] check_duplicate | session={session_id} | key={key} | existing_count={len(questions) if questions else 0}")
+        
         if not questions:
+            print(f"⚠️ [Q] No existing questions in Redis for session={session_id}")
             return False, []
+        
+        # Log existing questions for debugging
+        for i, q in enumerate(questions):
+            print(f"  📋 [Q] Existing[{i}]: '{q.get('text', '')[:50]}...'")
         
         # Get cached embeddings for this session
         cached_embeddings = self._embedding_cache.get(session_id)
@@ -254,6 +261,8 @@ class QuestionService(IQuestionService):
         # Get existing questions
         questions = await self.redis_service.get(key) or []
         
+        print(f"📥 [Q] register_question | session={session_id} | existing={len(questions)} | new='{question_text[:50]}...'")
+        
         # Add new question
         question = {
             'text': question_text,
@@ -265,6 +274,7 @@ class QuestionService(IQuestionService):
         
         # Save back to Redis
         save_result = await self.redis_service.set(key, questions, ttl=self.session_ttl)
+        print(f"💾 [Q] Saved to Redis | key={key} | total={len(questions)} | success={save_result}")
         
         # Update embedding cache
         try:
@@ -319,8 +329,19 @@ class QuestionService(IQuestionService):
         """
         lock = self._get_session_lock(session_id)
         
+        print(f"🔒 [Q] Acquiring lock for session={session_id} | question='{question_text[:50]}...'")
+        
         async with lock:
+            print(f"🔓 [Q] Lock acquired for session={session_id}")
+            
+            # Get existing questions from Redis FIRST
+            key = self._get_session_key(session_id)
+            existing_before = await self.redis_service.get(key) or []
+            print(f"📊 [Q] Before check: {len(existing_before)} questions in Redis for session={session_id}")
+            
             is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
+            
+            print(f"🔍 [Q] Duplicate check result: is_dup={is_dup}, similar_count={len(similar)}")
             
             registered = False
             question_id = None
@@ -329,6 +350,9 @@ class QuestionService(IQuestionService):
                 reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
                 registered = reg.get("success", False)
                 question_id = reg.get("question_id")
+                print(f"✅ [Q] Registered question #{question_id} | total now: {reg.get('total_questions')}")
+            else:
+                print(f"⚠️ [Q] NOT registering duplicate question | similar: {[s['text'][:30] for s in similar]}")
             
             existing = await self.get_questions(session_id)
             

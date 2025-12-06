@@ -32,10 +32,13 @@ class Config:
     # Azure Speech Service
     AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
     AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "")
-    # Custom Speech endpoint ID (optional - for custom-trained Vietnamese models)
-    # Create via Azure Speech Studio > Custom Speech > Deploy model
-    # Set to endpoint ID like: "12345678-1234-1234-1234-123456789abc"
-    AZURE_SPEECH_CUSTOM_ENDPOINT_ID: str = os.getenv("AZURE_SPEECH_CUSTOM_ENDPOINT_ID", "")
+    # Custom Speech endpoint ID (for custom-trained Vietnamese models)
+    # Deployed from Azure Speech Studio > Custom Speech > Deploy models
+    # Default: AIDefCom Vietnamese model (southeastasia region)
+    AZURE_SPEECH_CUSTOM_ENDPOINT_ID: str = os.getenv(
+        "AZURE_SPEECH_CUSTOM_ENDPOINT_ID", 
+        "8ef9c548-7aee-4224-82a7-d50e3b6db815"
+    )
 
     # Azure Cache for Redis
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
