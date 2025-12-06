@@ -37,7 +37,7 @@ class Config:
     # Default: AIDefCom Vietnamese model (southeastasia region)
     AZURE_SPEECH_CUSTOM_ENDPOINT_ID: str = os.getenv(
         "AZURE_SPEECH_CUSTOM_ENDPOINT_ID", 
-        "8ef9c548-7aee-4224-82a7-d50e3b6db815"
+        ""
     )
 
     # Azure Cache for Redis
