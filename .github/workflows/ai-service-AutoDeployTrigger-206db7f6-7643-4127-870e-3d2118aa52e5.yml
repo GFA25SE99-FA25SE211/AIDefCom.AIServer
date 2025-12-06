@@ -42,8 +42,9 @@ jobs:
           registryPassword: ${{ secrets.AISERVICE_REGISTRY_PASSWORD }}
           containerAppName: ai-service
           resourceGroup: AIDefCom
-          imageToBuild: minhtqse184278@fpt.edu.vn/ai-service:${{ github.sha }}
+          imageToBuild: hitech2605/ai-service:${{ github.sha }}
           _buildArgumentsKey_: |
             _buildArgumentsValues_
+
 
 
