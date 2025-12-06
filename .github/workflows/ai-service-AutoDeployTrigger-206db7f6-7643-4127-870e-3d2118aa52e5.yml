@@ -53,8 +53,8 @@ jobs:
           memory: 2Gi
           
           # Biến môi trường cho ai-service
-          environmentVariables: |
-           AZURE_SPEECH_KEY=${{ secrets.AZURE_SPEECH_KEY }}
+          environmentVariables: |-
+            AZURE_SPEECH_KEY=${{ secrets.AZURE_SPEECH_KEY }}
             AZURE_SPEECH_REGION=${{ secrets.AZURE_SPEECH_REGION }}
             REDIS_HOST=${{ secrets.REDIS_HOST }}
             REDIS_PORT=${{ secrets.REDIS_PORT }}
@@ -70,4 +70,5 @@ jobs:
             AUTH_SERVICE_VERIFY_SSL=${{ secrets.AUTH_SERVICE_VERIFY_SSL }}
             AUTH_SERVICE_TIMEOUT=${{ secrets.AUTH_SERVICE_TIMEOUT }}
             HF_TOKEN=${{ secrets.HF_TOKEN }}
+
 
