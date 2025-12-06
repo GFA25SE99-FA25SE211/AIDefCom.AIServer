@@ -163,6 +163,7 @@ class RecognitionStreamHandler:
         Yields:
             Recognition events
         """
+        print(f"🔵 [STT] handle_stream START | speaker={speaker_label} | filter={apply_noise_filter} | defense_session_id={defense_session_id}")
         logger.info(f"🎙️ Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
         loop = asyncio.get_running_loop()
         
@@ -319,19 +320,31 @@ class RecognitionStreamHandler:
         
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
             """Stream audio chunks from buffer manager."""
+            chunk_count = 0
+            print(f"🔵 [STT] audio_chunk_stream starting...")
             async for chunk in audio_buffer.process_audio_stream(
                 audio_queue,
                 on_interruption_detected=on_interruption_detected,
                 on_sufficient_audio=on_sufficient_audio,
             ):
+                chunk_count += 1
+                if chunk_count == 1:
+                    print(f"🔵 [STT] First audio chunk yielded! size={len(chunk)} bytes")
+                elif chunk_count % 50 == 0:
+                    print(f"🔵 [STT] Audio chunks yielded: {chunk_count}")
                 yield chunk
+            print(f"🔵 [STT] audio_chunk_stream ended | total_chunks={chunk_count}")
         
         async def process_azure_events(azure_events: AsyncGenerator) -> None:
             """Process Azure recognition events."""
             result_count = 0
+            print(f"🔵 [STT] process_azure_events starting...")
             try:
                 async for event in azure_events:
                     event_type = event.get("type")
+                    if result_count == 0:
+                        print(f"🔵 [STT] First Azure event received! type={event_type}")
+                    result_count += 1
                     
                     # Get current speaker info
                     if speaker_id_manager:
