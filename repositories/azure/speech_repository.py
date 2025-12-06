@@ -157,7 +157,26 @@ class AzureSpeechRepository(ISpeechRepository):
             tuple(default_phrase_hints) if default_phrase_hints else _get_default_phrase_hints()
         )
         
-        self.speech_config = speechsdk.SpeechConfig(subscription=subscription_key, region=region)
+        # Check for Custom Speech endpoint FIRST
+        custom_endpoint_id = None
+        try:
+            from app.config import Config
+            custom_endpoint_id = getattr(Config, 'AZURE_SPEECH_CUSTOM_ENDPOINT_ID', '') or ''
+            custom_endpoint_id = custom_endpoint_id.strip() if custom_endpoint_id else ''
+        except Exception:
+            custom_endpoint_id = ''
+        
+        # Create SpeechConfig - use Custom Speech endpoint if available
+        if custom_endpoint_id:
+            # For Custom Speech, we need to set endpoint_id property
+            # The endpoint URL format: wss://{region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?cid={endpoint_id}
+            self.speech_config = speechsdk.SpeechConfig(subscription=subscription_key, region=region)
+            self.speech_config.endpoint_id = custom_endpoint_id
+            logger.info(f"✓ Using Custom Speech model: {custom_endpoint_id}")
+        else:
+            self.speech_config = speechsdk.SpeechConfig(subscription=subscription_key, region=region)
+            logger.info("Using default Azure Speech model")
+        
         self.speech_config.speech_recognition_language = language
         self.speech_config.output_format = speechsdk.OutputFormat.Detailed
         
@@ -215,20 +234,10 @@ class AzureSpeechRepository(ISpeechRepository):
             str(_stable_threshold)
         )
         
-        # Custom Speech endpoint (for custom-trained Vietnamese models)
-        # If you have trained a Custom Speech model for Vietnamese, set endpoint ID in config
-        try:
-            from app.config import Config
-            custom_endpoint_id = getattr(Config, 'AZURE_SPEECH_CUSTOM_ENDPOINT_ID', None)
-            if custom_endpoint_id:
-                self.speech_config.endpoint_id = custom_endpoint_id
-                logger.info(f"Using Custom Speech endpoint: {custom_endpoint_id}")
-        except Exception:
-            pass
-        
+        endpoint_info = f"custom={custom_endpoint_id[:8]}..." if custom_endpoint_id else "default"
         logger.info(
             f"Azure Speech Repository initialized | language={language} | region={region} | "
-            f"sr={sample_rate}Hz | hints={len(self.default_phrase_hints)}"
+            f"sr={sample_rate}Hz | hints={len(self.default_phrase_hints)} | endpoint={endpoint_info}"
         )
     
     async def recognize_continuous_async(
