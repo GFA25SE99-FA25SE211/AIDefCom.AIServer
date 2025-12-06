@@ -397,6 +397,8 @@ class AzureSpeechRepository(ISpeechRepository):
         extra_phrases: Iterable[str] | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream speech recognition from an async audio source."""
+        print(f"🔵 [AZURE] recognize_stream START | region={self.region} | language={self.language}")
+        print(f"🔵 [AZURE] speech_key exists: {bool(self.speech_key)} | Custom endpoint: {getattr(self.speech_config, 'endpoint_id', 'None')}")
         fmt = speechsdk.audio.AudioStreamFormat(
             samples_per_second=self.sample_rate,
             bits_per_sample=16,
@@ -461,26 +463,35 @@ class AzureSpeechRepository(ISpeechRepository):
             
             return fallback_text
         
+        recognition_count = {"partial": 0, "result": 0}
+        
         def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             text = _extract_best_text(evt.result)
             if text:
+                recognition_count["partial"] += 1
+                if recognition_count["partial"] == 1:
+                    print(f"🟢 [AZURE] First partial! text='{text[:50]}...'")
                 event_queue.put_nowait({"type": "partial", "text": text})
         
         def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
                 text = _extract_best_text(evt.result)
                 if text:
+                    recognition_count["result"] += 1
+                    print(f"🟢 [AZURE] Result #{recognition_count['result']}: '{text}'")
                     event_queue.put_nowait({"type": "result", "text": text})
             elif evt.result.reason == speechsdk.ResultReason.NoMatch:
                 event_queue.put_nowait({"type": "nomatch"})
         
         def on_canceled(evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+            print(f"🔴 [AZURE] on_canceled | reason={evt.reason} | error={evt.error_details if hasattr(evt, 'error_details') else 'N/A'}")
             if evt.reason == speechsdk.CancellationReason.Error:
                 logger.error(f"Azure Speech error: {evt.error_details}")
                 event_queue.put_nowait({"type": "error", "error": evt.error_details})
             event_queue.put_nowait(None)
         
         def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
+            print(f"🔵 [AZURE] on_session_stopped")
             event_queue.put_nowait(None)
         
         recognizer.recognizing.connect(on_recognizing)
@@ -488,6 +499,7 @@ class AzureSpeechRepository(ISpeechRepository):
         recognizer.canceled.connect(on_canceled)
         recognizer.session_stopped.connect(on_session_stopped)
         
+        print(f"🔵 [AZURE] Starting continuous recognition...")
         recognizer.start_continuous_recognition_async()
         
         audio_task = asyncio.create_task(
@@ -512,16 +524,28 @@ class AzureSpeechRepository(ISpeechRepository):
         push_stream: speechsdk.audio.PushAudioInputStream,
     ) -> None:
         """Forward audio chunks into Azure's push stream."""
+        chunk_count = 0
+        total_bytes = 0
+        print(f"🔵 [AZURE] _pump_audio START")
         try:
             async for chunk in audio_source:
                 if not chunk:
                     continue
+                chunk_count += 1
+                total_bytes += len(chunk)
+                if chunk_count == 1:
+                    print(f"🔵 [AZURE] First audio chunk pushed to Azure | size={len(chunk)} bytes")
+                elif chunk_count % 50 == 0:
+                    print(f"🔵 [AZURE] Audio chunks pushed: {chunk_count} | total_bytes={total_bytes}")
                 push_stream.write(chunk)
         except asyncio.CancelledError:
+            print(f"🔵 [AZURE] _pump_audio cancelled | chunks={chunk_count} | bytes={total_bytes}")
             raise
         except Exception as exc:
+            print(f"🔴 [AZURE] _pump_audio error: {exc}")
             logger.warning(f"Audio streaming interrupted: {exc}")
         finally:
+            print(f"🔵 [AZURE] _pump_audio END | total_chunks={chunk_count} | total_bytes={total_bytes}")
             with contextlib.suppress(Exception):
                 push_stream.close()
     

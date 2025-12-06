@@ -31,16 +31,20 @@ class RedisService(IRedisService):
         
         self._initialized = True  # Mark as attempted to avoid retry loops
         
+        print(f"🔌 [REDIS] Config check: HOST={Config.REDIS_HOST}, PORT={Config.REDIS_PORT}, SSL={Config.REDIS_SSL}")
+        print(f"🔌 [REDIS] Password set: {bool(Config.REDIS_PASSWORD)} (len={len(Config.REDIS_PASSWORD) if Config.REDIS_PASSWORD else 0})")
+        
         if not Config.REDIS_PASSWORD:
+            print("⚠️ [REDIS] REDIS_PASSWORD not set! Running without cache.")
             logger.warning("⚠️ REDIS_PASSWORD not set. Running without cache.")
             self.client = None
             return
         
         try:
-            logger.info(f"🔌 Connecting to Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT} (SSL: {Config.REDIS_SSL})")
-            
             # Create client with from_url (rediss:// automatically enables SSL)
             redis_url = f"{'rediss' if Config.REDIS_SSL else 'redis'}://{Config.REDIS_HOST}:{Config.REDIS_PORT}/{Config.REDIS_DB}"
+            print(f"🔌 [REDIS] Connecting to: {redis_url}")
+            logger.info(f"🔌 Connecting to Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT} (SSL: {Config.REDIS_SSL})")
             
             self.client = await aioredis.from_url(
                 redis_url,
@@ -55,15 +59,19 @@ class RedisService(IRedisService):
             
             # Test connection with timeout
             await asyncio.wait_for(self.client.ping(), timeout=15)
+            print(f"✅ [REDIS] Connected successfully to {Config.REDIS_HOST}:{Config.REDIS_PORT}")
             logger.info(f"✅ Connected to Redis at {Config.REDIS_HOST}:{Config.REDIS_PORT}")
             
         except asyncio.TimeoutError:
+            print(f"❌ [REDIS] Connection TIMEOUT to {Config.REDIS_HOST}:{Config.REDIS_PORT}")
             logger.warning(f"⚠️ Redis connection timeout. Running without cache.")
             self.client = None
         except aioredis.AuthenticationError as e:
+            print(f"❌ [REDIS] Authentication FAILED: {e}")
             logger.warning(f"⚠️ Redis authentication failed: {e}. Check REDIS_PASSWORD. Running without cache.")
             self.client = None
         except Exception as e:
+            print(f"❌ [REDIS] Connection FAILED: {type(e).__name__}: {e}")
             logger.warning(f"⚠️ Redis connection failed: {e}. Running without cache.")
             self.client = None
     
