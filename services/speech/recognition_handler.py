@@ -47,10 +47,11 @@ def _get_recognition_config():
             "identify_window_seconds": Config.SPEAKER_IDENTIFY_WINDOW_SECONDS,
         }
     except Exception:
+        # Updated fallbacks matching new config.py
         return {
-            "history_seconds": 5.0,
-            "identify_min_seconds": 2.0,
-            "identify_window_seconds": 3.0,
+            "history_seconds": 6.0,
+            "identify_min_seconds": 3.0,
+            "identify_window_seconds": 4.0,
         }
 
 

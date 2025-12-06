@@ -35,17 +35,18 @@ def _get_identification_config():
             "speaker_lock_decay_seconds": Config.VOICE_SPEAKER_LOCK_DECAY_SECONDS,
         }
     except Exception:
+        # UPDATED fallback values matching new config.py defaults
         return {
-            "identify_window_seconds": 3.0,
-            "identify_interval_seconds": 0.3,
+            "identify_window_seconds": 4.0,
+            "identify_interval_seconds": 0.5,
             "redis_timeout_seconds": 0.5,
             "fallback_cosine_threshold": 0.30,
             "fallback_margin_threshold": 0.06,
             "weak_cosine_threshold": 0.22,
-            "cosine_threshold": 0.45,
-            "speaker_switch_margin": 0.06,
-            "speaker_switch_hits_required": 3,
-            "speaker_lock_decay_seconds": 5.0,
+            "cosine_threshold": 0.50,  # Higher threshold for accuracy
+            "speaker_switch_margin": 0.10,  # Require more difference to switch
+            "speaker_switch_hits_required": 4,  # More confirmations needed
+            "speaker_lock_decay_seconds": 8.0,  # Keep speaker longer
         }
 
 
@@ -54,20 +55,20 @@ class SpeakerIdentificationConfig:
     """Configuration for speaker identification."""
     
     sample_rate: int = 16000
-    identify_window_seconds: float = 3.0
-    identify_interval_seconds: float = 0.3
+    identify_window_seconds: float = 4.0
+    identify_interval_seconds: float = 0.5
     redis_timeout_seconds: float = 0.5
     
-    # Thresholds
+    # Thresholds (updated for better accuracy)
     fallback_cosine_threshold: float = 0.30
     fallback_margin_threshold: float = 0.06
     weak_cosine_threshold: float = 0.22
-    cosine_threshold: float = 0.45
+    cosine_threshold: float = 0.50  # Higher for accuracy
     
-    # Speaker switching
-    speaker_switch_margin: float = 0.06
-    speaker_switch_hits_required: int = 3
-    speaker_lock_decay_seconds: float = 5.0
+    # Speaker switching (more conservative)
+    speaker_switch_margin: float = 0.10  # Require more difference
+    speaker_switch_hits_required: int = 4  # More confirmations
+    speaker_lock_decay_seconds: float = 8.0  # Hold speaker longer
     
     # Reinforcement
     reinforcement_margin: float = 0.05
@@ -316,6 +317,10 @@ class SpeakerIdentificationManager:
         """Run voice identification in thread pool.
         
         Uses shared voice executor from core.executors to avoid blocking event loop.
+        
+        NOTE: pre_filtered=False because AudioBufferManager no longer applies
+        noise filtering (to preserve audio quality for Azure Speech).
+        VoiceService will apply its own noise filter for embedding extraction.
         """
         try:
             if self.preloaded_profiles is not None:
@@ -324,7 +329,7 @@ class SpeakerIdentificationManager:
                     self.voice_service.identify_speaker_with_cache,
                     wav_bytes,
                     preloaded_profiles=self.preloaded_profiles,
-                    pre_filtered=True,
+                    pre_filtered=False,  # Let VoiceService filter for embedding extraction
                 )
             else:
                 # Slow path: load profiles on-demand
@@ -332,7 +337,7 @@ class SpeakerIdentificationManager:
                     self.voice_service.identify_speaker,
                     wav_bytes,
                     whitelist_user_ids=self.whitelist_user_ids,
-                    pre_filtered=True,
+                    pre_filtered=False,  # Let VoiceService filter for embedding extraction
                 )
             
             return result

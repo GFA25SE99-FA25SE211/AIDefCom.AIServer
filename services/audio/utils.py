@@ -10,9 +10,14 @@ import numpy as np
 
 
 class NoiseFilter:
-    """Simple RMS-based noise gate with soft threshold and gentle gain.
+    """Minimal noise filter optimized for Azure Speech quality.
     
-    Optimized for low-latency streaming - processes frames quickly.
+    CRITICAL: Azure Speech đã có noise suppression tốt, nên filter này
+    chỉ làm nhẹ nhàng để tránh làm hỏng audio đầu vào.
+    
+    - KHÔNG apply gain normalization (làm hỏng dynamic range)
+    - Chỉ attenuate VERY low energy frames (< 50 RMS)
+    - Giữ nguyên speech quality cho Azure Speech xử lý
     """
 
     def __init__(self, sample_rate: int = 16000, voice_threshold: float = 0.002):
@@ -27,18 +32,22 @@ class NoiseFilter:
         self.voice_threshold = voice_threshold
         # Pre-calculated constants for faster processing
         self._frame_size = max(1, int(0.02 * sample_rate))  # 20ms frames
-        self._threshold_scale = voice_threshold * 32768.0
-        self._atten = 0.3  # soft attenuation
+        # VERY low threshold - chỉ filter tiếng ồn rất nhỏ
+        self._threshold_scale = 50.0  # Fixed low threshold in int16 scale
+        self._atten = 0.5  # Gentler attenuation (was 0.3)
 
     def reduce_noise(self, audio_data: bytes) -> bytes:
         """
-        Apply lightweight noise reduction optimized for streaming.
+        Apply MINIMAL noise reduction - let Azure Speech handle the rest.
+        
+        Azure Speech đã có noise suppression tốt, nên chỉ filter
+        những frame THỰC SỰ là noise (energy rất thấp).
 
         Args:
             audio_data: Raw PCM audio bytes (int16)
 
         Returns:
-            Filtered audio bytes (int16)
+            Lightly filtered audio bytes (int16)
         """
         # Fast path for empty data
         if not audio_data or len(audio_data) < 4:
@@ -49,12 +58,11 @@ class NoiseFilter:
         if samples.size == 0:
             return audio_data
 
-        # Simplified noise gate - use vectorized operations
+        # For short audio, return as-is (don't damage it)
         frame_size = self._frame_size
         num_frames = samples.size // frame_size
         
         if num_frames == 0:
-            # Too short, just return with minimal processing
             return audio_data
         
         # Reshape for vectorized RMS calculation
@@ -64,23 +72,19 @@ class NoiseFilter:
         # Vectorized RMS calculation (much faster than loop)
         rms_per_frame = np.sqrt(np.mean(frames * frames, axis=1) + 1e-10)
         
-        # Fast threshold: use median instead of percentile (faster)
-        baseline = float(np.median(rms_per_frame))
-        threshold = max(100.0, baseline * 1.2, self._threshold_scale)
+        # VERY conservative threshold - only filter obvious noise
+        # Use fixed low threshold, NOT adaptive (to preserve speech)
+        threshold = self._threshold_scale  # Fixed 50.0
         
-        # Apply soft gating using boolean mask (vectorized)
+        # Only attenuate frames with VERY low energy (obvious silence/noise)
         low_energy_mask = rms_per_frame < threshold
         frames[low_energy_mask] *= self._atten
         
         # Rebuild samples
         samples[:truncated_size] = frames.flatten()
         
-        # Fast gain normalization using max (faster than percentile)
-        peak = float(np.max(np.abs(samples)))
-        if peak > 100:  # Only normalize if there's meaningful signal
-            gain = min(2.0, 28000.0 / peak)  # Slightly lower target for speed
-            if gain > 1.1:  # Only apply if meaningful gain
-                samples = samples * gain
+        # NO gain normalization - let Azure Speech handle dynamic range
+        # This was causing audio distortion and STT errors!
         
         return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
