@@ -32,10 +32,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
 FROM python:3.11-slim
 
 # Install runtime dependencies only
+# Azure Speech SDK requires: libssl, libasound2, ca-certificates
 RUN apt-get update && apt-get install -y --no-install-recommends \
     portaudio19-dev \
     libgomp1 \
     curl \
+    ca-certificates \
+    libasound2 \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
