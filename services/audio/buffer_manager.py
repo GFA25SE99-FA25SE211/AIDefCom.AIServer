@@ -58,8 +58,11 @@ class AudioBufferManager:
     Responsibilities:
     - Buffer incoming audio chunks into fixed-size frames
     - Maintain rolling audio history for speaker identification
-    - Apply noise filtering
     - Detect speaker interruptions (energy spikes, acoustic changes)
+    
+    IMPORTANT: Audio is yielded WITHOUT noise filtering to Azure Speech.
+    Azure Speech SDK has superior built-in noise suppression.
+    History buffer stores raw audio for speaker identification.
     
     This class is extracted from SpeechService to follow Single Responsibility Principle.
     """
@@ -72,7 +75,10 @@ class AudioBufferManager:
             config: Buffer configuration (uses defaults if not provided)
         """
         self.config = config or AudioBufferConfig()
-        self.noise_filter = NoiseFilter() if self.config.apply_noise_filter else None
+        # NOTE: Noise filter is NO LONGER used for Azure Speech streaming.
+        # Azure Speech SDK has built-in noise suppression that works better
+        # when receiving unmodified audio.
+        self.noise_filter = None  # Disabled for STT quality
         
         # Internal state
         self._frame_buffer = bytearray()

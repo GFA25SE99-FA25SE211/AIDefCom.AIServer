@@ -32,6 +32,10 @@ class Config:
     # Azure Speech Service
     AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
     AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "")
+    # Custom Speech endpoint ID (optional - for custom-trained Vietnamese models)
+    # Create via Azure Speech Studio > Custom Speech > Deploy model
+    # Set to endpoint ID like: "12345678-1234-1234-1234-123456789abc"
+    AZURE_SPEECH_CUSTOM_ENDPOINT_ID: str = os.getenv("AZURE_SPEECH_CUSTOM_ENDPOINT_ID", "")
 
     # Azure Cache for Redis
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
@@ -68,17 +72,25 @@ class Config:
     MAX_ENROLLMENT_COUNT: int = 3  # Maximum enrollment samples per user
     
     # Voice Authentication Thresholds (tunable via env vars)
-    VOICE_COSINE_THRESHOLD: float = float(os.getenv("VOICE_COSINE_THRESHOLD", "0.45"))
-    VOICE_SPEAKER_LOCK_DECAY_SECONDS: float = float(os.getenv("VOICE_SPEAKER_LOCK_DECAY_SECONDS", "5.0"))
-    VOICE_SPEAKER_SWITCH_MARGIN: float = float(os.getenv("VOICE_SPEAKER_SWITCH_MARGIN", "0.06"))
-    VOICE_SPEAKER_SWITCH_HITS_REQUIRED: int = int(os.getenv("VOICE_SPEAKER_SWITCH_HITS_REQUIRED", "3"))
+    # Cosine threshold 0.50: cao hơn để tránh false positive (identify sai người)
+    VOICE_COSINE_THRESHOLD: float = float(os.getenv("VOICE_COSINE_THRESHOLD", "0.50"))
+    # Lock decay 8s: giữ speaker hiện tại lâu hơn, tránh switch lung tung
+    VOICE_SPEAKER_LOCK_DECAY_SECONDS: float = float(os.getenv("VOICE_SPEAKER_LOCK_DECAY_SECONDS", "8.0"))
+    # Switch margin 0.10: phải khác biệt rõ mới switch speaker
+    VOICE_SPEAKER_SWITCH_MARGIN: float = float(os.getenv("VOICE_SPEAKER_SWITCH_MARGIN", "0.10"))
+    # Hits required 4: cần 4 lần confirm mới switch (giảm false switch)
+    VOICE_SPEAKER_SWITCH_HITS_REQUIRED: int = int(os.getenv("VOICE_SPEAKER_SWITCH_HITS_REQUIRED", "4"))
     
     # Speaker Identification Algorithm Thresholds (tunable via env vars)
     # These control how the system identifies and switches between speakers
-    SPEAKER_IDENTIFY_MIN_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_MIN_SECONDS", "2.0"))
-    SPEAKER_IDENTIFY_WINDOW_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_WINDOW_SECONDS", "3.0"))
-    SPEAKER_HISTORY_SECONDS: float = float(os.getenv("SPEAKER_HISTORY_SECONDS", "5.0"))
-    SPEAKER_IDENTIFY_INTERVAL_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_INTERVAL_SECONDS", "0.3"))
+    # Min 3s audio để identify chính xác hơn (tránh identify sai với audio ngắn)
+    SPEAKER_IDENTIFY_MIN_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_MIN_SECONDS", "3.0"))
+    # Window 4s để có đủ context voice
+    SPEAKER_IDENTIFY_WINDOW_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_WINDOW_SECONDS", "4.0"))
+    # History 6s để smooth switching
+    SPEAKER_HISTORY_SECONDS: float = float(os.getenv("SPEAKER_HISTORY_SECONDS", "6.0"))
+    # Interval 0.5s giữa các lần identify (giảm CPU, tăng stability)
+    SPEAKER_IDENTIFY_INTERVAL_SECONDS: float = float(os.getenv("SPEAKER_IDENTIFY_INTERVAL_SECONDS", "0.5"))
     SPEAKER_REDIS_TIMEOUT_SECONDS: float = float(os.getenv("SPEAKER_REDIS_TIMEOUT_SECONDS", "0.5"))
     
     # Fallback cosine thresholds for speaker identification
@@ -90,11 +102,16 @@ class Config:
     SPEAKER_MAX_CONCURRENT: int = int(os.getenv("SPEAKER_MAX_CONCURRENT", "4"))
     SPEAKER_INACTIVITY_TIMEOUT_SECONDS: float = float(os.getenv("SPEAKER_INACTIVITY_TIMEOUT_SECONDS", "30.0"))
     
-    # Azure Speech recognition timeouts (ms)
-    AZURE_SPEECH_SEGMENTATION_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_SEGMENTATION_SILENCE_MS", "600"))
-    AZURE_SPEECH_INITIAL_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_INITIAL_SILENCE_MS", "5000"))
-    AZURE_SPEECH_END_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_END_SILENCE_MS", "400"))
-    AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD: int = int(os.getenv("AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD", "4"))
+    # Azure Speech recognition timeouts (ms) - TUNED FOR VIETNAMESE
+    # Segmentation: 1200ms cho phép câu tiếng Việt dài, không bị cắt giữa chừng
+    # Vietnamese tends to have longer phrases without pauses
+    AZURE_SPEECH_SEGMENTATION_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_SEGMENTATION_SILENCE_MS", "1200"))
+    # Initial: 8s chờ người nói bắt đầu
+    AZURE_SPEECH_INITIAL_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_INITIAL_SILENCE_MS", "8000"))
+    # End: 800ms để kết thúc câu tự nhiên (tăng cho tiếng Việt)
+    AZURE_SPEECH_END_SILENCE_MS: int = int(os.getenv("AZURE_SPEECH_END_SILENCE_MS", "800"))
+    # Stable threshold: 3 để partial results ổn định hơn
+    AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD: int = int(os.getenv("AZURE_SPEECH_STABLE_PARTIAL_THRESHOLD", "3"))
     
     # Path to phrase hints file (JSON array of strings)
     PHRASE_HINTS_FILE: str = os.getenv("PHRASE_HINTS_FILE", "")

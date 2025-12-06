@@ -161,48 +161,68 @@ class AzureSpeechRepository(ISpeechRepository):
         self.speech_config.speech_recognition_language = language
         self.speech_config.output_format = speechsdk.OutputFormat.Detailed
         
+        # Use CONVERSATION mode for Vietnamese - better for real-time streaming
+        # DICTATION mode can cause delayed results and over-buffering
+        # INTERACTIVE is too aggressive with end-pointing
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
             "CONVERSATION"
         )
         
+        # Enable audio logging for debugging (disable in production)
+        # self.speech_config.set_property(
+        #     speechsdk.PropertyId.Speech_LogFilename, "speech_log.txt"
+        # )
+        
+        # Request detailed JSON with NBest alternatives for better accuracy
+        self.speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceResponse_RequestDetailedResultTrueFalse,
+            "true"
+        )
+        
+        # Segmentation silence: time to wait before ending a phrase
+        # Higher = longer phrases, fewer fragments
+        # For Vietnamese, use 1000-1500ms to avoid cutting mid-sentence
         self.speech_config.set_property(
             speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-            str(_segmentation_silence)
+            str(max(_segmentation_silence, 1000))  # At least 1000ms for Vietnamese
         )
+        
+        # Initial silence: how long to wait for speech to start
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
             str(_initial_silence)
         )
+        
+        # End silence: time after speech ends to finalize result
+        # For Vietnamese, use 600-800ms to allow natural pauses
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-            str(_end_silence)
+            str(max(_end_silence, 600))  # At least 600ms
         )
         
-        try:
-            self.speech_config.set_property(
-                speechsdk.PropertyId.SpeechServiceResponse_PostProcessingOption,
-                "TrueText",
-            )
-        except AttributeError:
-            self.speech_config.set_property_by_name(
-                "SpeechServiceResponse_PostProcessingOption", "TrueText"
-            )
-        
-        self.speech_config.set_profanity(speechsdk.ProfanityOption.Masked)
-        
+        # For Vietnamese: Don't use TrueText (English-optimized)
+        # Request word-level timestamps for confidence analysis
         try:
             self.speech_config.request_word_level_timestamps()
         except Exception:
             pass
+        
+        self.speech_config.set_profanity(speechsdk.ProfanityOption.Raw)  # Don't mask - academic context
         
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold,
             str(_stable_threshold)
         )
         
+        # Custom Speech endpoint (for custom-trained Vietnamese models)
+        # If you have trained a Custom Speech model for Vietnamese, set endpoint ID in config
         try:
-            self.speech_config.enable_dictation()
+            from app.config import Config
+            custom_endpoint_id = getattr(Config, 'AZURE_SPEECH_CUSTOM_ENDPOINT_ID', None)
+            if custom_endpoint_id:
+                self.speech_config.endpoint_id = custom_endpoint_id
+                logger.info(f"Using Custom Speech endpoint: {custom_endpoint_id}")
         except Exception:
             pass
         
@@ -265,14 +285,73 @@ class AzureSpeechRepository(ISpeechRepository):
 
         event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
 
+        def _extract_best_text(result: speechsdk.SpeechRecognitionResult) -> str:
+            """Extract best text from recognition result.
+            
+            With Detailed output format, analyze NBest alternatives and pick
+            the one with highest confidence. This helps Vietnamese recognition
+            by choosing the most likely transcription.
+            """
+            import json
+            
+            fallback_text = result.text.strip() if result.text else ""
+            
+            try:
+                props_json = result.properties.get(
+                    speechsdk.PropertyId.SpeechServiceResponse_JsonResult, ""
+                )
+                if not props_json:
+                    return fallback_text
+                    
+                data = json.loads(props_json)
+                
+                # Check NBest alternatives for highest confidence
+                nbest = data.get("NBest", [])
+                if nbest:
+                    # Sort by confidence descending
+                    sorted_alternatives = sorted(
+                        nbest, 
+                        key=lambda x: x.get("Confidence", 0), 
+                        reverse=True
+                    )
+                    
+                    best_alt = sorted_alternatives[0]
+                    best_confidence = best_alt.get("Confidence", 0)
+                    
+                    # For Vietnamese: prefer Display text (with ITN applied)
+                    # over Lexical (raw form) or regular text
+                    best_text = (
+                        best_alt.get("Display", "") or 
+                        best_alt.get("Lexical", "") or
+                        best_alt.get("ITN", "")
+                    ).strip()
+                    
+                    if best_text and best_confidence > 0.5:
+                        # Log low confidence for debugging
+                        if best_confidence < 0.7:
+                            logger.debug(
+                                f"Low confidence ({best_confidence:.2f}): '{best_text[:50]}...'"
+                            )
+                        return best_text
+                
+                # Fallback to DisplayText from main result
+                display_text = data.get("DisplayText", "").strip()
+                if display_text:
+                    return display_text
+                    
+            except Exception as e:
+                logger.debug(f"JSON parse error: {e}")
+            
+            return fallback_text
+
         def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
-            text = evt.result.text.strip()
+            text = _extract_best_text(evt.result)
             if text:
                 event_queue.put_nowait({"type": "partial", "text": text})
 
         def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                text = evt.result.text.strip()
+                text = _extract_best_text(evt.result)
                 if text:
                     event_queue.put_nowait({"type": "result", "text": text})
             elif evt.result.reason == speechsdk.ResultReason.NoMatch:
@@ -333,14 +412,54 @@ class AzureSpeechRepository(ISpeechRepository):
         
         event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
         
+        def _extract_best_text(result: speechsdk.SpeechRecognitionResult) -> str:
+            """Extract best text from recognition result with NBest analysis."""
+            import json
+            
+            fallback_text = result.text.strip() if result.text else ""
+            
+            try:
+                props_json = result.properties.get(
+                    speechsdk.PropertyId.SpeechServiceResponse_JsonResult, ""
+                )
+                if not props_json:
+                    return fallback_text
+                    
+                data = json.loads(props_json)
+                
+                # Check NBest alternatives for highest confidence
+                nbest = data.get("NBest", [])
+                if nbest:
+                    sorted_alternatives = sorted(
+                        nbest, 
+                        key=lambda x: x.get("Confidence", 0), 
+                        reverse=True
+                    )
+                    best_alt = sorted_alternatives[0]
+                    best_text = (
+                        best_alt.get("Display", "") or 
+                        best_alt.get("Lexical", "")
+                    ).strip()
+                    if best_text:
+                        return best_text
+                
+                display_text = data.get("DisplayText", "").strip()
+                if display_text:
+                    return display_text
+                    
+            except Exception:
+                pass
+            
+            return fallback_text
+        
         def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
-            text = evt.result.text.strip()
+            text = _extract_best_text(evt.result)
             if text:
                 event_queue.put_nowait({"type": "partial", "text": text})
         
         def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                text = evt.result.text.strip()
+                text = _extract_best_text(evt.result)
                 if text:
                     event_queue.put_nowait({"type": "result", "text": text})
             elif evt.result.reason == speechsdk.ResultReason.NoMatch:

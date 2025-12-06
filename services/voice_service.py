@@ -93,13 +93,22 @@ class VoiceService(IVoiceService):
         self.embedding_dim = model_repo.get_embedding_dim()
         self.model_tag = model_repo.get_model_tag()
         
-        # Thresholds for WeSpeaker model (256-dim embeddings)
+        # Thresholds - read from Config for tuning flexibility
+        try:
+            from app.config import Config as _AppConfig
+            self.cosine_threshold = float(getattr(_AppConfig, "VOICE_COSINE_THRESHOLD", 0.50))
+            self.speaker_lock_decay = float(getattr(_AppConfig, "VOICE_SPEAKER_LOCK_DECAY_SECONDS", 8.0))
+            self.speaker_switch_margin = float(getattr(_AppConfig, "VOICE_SPEAKER_SWITCH_MARGIN", 0.10))
+            self.speaker_switch_hits_required = int(getattr(_AppConfig, "VOICE_SPEAKER_SWITCH_HITS_REQUIRED", 4))
+        except Exception:
+            self.cosine_threshold = 0.50  # Default for production
+            self.speaker_lock_decay = 8.0
+            self.speaker_switch_margin = 0.10
+            self.speaker_switch_hits_required = 4
+        
+        # Other thresholds (keep hardcoded as they're model-specific)
         self.enrollment_threshold = 0.76
-        self.cosine_threshold = 0.45  # WeSpeaker typically has higher similarity scores
         self.verification_threshold = 0.55
-        # Margin threshold for speaker switching
-        self.speaker_switch_margin = 0.05
-        self.speaker_switch_hits_required = 2
         self.angle_cap = float(np.deg2rad(75))
         self.z_threshold = 1.8
         self.enroll_min_similarity = 0.65
