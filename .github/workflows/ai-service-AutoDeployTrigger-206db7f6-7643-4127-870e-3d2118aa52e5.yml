@@ -1,28 +1,27 @@
 name: Trigger auto deployment for ai-service
 
-# When this action will be executed
 on:
-  # Automatically trigger it when detected changes in repo
+  # Tự chạy khi push lên nhánh main
   push:
-    branches: 
-      [ main ]
+    branches:
+      - main
     paths:
-    - '**'
-    - '.github/workflows/ai-service-AutoDeployTrigger-206db7f6-7643-4127-870e-3d2118aa52e5.yml'
+      - '**'
+      - '.github/workflows/ai-service-AutoDeployTrigger-206db7f6-7643-4127-870e-3d2118aa52e5.yml'
 
-  # Allow manual trigger 
-  workflow_dispatch:      
+  # Cho phép chạy tay trong tab Actions
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    permissions: 
-      id-token: write #This is required for requesting the OIDC JWT Token
-      contents: read #Required when GH token is used to authenticate with private repo
+    permissions:
+      id-token: write          # cần cho OIDC login Azure
+      contents: read           # cần để checkout code
 
     steps:
       - name: Checkout to the branch
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Azure Login
         uses: azure/login@v2
@@ -31,20 +30,52 @@ jobs:
           tenant-id: ${{ secrets.AISERVICE_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AISERVICE_AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push container image to registry
+      - name: Build, push image and deploy to Azure Container Apps
         uses: azure/container-apps-deploy-action@v2
         with:
+          # Source code
           appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
+
+          # Docker registry: Docker Hub
           registryUrl: docker.io
           registryUsername: ${{ secrets.AISERVICE_REGISTRY_USERNAME }}
           registryPassword: ${{ secrets.AISERVICE_REGISTRY_PASSWORD }}
+
+          # Azure Container App info
           containerAppName: ai-service
           resourceGroup: AIDefCom
+
+          # Image name + tag theo commit
           imageToBuild: hitech2605/ai-service:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
 
+          # Cấu hình resource cho container
+          cpu: 1.0
+          memory: 2Gi
 
+          # Nếu lần đầu deploy cần port, có thể thêm:
+          # targetPort: 8000
+          # ingress: external
 
+          # Biến môi trường cho ai-service
+          environmentVariables: |
+            AZURE_SPEECH_KEY=${{ secrets.AZURE_SPEECH_KEY }}
+            AZURE_SPEECH_REGION=${{ secrets.AZURE_SPEECH_REGION }}
+
+            REDIS_HOST=${{ secrets.REDIS_HOST }}
+            REDIS_PORT=${{ secrets.REDIS_PORT }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            REDIS_SSL=${{ secrets.REDIS_SSL }}
+            REDIS_DB=${{ secrets.REDIS_DB }}
+            REDIS_TTL_SECONDS=${{ secrets.REDIS_TTL_SECONDS }}
+
+            AZURE_STORAGE_CONNECTION_STRING=${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+            AZURE_BLOB_CONTAINER_NAME=${{ secrets.AZURE_BLOB_CONTAINER_NAME }}
+            VOICE_PROFILE_STORAGE_MODE=${{ secrets.VOICE_PROFILE_STORAGE_MODE }}
+
+            SQL_SERVER_CONNECTION_STRING=${{ secrets.SQL_SERVER_CONNECTION_STRING }}
+
+            AUTH_SERVICE_BASE_URL=${{ secrets.AUTH_SERVICE_BASE_URL }}
+            AUTH_SERVICE_VERIFY_SSL=${{ secrets.AUTH_SERVICE_VERIFY_SSL }}
+            AUTH_SERVICE_TIMEOUT=${{ secrets.AUTH_SERVICE_TIMEOUT }}
+
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
