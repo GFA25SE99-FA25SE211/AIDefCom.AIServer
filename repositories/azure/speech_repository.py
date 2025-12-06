@@ -491,15 +491,29 @@ class AzureSpeechRepository(ISpeechRepository):
             event_queue.put_nowait(None)
         
         def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
-            print(f"🔵 [AZURE] on_session_stopped")
+            print(f"🔵 [AZURE] on_session_stopped | session_id={evt.session_id}")
             event_queue.put_nowait(None)
+        
+        def on_session_started(evt: speechsdk.SessionEventArgs) -> None:
+            print(f"🟢 [AZURE] on_session_started | session_id={evt.session_id}")
+        
+        def on_speech_start(evt: speechsdk.SessionEventArgs) -> None:
+            print(f"🟢 [AZURE] on_speech_start_detected")
+        
+        def on_speech_end(evt: speechsdk.SessionEventArgs) -> None:
+            print(f"🔵 [AZURE] on_speech_end_detected")
         
         recognizer.recognizing.connect(on_recognizing)
         recognizer.recognized.connect(on_recognized)
         recognizer.canceled.connect(on_canceled)
         recognizer.session_stopped.connect(on_session_stopped)
+        recognizer.session_started.connect(on_session_started)
+        recognizer.speech_start_detected.connect(on_speech_start)
+        recognizer.speech_end_detected.connect(on_speech_end)
         
-        print(f"🔵 [AZURE] Starting continuous recognition...")
+        # Log Custom Speech endpoint status
+        endpoint_id = getattr(self.speech_config, 'endpoint_id', None)
+        print(f"🔵 [AZURE] Starting continuous recognition... (endpoint_id={endpoint_id})")
         recognizer.start_continuous_recognition_async()
         
         audio_task = asyncio.create_task(
