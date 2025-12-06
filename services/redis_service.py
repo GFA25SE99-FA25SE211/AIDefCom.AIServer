@@ -73,15 +73,19 @@ class RedisService(IRedisService):
             await self._ensure_connection()
         
         if not self.client:
+            print(f"⚠️ [REDIS] GET '{key}' - NO CLIENT (Redis not connected!)")
             return None
         
         try:
             value = await self.client.get(key)
             if value:
-                return json.loads(value)
+                result = json.loads(value)
+                print(f"✅ [REDIS] GET '{key}' - Found {len(result) if isinstance(result, list) else 'value'}")
+                return result
+            print(f"📭 [REDIS] GET '{key}' - Key not found (empty)")
             return None
         except Exception as e:
-            logger.debug(f"Redis get error for '{key}': {e}")
+            print(f"❌ [REDIS] GET '{key}' - Error: {e}")
             return None
     
     async def set(
@@ -95,6 +99,7 @@ class RedisService(IRedisService):
             await self._ensure_connection()
         
         if not self.client:
+            print(f"⚠️ [REDIS] SET '{key}' - NO CLIENT (Redis not connected!)")
             return False
         
         try:
@@ -106,9 +111,11 @@ class RedisService(IRedisService):
             else:
                 await self.client.set(key, serialized)
             
+            item_count = len(value) if isinstance(value, list) else 1
+            print(f"✅ [REDIS] SET '{key}' - Saved {item_count} items, TTL={ttl_seconds}s")
             return True
         except Exception as e:
-            logger.debug(f"Redis set error for '{key}': {e}")
+            print(f"❌ [REDIS] SET '{key}' - Error: {e}")
             return False
     
     async def delete(self, *keys: str) -> bool:
