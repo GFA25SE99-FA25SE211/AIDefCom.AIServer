@@ -180,18 +180,25 @@ class AzureSpeechRepository(ISpeechRepository):
         self.speech_config.speech_recognition_language = language
         self.speech_config.output_format = speechsdk.OutputFormat.Detailed
         
-        # Use CONVERSATION mode for Vietnamese - better for real-time streaming
-        # DICTATION mode can cause delayed results and over-buffering
-        # INTERACTIVE is too aggressive with end-pointing
+        # Use DICTATION mode for Vietnamese - provides automatic punctuation!
+        # DICTATION is best for longer, natural speech with proper sentence structure
+        # CONVERSATION mode doesn't add punctuation automatically
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
-            "CONVERSATION"
+            "DICTATION"
         )
         
-        # Enable audio logging for debugging (disable in production)
-        # self.speech_config.set_property(
-        #     speechsdk.PropertyId.Speech_LogFilename, "speech_log.txt"
-        # )
+        # === ACCURACY OPTIMIZATION FOR VIETNAMESE ===
+        
+        # Enable automatic punctuation and capitalization (TrueText)
+        # Note: TrueText works best with English, but still helps Vietnamese
+        try:
+            self.speech_config.set_property(
+                speechsdk.PropertyId.SpeechServiceResponse_PostProcessingOption,
+                "TrueText"
+            )
+        except Exception:
+            pass  # Some SDK versions may not support this
         
         # Request detailed JSON with NBest alternatives for better accuracy
         self.speech_config.set_property(
@@ -199,12 +206,31 @@ class AzureSpeechRepository(ISpeechRepository):
             "true"
         )
         
+        # Enable disfluency removal (remove "uh", "um", stuttering)
+        # Use set_property_by_name for custom string properties
+        try:
+            self.speech_config.set_property_by_name(
+                "SpeechServiceResponse_DisfluencyRemovalEnabled",
+                "true"
+            )
+        except Exception:
+            pass
+        
+        # Request sentence-level punctuation
+        try:
+            self.speech_config.set_property_by_name(
+                "SpeechServiceResponse_PunctuationMode",
+                "DictatedAndAutomatic"
+            )
+        except Exception:
+            pass
+        
         # Segmentation silence: time to wait before ending a phrase
-        # Higher = longer phrases, fewer fragments
-        # For Vietnamese, use 1000-1500ms to avoid cutting mid-sentence
+        # Higher = longer phrases, fewer fragments, better accuracy
+        # For Vietnamese: 1500-2000ms is optimal (natural pauses are longer)
         self.speech_config.set_property(
             speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-            str(max(_segmentation_silence, 1000))  # At least 1000ms for Vietnamese
+            str(max(_segmentation_silence, 1500))  # At least 1500ms for Vietnamese
         )
         
         # Initial silence: how long to wait for speech to start
@@ -214,10 +240,10 @@ class AzureSpeechRepository(ISpeechRepository):
         )
         
         # End silence: time after speech ends to finalize result
-        # For Vietnamese, use 600-800ms to allow natural pauses
+        # For Vietnamese, use 800-1000ms to allow natural pauses and trailing particles
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-            str(max(_end_silence, 600))  # At least 600ms
+            str(max(_end_silence, 800))  # At least 800ms for Vietnamese
         )
         
         # For Vietnamese: Don't use TrueText (English-optimized)
@@ -398,7 +424,10 @@ class AzureSpeechRepository(ISpeechRepository):
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream speech recognition from an async audio source."""
         print(f"🔵 [AZURE] recognize_stream START | region={self.region} | language={self.language}")
-        print(f"🔵 [AZURE] speech_key exists: {bool(self.speech_key)} | Custom endpoint: {getattr(self.speech_config, 'endpoint_id', 'None')}")
+        print(f"🔵 [AZURE] speech_key exists: {bool(self.speech_key)} | key_len={len(self.speech_key) if self.speech_key else 0}")
+        print(f"🔵 [AZURE] Custom endpoint: {getattr(self.speech_config, 'endpoint_id', 'None')}")
+        print(f"🔵 [AZURE] Sample rate: {self.sample_rate}Hz | Audio format: 16-bit mono PCM")
+        
         fmt = speechsdk.audio.AudioStreamFormat(
             samples_per_second=self.sample_rate,
             bits_per_sample=16,
@@ -416,6 +445,7 @@ class AzureSpeechRepository(ISpeechRepository):
         if extra_phrases:
             all_hints.extend(extra_phrases)
         
+        print(f"🔵 [AZURE] Phrase hints loaded: {len(all_hints)} phrases")
         if all_hints:
             phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
             for phrase in all_hints:
@@ -494,6 +524,11 @@ class AzureSpeechRepository(ISpeechRepository):
             print(f"🔵 [AZURE] on_session_stopped")
             event_queue.put_nowait(None)
         
+        def on_session_started(evt: speechsdk.SessionEventArgs) -> None:
+            print(f"🟢 [AZURE] on_session_started! session_id={evt.session_id}")
+            logger.info(f"Azure Speech session started: {evt.session_id}")
+        
+        recognizer.session_started.connect(on_session_started)
         recognizer.recognizing.connect(on_recognizing)
         recognizer.recognized.connect(on_recognized)
         recognizer.canceled.connect(on_canceled)
@@ -523,29 +558,64 @@ class AzureSpeechRepository(ISpeechRepository):
         audio_source: AsyncIterable[bytes],
         push_stream: speechsdk.audio.PushAudioInputStream,
     ) -> None:
-        """Forward audio chunks into Azure's push stream."""
+        """Forward audio chunks into Azure's push stream.
+        
+        Aggregates small chunks into larger buffers (100-200ms) before pushing
+        to Azure Speech SDK for better recognition quality.
+        """
         chunk_count = 0
         total_bytes = 0
-        print(f"🔵 [AZURE] _pump_audio START")
+        push_count = 0
+        
+        # Buffer audio to aggregate small chunks into larger ones
+        # Azure Speech works MUCH better with 200ms+ chunks for Vietnamese
+        # Larger chunks = more phonetic context = better recognition
+        MIN_PUSH_SIZE = 6400   # ~200ms at 16kHz, 16-bit mono (OPTIMAL for Vietnamese)
+        MAX_PUSH_SIZE = 12800  # ~400ms - balance between accuracy and latency
+        audio_buffer = bytearray()
+        
+        print(f"🔵 [AZURE] _pump_audio START | MIN_PUSH_SIZE={MIN_PUSH_SIZE} bytes")
         try:
             async for chunk in audio_source:
                 if not chunk:
                     continue
                 chunk_count += 1
                 total_bytes += len(chunk)
+                
+                # Add to buffer
+                audio_buffer.extend(chunk)
+                
                 if chunk_count == 1:
-                    print(f"🔵 [AZURE] First audio chunk pushed to Azure | size={len(chunk)} bytes")
-                elif chunk_count % 50 == 0:
-                    print(f"🔵 [AZURE] Audio chunks pushed: {chunk_count} | total_bytes={total_bytes}")
-                push_stream.write(chunk)
+                    print(f"🔵 [AZURE] First audio chunk received | size={len(chunk)} bytes")
+                
+                # Push to Azure when buffer is large enough
+                while len(audio_buffer) >= MIN_PUSH_SIZE:
+                    # Take up to MAX_PUSH_SIZE bytes
+                    push_size = min(len(audio_buffer), MAX_PUSH_SIZE)
+                    push_data = bytes(audio_buffer[:push_size])
+                    del audio_buffer[:push_size]
+                    
+                    push_stream.write(push_data)
+                    push_count += 1
+                    
+                    if push_count == 1:
+                        print(f"🔵 [AZURE] First buffer pushed to Azure | size={len(push_data)} bytes (~{len(push_data)*1000//3200}ms)")
+                    elif push_count % 25 == 0:
+                        print(f"🔵 [AZURE] Buffers pushed: {push_count} | total_bytes={total_bytes}")
+                    
         except asyncio.CancelledError:
-            print(f"🔵 [AZURE] _pump_audio cancelled | chunks={chunk_count} | bytes={total_bytes}")
+            print(f"🔵 [AZURE] _pump_audio cancelled | chunks={chunk_count} | bytes={total_bytes} | pushes={push_count}")
             raise
         except Exception as exc:
             print(f"🔴 [AZURE] _pump_audio error: {exc}")
             logger.warning(f"Audio streaming interrupted: {exc}")
         finally:
-            print(f"🔵 [AZURE] _pump_audio END | total_chunks={chunk_count} | total_bytes={total_bytes}")
+            # Push remaining buffered audio
+            if audio_buffer:
+                push_stream.write(bytes(audio_buffer))
+                push_count += 1
+                print(f"🔵 [AZURE] Final buffer pushed | size={len(audio_buffer)} bytes")
+            print(f"🔵 [AZURE] _pump_audio END | total_chunks={chunk_count} | total_bytes={total_bytes} | total_pushes={push_count}")
             with contextlib.suppress(Exception):
                 push_stream.close()
     
