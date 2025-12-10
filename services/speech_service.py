@@ -186,6 +186,25 @@ class SpeechService(ISpeechService):
         task = asyncio.create_task(coro)
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
+    
+    @staticmethod
+    def _format_vtt_timestamp(seconds: float) -> str:
+        """Format seconds to VTT timestamp (HH:MM:SS.mmm).
+        
+        Args:
+            seconds: Elapsed time in seconds
+            
+        Returns:
+            VTT-formatted timestamp string
+            
+        Example:
+            123.456 -> "00:02:03.456"
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
     async def recognize_stream_from_queue(
         self,
@@ -662,6 +681,64 @@ class SpeechService(ISpeechService):
                                         },
                                         exclude_ws=ws,
                                     )
+                            elif message_raw.startswith("transcript:edit:"):
+                                # FE chỉnh sửa transcript line
+                                # Format: transcript:edit:{json}
+                                # JSON: {"id": "...", "edited_speaker": "...", "edited_text": "..."}
+                                try:
+                                    edit_json = message_raw[len("transcript:edit:"):]
+                                    edit_data = json.loads(edit_json)
+                                    line_id = edit_data.get("id")
+                                    edited_speaker = edit_data.get("edited_speaker")
+                                    edited_text = edit_data.get("edited_text")
+                                    
+                                    # Find and update the line in transcript_lines
+                                    for line in transcript_lines:
+                                        if line.get("id") == line_id:
+                                            if edited_speaker:
+                                                line["edited_speaker"] = edited_speaker
+                                            if edited_text:
+                                                line["edited_text"] = edited_text
+                                            logger.info(f"📝 Transcript edit | id={line_id} | edited_speaker={edited_speaker} | edited_text={edited_text[:30] if edited_text else None}")
+                                            break
+                                    
+                                    # Update Redis cache
+                                    if self.redis_service:
+                                        await self.redis_service.set(
+                                            transcript_cache_key,
+                                            {
+                                                "defense_session_id": defense_session_id,
+                                                "session_id": session_id,
+                                                "start_time": session_start.isoformat(),
+                                                "lines": transcript_lines,
+                                            },
+                                            ttl=7200,
+                                        )
+                                    
+                                    # Broadcast edit to other clients
+                                    if defense_session_id:
+                                        await room_manager.broadcast_to_room(
+                                            defense_session_id,
+                                            {
+                                                "type": "transcript_edited",
+                                                "id": line_id,
+                                                "edited_speaker": edited_speaker,
+                                                "edited_text": edited_text,
+                                                "source_session_id": session_id,
+                                            },
+                                            exclude_ws=ws,
+                                        )
+                                    
+                                    await ws.send_json({
+                                        "type": "transcript_edit_success",
+                                        "id": line_id,
+                                    })
+                                except Exception as edit_err:
+                                    logger.warning(f"Failed to edit transcript: {edit_err}")
+                                    await ws.send_json({
+                                        "type": "transcript_edit_error",
+                                        "error": str(edit_err),
+                                    })
                         else:
                             # Disconnect event
                             logger.debug("Received disconnect event")
@@ -747,21 +824,39 @@ class SpeechService(ISpeechService):
                         text = event.get("text", "")
                         timestamp = datetime.utcnow().isoformat()
                         
+                        # Calculate VTT-style timestamp (relative to session start)
+                        elapsed = (datetime.utcnow() - session_start).total_seconds()
+                        start_time_vtt = self._format_vtt_timestamp(elapsed)
+                        end_time_vtt = self._format_vtt_timestamp(elapsed + 3.0)  # Assume 3s duration
+                        
+                        # Generate unique ID for this line
+                        import uuid
+                        line_id = f"stt_{int(elapsed * 1000)}_{uuid.uuid4().hex[:8]}"
+                        
                         transcript_lines.append({
+                            "id": line_id,
                             "timestamp": timestamp,
+                            "start_time_vtt": start_time_vtt,
+                            "end_time_vtt": end_time_vtt,
                             "speaker": speaker,
                             "text": text,
                             "user_id": event.get("user_id"),
+                            # FE can populate these when editing:
+                            "edited_speaker": None,
+                            "edited_text": None,
                         })
                         
                         # === BROADCAST TO ALL CLIENTS IN SAME DEFENSE SESSION ===
                         if defense_session_id:
                             broadcast_event = {
                                 "type": "broadcast_transcript",
+                                "id": line_id,
                                 "speaker": speaker,
                                 "text": text,
                                 "user_id": event.get("user_id"),
                                 "timestamp": timestamp,
+                                "start_time_vtt": start_time_vtt,
+                                "end_time_vtt": end_time_vtt,
                                 "confidence": event.get("confidence_adjusted"),
                                 "source_session_id": session_id,  # Who sent this
                             }
@@ -839,18 +934,45 @@ class SpeechService(ISpeechService):
                 session_end = datetime.utcnow()
                 duration_seconds = (session_end - session_start).total_seconds()
 
-                # Build full_text with speaker names in format: [Speaker]: [Text]
+                # Build full_text in VTT-style format:
+                # HH:MM:SS.mmm --> HH:MM:SS.mmm
+                # [Speaker] Text
+                # [Edited Speaker] Edited Text  (only if edited)
                 parts: List[str] = []
                 for line in transcript_lines:
-                    speaker = line.get("speaker", "Unknown")
-                    txt = (line.get("text") or "").strip()
-                    if not txt:
+                    # Get original values
+                    original_speaker = line.get("speaker", "Unknown")
+                    original_text = (line.get("text") or "").strip()
+                    if not original_text:
                         raw = (line.get("text_raw") or "").strip()
                         if raw:
-                            txt = raw
-                    if txt:
-                        parts.append(f"{speaker}: {txt}")
-                full_text = "\n".join(parts).strip()
+                            original_text = raw
+                    
+                    # Get edited values (if any)
+                    edited_speaker = line.get("edited_speaker")
+                    edited_text = line.get("edited_text")
+                    
+                    # Get VTT timestamps
+                    start_vtt = line.get("start_time_vtt", "00:00:00.000")
+                    end_vtt = line.get("end_time_vtt", "00:00:03.000")
+                    
+                    if original_text or edited_text:
+                        # VTT timestamp line
+                        vtt_line = f"{start_vtt} --> {end_vtt}"
+                        # Original speaker line
+                        speaker_line = f"[{original_speaker}] {original_text}"
+                        
+                        if edited_speaker or edited_text:
+                            # Has edit - add edited line
+                            edit_speaker_display = edited_speaker or original_speaker
+                            edit_text_display = edited_text or original_text
+                            edit_line = f"[{edit_speaker_display}] {edit_text_display}"
+                            parts.append(f"{vtt_line}\n{speaker_line}\n{edit_line}")
+                        else:
+                            # No edit - leave second line empty
+                            parts.append(f"{vtt_line}\n{speaker_line}\n")
+                
+                full_text = "\n\n".join(parts).strip()
 
                 MIN_TRANSCRIPT_CHARS = 12
                 logger.info(
@@ -888,66 +1010,100 @@ class SpeechService(ISpeechService):
                             f"session_id={session_id} | lines={len(transcript_lines)}"
                         )
                         logger.info("💡 Transcript cached in Redis only. Send 'session:end' or 'save:transcript' to save to DB.")
-                    elif not defense_session_id or not defense_session_id.isdigit():
-                        logger.warning(
-                            f"⚠️ Skip API save: defense_session_id not provided or invalid | "
-                            f"defense_session_id={defense_session_id} | session_id={session_id}"
-                        )
-                        logger.info("💡 Transcript cached in Redis only (no database save)")
                     else:
-                        try:
-                            from app.config import Config
-                            import httpx
-
-                            api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
-                            session_id_int = int(defense_session_id)
-
-                            payload = {
-                                "sessionId": session_id_int,
-                                "transcriptText": full_text,
-                                "isApproved": True,
-                            }
-
-                            logger.info(
-                                f"📤 Attempting transcript save | defense_session_id={session_id_int} | chars={len(full_text)}"
+                        # === CHECK FOR GUEST SPEAKERS BEFORE SAVING ===
+                        guest_lines = []
+                        for line in transcript_lines:
+                            # Prioritize edited_speaker, fall back to original speaker
+                            effective_speaker = line.get("edited_speaker") or line.get("speaker", "")
+                            effective_speaker_lower = effective_speaker.lower().strip()
+                            if effective_speaker_lower in {"khách", "guest", "unknown", "đang xác định"}:
+                                guest_lines.append({
+                                    "id": line.get("id"),
+                                    "speaker": effective_speaker,
+                                    "text": (line.get("edited_text") or line.get("text", ""))[:50],
+                                })
+                        
+                        if guest_lines:
+                            # Block save - still have guest speakers
+                            logger.warning(
+                                f"⚠️ Cannot save transcript: {len(guest_lines)} lines with guest speaker | "
+                                f"session_id={session_id}"
                             )
+                            try:
+                                if ws.application_state == WebSocketState.CONNECTED:
+                                    await ws.send_json({
+                                        "type": "save_blocked",
+                                        "reason": "guest_speaker",
+                                        "message": f"Không thể lưu: còn {len(guest_lines)} dòng chưa xác định người nói",
+                                        "guest_lines": guest_lines[:10],  # First 10 for debugging
+                                        "total_guest_lines": len(guest_lines),
+                                    })
+                            except Exception:
+                                pass
+                            # Don't save - skip to cache only
+                            should_save_to_db = False
+                        
+                        if should_save_to_db and (not defense_session_id or not defense_session_id.isdigit()):
+                            logger.warning(
+                                f"⚠️ Skip API save: defense_session_id not provided or invalid | "
+                                f"defense_session_id={defense_session_id} | session_id={session_id}"
+                            )
+                            logger.info("💡 Transcript cached in Redis only (no database save)")
+                        elif should_save_to_db:
+                            try:
+                                from app.config import Config
+                                import httpx
 
-                            saved = False
-                            last_error = None
-                            for attempt in range(3):
-                                try:
-                                    async with httpx.AsyncClient(
-                                        verify=Config.AUTH_SERVICE_VERIFY_SSL,
-                                        timeout=Config.AUTH_SERVICE_TIMEOUT,
-                                    ) as client:
-                                        response = await client.post(api_url, json=payload)
-                                    if response.status_code in (200, 201):
-                                        logger.info(
-                                            f"✅ Saved transcript | attempt={attempt+1} status={response.status_code}"
-                                        )
-                                        saved = True
-                                        break
-                                    else:
-                                        last_error = f"HTTP {response.status_code}: {response.text}"
+                                api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
+                                session_id_int = int(defense_session_id)
+
+                                payload = {
+                                    "sessionId": session_id_int,
+                                    "transcriptText": full_text,
+                                    "isApproved": True,
+                                }
+
+                                logger.info(
+                                    f"📤 Attempting transcript save | defense_session_id={session_id_int} | chars={len(full_text)}"
+                                )
+
+                                saved = False
+                                last_error = None
+                                for attempt in range(3):
+                                    try:
+                                        async with httpx.AsyncClient(
+                                            verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                                            timeout=Config.AUTH_SERVICE_TIMEOUT,
+                                        ) as client:
+                                            response = await client.post(api_url, json=payload)
+                                        if response.status_code in (200, 201):
+                                            logger.info(
+                                                f"✅ Saved transcript | attempt={attempt+1} status={response.status_code}"
+                                            )
+                                            saved = True
+                                            break
+                                        else:
+                                            last_error = f"HTTP {response.status_code}: {response.text}"
+                                            if attempt < 2:
+                                                logger.warning(
+                                                    f"⚠️ Retry {attempt+1}/3 saving transcript | status={response.status_code}"
+                                                )
+                                                await asyncio.sleep(2 ** attempt)
+                                    except Exception as req_err:
+                                        last_error = str(req_err)
                                         if attempt < 2:
                                             logger.warning(
-                                                f"⚠️ Retry {attempt+1}/3 saving transcript | status={response.status_code}"
+                                                f"⚠️ Retry {attempt+1}/3 error: {req_err}"
                                             )
                                             await asyncio.sleep(2 ** attempt)
-                                except Exception as req_err:
-                                    last_error = str(req_err)
-                                    if attempt < 2:
-                                        logger.warning(
-                                            f"⚠️ Retry {attempt+1}/3 error: {req_err}"
-                                        )
-                                        await asyncio.sleep(2 ** attempt)
 
-                            if not saved:
-                                logger.error(
-                                    f"❌ Failed to save transcript after retries | defense_session_id={session_id_int} | error={last_error}"
-                                )
-                        except Exception as api_err:
-                            logger.exception(f"Critical error saving transcript: {api_err}")
+                                if not saved:
+                                    logger.error(
+                                        f"❌ Failed to save transcript after retries | defense_session_id={session_id_int} | error={last_error}"
+                                    )
+                            except Exception as api_err:
+                                logger.exception(f"Critical error saving transcript: {api_err}")
 
                     # Cache final transcript (only if we had valid content)
                     try:
