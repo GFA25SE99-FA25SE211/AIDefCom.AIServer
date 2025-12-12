@@ -443,14 +443,16 @@ class AzureSpeechRepository(ISpeechRepository):
             "result_count": 0,
         }
         
-        # Use a queue to buffer audio - allows switching recognizers
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=500)
+        # Use a smaller queue to reduce delay - drop old audio instead of blocking
+        # 100 chunks @ 640 bytes = ~4 seconds of audio buffer (sufficient for real-time)
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
         event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
         
         # Collect audio chunks into queue
         async def audio_collector():
             """Collect audio from source into queue."""
             chunk_count = 0
+            dropped_count = 0
             try:
                 async for chunk in audio_source:
                     if not chunk:
@@ -459,17 +461,27 @@ class AzureSpeechRepository(ISpeechRepository):
                     try:
                         audio_queue.put_nowait(chunk)
                     except asyncio.QueueFull:
-                        # Drop oldest if full
+                        # Drop oldest chunks to prevent delay buildup
+                        # This prioritizes real-time audio over historical audio
+                        dropped = 0
+                        while dropped < 10:  # Drop up to 10 old chunks
+                            try:
+                                audio_queue.get_nowait()
+                                dropped += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        dropped_count += dropped
                         try:
-                            audio_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
-                        audio_queue.put_nowait(chunk)
+                            audio_queue.put_nowait(chunk)
+                        except asyncio.QueueFull:
+                            pass  # Still full, skip this chunk
             except asyncio.CancelledError:
                 pass
             finally:
                 state["audio_ended"] = True
                 audio_queue.put_nowait(None)
+                if dropped_count > 0:
+                    print(f"⚠️ [AZURE] Audio collector: dropped {dropped_count} old chunks to prevent delay")
                 print(f"🔵 [AZURE] Audio collector ended | chunks={chunk_count}")
         
         def create_recognizer_and_pump():
@@ -549,13 +561,21 @@ class AzureSpeechRepository(ISpeechRepository):
         async def pump_to_stream(push_stream, stop_event: asyncio.Event):
             """Pump audio from queue to push stream until stop event."""
             buffer = bytearray()
-            MIN_PUSH = 6400
+            # Reduce MIN_PUSH to 3200 bytes (~100ms) for lower latency
+            MIN_PUSH = 3200
             push_count = 0
             
             while not stop_event.is_set():
                 try:
-                    chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+                    # Shorter timeout for more responsive pumping
+                    chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.05)
                 except asyncio.TimeoutError:
+                    # Even if no new chunk, push any buffered audio to reduce latency
+                    if len(buffer) >= MIN_PUSH // 2:
+                        push_data = bytes(buffer)
+                        buffer.clear()
+                        push_stream.write(push_data)
+                        push_count += 1
                     continue
                 
                 if chunk is None:
@@ -564,6 +584,7 @@ class AzureSpeechRepository(ISpeechRepository):
                 
                 buffer.extend(chunk)
                 
+                # Push immediately when we have enough data
                 while len(buffer) >= MIN_PUSH:
                     push_data = bytes(buffer[:MIN_PUSH])
                     del buffer[:MIN_PUSH]
@@ -572,8 +593,6 @@ class AzureSpeechRepository(ISpeechRepository):
                     
                     if push_count == 1:
                         print(f"🔵 [AZURE] First buffer pushed | size={len(push_data)} bytes")
-                    elif push_count % 25 == 0:
-                        print(f"🔵 [AZURE] Buffers pushed: {push_count}")
             
             # Push remaining
             if buffer:

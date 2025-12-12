@@ -333,6 +333,51 @@ async def metrics():
     )
 
 
+@app.get("/memory", include_in_schema=False)
+async def memory_stats():
+    """Memory statistics endpoint for debugging memory issues."""
+    import json
+    from core.health import get_memory_stats, force_gc_collect
+    
+    stats = get_memory_stats()
+    
+    # Add service-specific memory stats if available
+    try:
+        from api.dependencies import get_voice_service
+        voice_service = get_voice_service()
+        if voice_service and hasattr(voice_service, 'get_memory_stats'):
+            stats["voice_service"] = voice_service.get_memory_stats()
+    except Exception:
+        pass
+    
+    return Response(
+        content=json.dumps(stats, indent=2),
+        status_code=200,
+        media_type="application/json"
+    )
+
+
+@app.post("/gc", include_in_schema=False)
+async def force_garbage_collection():
+    """Force garbage collection - use when memory is high."""
+    import json
+    from core.health import force_gc_collect, get_memory_stats
+    
+    before = get_memory_stats()
+    gc_result = force_gc_collect()
+    after = get_memory_stats()
+    
+    return Response(
+        content=json.dumps({
+            "gc": gc_result,
+            "before": before,
+            "after": after,
+        }, indent=2),
+        status_code=200,
+        media_type="application/json"
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

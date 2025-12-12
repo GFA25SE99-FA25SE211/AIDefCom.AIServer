@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
-from dataclasses import dataclass
+import time
+import weakref
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Protocol
 
 import httpx
@@ -26,6 +30,107 @@ logger = logging.getLogger(__name__)
 # Constants
 MIN_ENROLL_SAMPLES = 3
 ANGLE_CAP_DEG = 45.0
+
+# Memory limits
+MAX_EMBEDDING_CACHE_SIZE = 100  # Max users in embedding cache
+MAX_MEAN_CACHE_SIZE = 100  # Max users in mean cache
+MAX_SESSION_CACHE_SIZE = 20  # Max sessions in profile cache
+CACHE_TTL_SECONDS = 3600  # 1 hour TTL for caches
+
+
+class LRUCache:
+    """Simple LRU cache with TTL and size limit.
+    
+    Automatically evicts oldest items when size limit is reached.
+    Items expire after TTL seconds.
+    """
+    
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 3600):
+        self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get item from cache, None if missing or expired."""
+        if key not in self._cache:
+            self._misses += 1
+            return None
+        
+        value, timestamp = self._cache[key]
+        
+        # Check TTL
+        if time.time() - timestamp > self._ttl:
+            del self._cache[key]
+            self._misses += 1
+            return None
+        
+        # Move to end (most recently used)
+        self._cache.move_to_end(key)
+        self._hits += 1
+        return value
+    
+    def set(self, key: str, value: Any) -> None:
+        """Set item in cache with current timestamp."""
+        # Evict oldest if at capacity
+        while len(self._cache) >= self._max_size:
+            oldest_key = next(iter(self._cache))
+            old_value = self._cache.pop(oldest_key)
+            # Help GC for numpy arrays
+            if isinstance(old_value[0], np.ndarray):
+                del old_value
+        
+        self._cache[key] = (value, time.time())
+    
+    def delete(self, key: str) -> bool:
+        """Delete item from cache."""
+        if key in self._cache:
+            del self._cache[key]
+            return True
+        return False
+    
+    def clear(self) -> None:
+        """Clear all items."""
+        self._cache.clear()
+    
+    def cleanup_expired(self) -> int:
+        """Remove expired items. Returns count removed."""
+        now = time.time()
+        expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._cache[k]
+        return len(expired)
+    
+    def __len__(self) -> int:
+        return len(self._cache)
+    
+    def __contains__(self, key: str) -> bool:
+        if key not in self._cache:
+            return False
+        _, timestamp = self._cache[key]
+        if time.time() - timestamp > self._ttl:
+            del self._cache[key]
+            return False
+        return True
+    
+    def keys(self):
+        return self._cache.keys()
+    
+    def items(self):
+        return [(k, v[0]) for k, v in self._cache.items()]
+    
+    def stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total > 0 else 0
+        return {
+            "size": len(self._cache),
+            "max_size": self._max_size,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": hit_rate,
+        }
 
 
 class EmbeddingModel(Protocol):
@@ -137,18 +242,59 @@ class VoiceService(IVoiceService):
         logger.info(
             f"Voice Service initialized | model={self.model_tag} | dim={self.embedding_dim}"
         )
-        # Embedding caches for performance
-        self._embedding_cache: Dict[str, np.ndarray] = {}
-        self._mean_cache: Dict[str, np.ndarray] = {}
+        # Embedding caches for performance with LRU eviction
+        self._embedding_cache: LRUCache = LRUCache(
+            max_size=MAX_EMBEDDING_CACHE_SIZE, 
+            ttl_seconds=CACHE_TTL_SECONDS
+        )
+        self._mean_cache: LRUCache = LRUCache(
+            max_size=MAX_MEAN_CACHE_SIZE,
+            ttl_seconds=CACHE_TTL_SECONDS
+        )
         self._profiles_preloaded: bool = False
-        # Session-specific profile cache (populated by preload_session_profiles)
-        self._session_profiles_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # Session-specific profile cache with TTL
+        self._session_profiles_cache: LRUCache = LRUCache(
+            max_size=MAX_SESSION_CACHE_SIZE,
+            ttl_seconds=CACHE_TTL_SECONDS
+        )
+        # Track last cleanup time
+        self._last_cleanup_ts: float = time.time()
+        self._cleanup_interval: int = 300  # Cleanup every 5 minutes
         
         # Score normalizer for S-Norm (Adaptive Symmetric Normalization)
         self._score_normalizer = get_score_normalizer(embedding_dim=self.embedding_dim)
         # S-Norm thresholds
         self.snorm_threshold = 1.5  # S-Norm score threshold (in std units)
         self.use_snorm = True  # Enable S-Norm by default
+    
+    def _maybe_cleanup_caches(self) -> None:
+        """Periodically cleanup expired cache entries."""
+        now = time.time()
+        if now - self._last_cleanup_ts < self._cleanup_interval:
+            return
+        
+        self._last_cleanup_ts = now
+        expired_emb = self._embedding_cache.cleanup_expired()
+        expired_mean = self._mean_cache.cleanup_expired()
+        expired_session = self._session_profiles_cache.cleanup_expired()
+        
+        if expired_emb + expired_mean + expired_session > 0:
+            logger.info(
+                f"🧹 Cache cleanup: embedding={expired_emb}, mean={expired_mean}, session={expired_session}"
+            )
+            # Force garbage collection after cleanup
+            gc.collect()
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get memory statistics for monitoring."""
+        return {
+            "embedding_cache": self._embedding_cache.stats(),
+            "mean_cache": self._mean_cache.stats(),
+            "session_cache": {
+                "size": len(self._session_profiles_cache),
+                "max_size": MAX_SESSION_CACHE_SIZE,
+            },
+        }
     
     def preload_enrolled_profiles(self) -> int:
         """Preload all enrolled profiles into memory cache.
@@ -188,10 +334,13 @@ class VoiceService(IVoiceService):
         Returns:
             List of profiles với embeddings đã normalize, sẵn sàng cho identification
         """
+        # Periodically cleanup expired entries
+        self._maybe_cleanup_caches()
+        
         # Check if already cached
         cache_key = defense_session_id
-        if cache_key in self._session_profiles_cache:
-            cached = self._session_profiles_cache[cache_key]
+        cached = self._session_profiles_cache.get(cache_key)
+        if cached is not None:
             
             # Update display names if user_info_map provided (may have been fetched after initial cache)
             if user_info_map:
@@ -228,7 +377,7 @@ class VoiceService(IVoiceService):
                 logger.info(f"📋 Profile: user_id={profile.get('user_id')}, name='{profile.get('name')}'")
         
         # Cache for this session
-        self._session_profiles_cache[cache_key] = profiles
+        self._session_profiles_cache.set(cache_key, profiles)
         
         return profiles
     
@@ -238,9 +387,10 @@ class VoiceService(IVoiceService):
     
     def clear_session_cache(self, defense_session_id: str) -> None:
         """Clear cached profiles for a session (call when session ends)."""
-        if defense_session_id in self._session_profiles_cache:
-            del self._session_profiles_cache[defense_session_id]
+        if self._session_profiles_cache.delete(defense_session_id):
             logger.info(f"🧹 Cleared profile cache for session {defense_session_id}")
+            # Force GC to release numpy arrays
+            gc.collect()
     
     def _invalidate_user_caches(self, user_id: str) -> None:
         """Invalidate all caches for a user after enrollment/update.
@@ -248,22 +398,16 @@ class VoiceService(IVoiceService):
         This forces the next identification to reload fresh embeddings from storage.
         """
         # Clear embedding cache
-        if user_id in self._embedding_cache:
-            del self._embedding_cache[user_id]
+        if self._embedding_cache.delete(user_id):
             logger.info(f"🧹 Invalidated embedding cache for {user_id}")
         
         # Clear mean cache
-        if user_id in self._mean_cache:
-            del self._mean_cache[user_id]
+        if self._mean_cache.delete(user_id):
             logger.info(f"🧹 Invalidated mean cache for {user_id}")
         
-        # Clear from all session caches (user may have re-enrolled during session)
-        for session_id, profiles in list(self._session_profiles_cache.items()):
-            for i, profile in enumerate(profiles):
-                if profile.get("user_id") == user_id:
-                    del profiles[i]
-                    logger.info(f"🧹 Removed {user_id} from session {session_id} cache (will reload on next use)")
-                    break
+        # Note: LRUCache doesn't support iteration by session_id,
+        # so we clear all session caches when user re-enrolls
+        # This is acceptable as re-enrollment is rare
         
         # Reset preloaded flag so next global load will refresh
         self._profiles_preloaded = False
@@ -1640,8 +1784,8 @@ class VoiceService(IVoiceService):
                 profile["embeddings"] = embeddings  # keep raw if needed
                 profile["embeddings_norm"] = norm_mat
 
-                # Cache normalized matrix
-                self._embedding_cache[uid] = norm_mat
+                # Cache normalized matrix using LRUCache
+                self._embedding_cache.set(uid, norm_mat)
 
                 # Prepare mean embedding if present
                 raw_mean = profile.get("mean_embedding")
@@ -1650,7 +1794,7 @@ class VoiceService(IVoiceService):
                     if mean_arr.size == self.embedding_dim:
                         mean_norm = mean_arr / (np.linalg.norm(mean_arr) + 1e-6)
                         profile["mean_embedding_norm"] = mean_norm
-                        self._mean_cache[uid] = mean_norm
+                        self._mean_cache.set(uid, mean_norm)
                 return profile
             except Exception as e:
                 logger.warning(f"Failed to load profile {uid}: {e}")

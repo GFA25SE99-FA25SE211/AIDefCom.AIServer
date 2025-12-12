@@ -1,9 +1,11 @@
 """Question duplicate detection service using Redis and fuzzy matching."""
 import asyncio
+import gc
 import logging
 import string
+import time
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 from rapidfuzz import fuzz
@@ -14,6 +16,11 @@ from services.voice.vector_index import SessionVectorIndex, create_vector_index
 from core.executors import run_cpu_bound
 
 logger = logging.getLogger(__name__)
+
+# Memory limits for QuestionService
+MAX_SESSION_LOCKS = 50  # Max sessions to track locks
+MAX_EMBEDDING_CACHE_SESSIONS = 30  # Max sessions to cache embeddings
+LOCK_TTL_SECONDS = 3600  # 1 hour TTL for session locks
 
 
 def _normalize_text_sync(text: str) -> str:
@@ -151,12 +158,63 @@ class QuestionService(IQuestionService):
         self.session_ttl = session_ttl
         self._redis_service = redis_service
         self._semantic_model = None  # Lazy load SBERT
-        # Local locks per session (for single-container atomicity)
-        self._session_locks: dict[str, asyncio.Lock] = {}
-        # Embedding cache per session: session_id -> np.ndarray (N, dim)
-        self._embedding_cache: Dict[str, np.ndarray] = {}
+        # Local locks per session with timestamps (for cleanup)
+        self._session_locks: Dict[str, Tuple[asyncio.Lock, float]] = {}
+        # Embedding cache per session: session_id -> (np.ndarray, timestamp)
+        self._embedding_cache: Dict[str, Tuple[np.ndarray, float]] = {}
         # Vector index for fast similarity search (for large sessions)
         self._vector_index = SessionVectorIndex(dim=self.EMBEDDING_DIM, ttl_seconds=session_ttl)
+        # Last cleanup timestamp
+        self._last_cleanup_ts: float = time.time()
+        self._cleanup_interval: int = 300  # Cleanup every 5 minutes
+    
+    def _maybe_cleanup(self) -> None:
+        """Periodically cleanup expired locks and embeddings."""
+        now = time.time()
+        if now - self._last_cleanup_ts < self._cleanup_interval:
+            return
+        
+        self._last_cleanup_ts = now
+        
+        # Cleanup expired session locks
+        expired_locks = [
+            sid for sid, (lock, ts) in self._session_locks.items()
+            if now - ts > LOCK_TTL_SECONDS and not lock.locked()
+        ]
+        for sid in expired_locks:
+            del self._session_locks[sid]
+        
+        # Cleanup expired embedding caches
+        expired_emb = [
+            sid for sid, (emb, ts) in self._embedding_cache.items()
+            if now - ts > self.session_ttl
+        ]
+        for sid in expired_emb:
+            del self._embedding_cache[sid]
+        
+        # Evict oldest if too many
+        if len(self._session_locks) > MAX_SESSION_LOCKS:
+            sorted_locks = sorted(
+                self._session_locks.items(),
+                key=lambda x: x[1][1]  # Sort by timestamp
+            )
+            for sid, _ in sorted_locks[:len(sorted_locks) - MAX_SESSION_LOCKS]:
+                if not self._session_locks[sid][0].locked():
+                    del self._session_locks[sid]
+        
+        if len(self._embedding_cache) > MAX_EMBEDDING_CACHE_SESSIONS:
+            sorted_emb = sorted(
+                self._embedding_cache.items(),
+                key=lambda x: x[1][1]
+            )
+            for sid, _ in sorted_emb[:len(sorted_emb) - MAX_EMBEDDING_CACHE_SESSIONS]:
+                del self._embedding_cache[sid]
+        
+        if expired_locks or expired_emb:
+            logger.info(
+                f"🧹 QuestionService cleanup: locks={len(expired_locks)}, embeddings={len(expired_emb)}"
+            )
+            gc.collect()
     
     @property
     def redis_service(self) -> IRedisService:
@@ -181,9 +239,16 @@ class QuestionService(IQuestionService):
     
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create lock for a session (prevents race conditions)."""
+        # Periodically cleanup
+        self._maybe_cleanup()
+        
         if session_id not in self._session_locks:
-            self._session_locks[session_id] = asyncio.Lock()
-        return self._session_locks[session_id]
+            self._session_locks[session_id] = (asyncio.Lock(), time.time())
+        else:
+            # Update timestamp on access
+            lock, _ = self._session_locks[session_id]
+            self._session_locks[session_id] = (lock, time.time())
+        return self._session_locks[session_id][0]
     
     def _normalize_text(self, text: str) -> str:
         """Normalize text for comparison (delegates to sync function)."""
@@ -228,8 +293,9 @@ class QuestionService(IQuestionService):
         for i, q in enumerate(questions):
             print(f"  📋 [Q] Existing[{i}]: '{q.get('text', '')[:50]}...'")
         
-        # Get cached embeddings for this session
-        cached_embeddings = self._embedding_cache.get(session_id)
+        # Get cached embeddings for this session (with timestamp)
+        cached_entry = self._embedding_cache.get(session_id)
+        cached_embeddings = cached_entry[0] if cached_entry else None
         
         # Offload CPU-intensive work to executor
         similar_questions, query_embedding = await run_cpu_bound(
@@ -276,7 +342,7 @@ class QuestionService(IQuestionService):
         save_result = await self.redis_service.set(key, questions, ttl=self.session_ttl)
         print(f"💾 [Q] Saved to Redis | key={key} | total={len(questions)} | success={save_result}")
         
-        # Update embedding cache
+        # Update embedding cache (with timestamp)
         try:
             new_embedding = await run_cpu_bound(
                 _encode_text_sync,
@@ -287,13 +353,14 @@ class QuestionService(IQuestionService):
             if norm > 1e-8:
                 new_embedding = new_embedding / norm
             
-            if session_id in self._embedding_cache:
-                self._embedding_cache[session_id] = np.vstack([
-                    self._embedding_cache[session_id],
-                    new_embedding.reshape(1, -1)
-                ])
+            existing_entry = self._embedding_cache.get(session_id)
+            if existing_entry is not None:
+                existing_emb, _ = existing_entry
+                new_cache = np.vstack([existing_emb, new_embedding.reshape(1, -1)])
             else:
-                self._embedding_cache[session_id] = new_embedding.reshape(1, -1)
+                new_cache = new_embedding.reshape(1, -1)
+            
+            self._embedding_cache[session_id] = (new_cache, time.time())
         except Exception as e:
             logger.warning(f"Failed to update embedding cache: {e}")
         

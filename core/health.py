@@ -1,10 +1,60 @@
 """Health check utilities for dependency verification."""
 
+import gc
 import logging
+import os
+import sys
 from typing import Dict, Any
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def get_memory_stats() -> Dict[str, Any]:
+    """Get current process memory statistics."""
+    import psutil
+    
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        
+        # Convert to MB
+        rss_mb = mem_info.rss / (1024 * 1024)
+        vms_mb = mem_info.vms / (1024 * 1024)
+        
+        # Get system memory
+        system_mem = psutil.virtual_memory()
+        
+        return {
+            "rss_mb": round(rss_mb, 2),
+            "vms_mb": round(vms_mb, 2),
+            "rss_percent": round(process.memory_percent(), 2),
+            "system_available_mb": round(system_mem.available / (1024 * 1024), 2),
+            "system_percent_used": system_mem.percent,
+            "gc_counts": gc.get_count(),
+            "gc_threshold": gc.get_threshold(),
+        }
+    except ImportError:
+        # psutil not available
+        return {
+            "error": "psutil not installed",
+            "gc_counts": gc.get_count(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def force_gc_collect() -> Dict[str, Any]:
+    """Force garbage collection and return stats."""
+    before = gc.get_count()
+    collected = gc.collect()
+    after = gc.get_count()
+    
+    return {
+        "collected": collected,
+        "before": before,
+        "after": after,
+    }
 
 
 async def check_redis_health(redis_service) -> Dict[str, Any]:
