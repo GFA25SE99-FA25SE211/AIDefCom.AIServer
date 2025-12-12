@@ -49,7 +49,7 @@ audio_file: <binary audio file>
 ```
 
 **Response Fields:**
-- `success` (boolean): Thành công hay không
+- `success` (boolean): Thành công hay không.
 - `user_id` (string): User ID đã enroll
 - `enrollment_count` (int): Số mẫu đã có
 - `min_required` (int): Số mẫu tối thiểu cần (3)
