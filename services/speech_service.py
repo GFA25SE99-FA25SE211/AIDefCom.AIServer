@@ -381,40 +381,41 @@ class SpeechService(ISpeechService):
         session_start = datetime.utcnow()
         transcript_lines = []
         
-        # === LOAD EXISTING TRANSCRIPT FROM CACHE AND SEND TO CLIENT ===
-        # This ensures client gets latest transcript when reconnecting/reloading
-        if defense_session_id and self.redis_service:
+        # === LOAD EXISTING TRANSCRIPT IN BACKGROUND (non-blocking) ===
+        async def _load_cached_transcript():
+            nonlocal transcript_lines, session_start
+            if not defense_session_id or not self.redis_service:
+                return
             try:
                 existing = await asyncio.wait_for(
                     self.redis_service.get(transcript_cache_key),
-                    timeout=2.0
+                    timeout=1.0  # Reduced timeout
                 )
                 if existing and isinstance(existing, dict):
                     cached_lines = existing.get("lines", [])
                     if cached_lines:
-                        # Gửi transcript đã cache cho client
-                        await ws.send_json({
-                            "type": "cached_transcript",
-                            "defense_session_id": defense_session_id,
-                            "lines": cached_lines,
-                            "start_time": existing.get("start_time"),
-                            "message": f"Loaded {len(cached_lines)} lines from cache"
-                        })
-                        logger.info(f"📦 Sent cached transcript to client | lines={len(cached_lines)}")
-                        
-                        # Load vào biến local để tiếp tục append
                         transcript_lines = cached_lines
                         original_start = existing.get("start_time")
                         if original_start:
                             try:
                                 session_start = datetime.fromisoformat(original_start)
-                            except Exception as e:
-                                _log_suppressed_error("parse_session_start", e, "warning")
-                        logger.info(f"📂 Resumed transcript | defense_session_id={defense_session_id} | existing_lines={len(transcript_lines)}")
-            except asyncio.TimeoutError:
-                logger.debug("Timeout loading cached transcript")
-            except Exception as e:
-                logger.debug(f"No cached transcript: {e}")
+                            except Exception:
+                                pass
+                        # Send to client (fire and forget)
+                        try:
+                            await ws.send_json({
+                                "type": "cached_transcript",
+                                "defense_session_id": defense_session_id,
+                                "lines": cached_lines,
+                                "message": f"Loaded {len(cached_lines)} lines"
+                            })
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # Non-critical, don't log
+        
+        # Start background load (don't await)
+        cached_transcript_task = asyncio.create_task(_load_cached_transcript())
         
         # === FLAG: Only save to DB when explicitly requested ===
         # Set to True when: session:end command OR save:transcript command
@@ -422,9 +423,8 @@ class SpeechService(ISpeechService):
         should_save_to_db = False
         
         # Audio queue - LARGE buffer to prevent audio loss during startup
-        # 1000 items @ 20ms chunks = 20 seconds of buffer
-        # This ensures no audio is lost while recognizer is initializing
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=1000)
+        # 2000 items @ 20ms chunks = 40 seconds of buffer for production stability
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=2000)
         stop_event = asyncio.Event()
         
         # Ping task to keep connection alive
@@ -468,15 +468,14 @@ class SpeechService(ISpeechService):
                                 logger.debug(f"🎤 Audio chunks received: {audio_chunk_count}")
                             
                             # CRITICAL: Don't drop audio - use blocking put with timeout
-                            # This ensures we don't lose the first sentences
                             try:
                                 await asyncio.wait_for(
                                     audio_queue.put(data["bytes"]),
-                                    timeout=1.0  # Wait up to 1s for queue space
+                                    timeout=2.0  # Wait up to 2s for queue space (production latency)
                                 )
                             except asyncio.TimeoutError:
-                                # Queue is really stuck - this shouldn't happen with 1000 item queue
-                                logger.warning(f"⚠️ Audio queue blocked for 1s, queue_size={audio_queue.qsize()}")
+                                # Queue is really stuck
+                                logger.warning(f"⚠️ Audio queue blocked, size={audio_queue.qsize()}")
                         
                         elif "text" in data:
                             # Text command (e.g., control messages: stop, q:start, q:end)
@@ -488,27 +487,39 @@ class SpeechService(ISpeechService):
                                 break
                             elif message == "q:start":
                                 # Begin question capture mode (stored in Redis for scaling)
-                                await self._session_state.set_question_mode(
-                                    session_id, 
-                                    active=True,
-                                    defense_session_id=defense_session_id
-                                )
                                 try:
+                                    await self._session_state.set_question_mode(
+                                        session_id, 
+                                        active=True,
+                                        defense_session_id=defense_session_id
+                                    )
                                     await ws.send_json({
                                         "type": "question_mode_started",
                                         "session_id": session_id
                                     })
                                 except Exception as e:
-                                    _log_suppressed_error("send_question_mode_started", e, "warning")
+                                    _log_suppressed_error("q:start", e, "warning")
                             elif message == "q:end":
                                 # End question mode and process captured text
-                                is_question_mode = await self._session_state.is_question_mode(session_id)
+                                try:
+                                    is_question_mode = await self._session_state.is_question_mode(session_id)
+                                except Exception as e:
+                                    _log_suppressed_error("q:end.is_question_mode", e, "warning")
+                                    is_question_mode = False
+                                
                                 if is_question_mode:
                                     # Get accumulated question text from Redis
-                                    question_text = await self._session_state.get_question_text(session_id)
+                                    try:
+                                        question_text = await self._session_state.get_question_text(session_id)
+                                    except Exception as e:
+                                        _log_suppressed_error("q:end.get_question_text", e, "warning")
+                                        question_text = ""
                                     
                                     # Clear question mode in Redis
-                                    await self._session_state.clear_question_buffer(session_id)
+                                    try:
+                                        await self._session_state.clear_question_buffer(session_id)
+                                    except Exception as e:
+                                        _log_suppressed_error("q:end.clear_question_buffer", e, "warning")
                                     
                                     logger.info(f"📝 Question mode ended | text='{question_text[:80]}...' if question_text else ''")
                                     
@@ -624,48 +635,60 @@ class SpeechService(ISpeechService):
                                 # Buffer already cleared above via clear_question_buffer()
                             elif message == "session:start":
                                 # Thư ký bắt đầu ghi âm - broadcast cho member
-                                logger.info(f"📢 Broadcasting session:start to room {defense_session_id}")
-                                await room_manager.broadcast_to_room(
-                                    defense_session_id,
-                                    {"type": "session_started"},
-                                    exclude_ws=None  # Gửi cho tất cả, kể cả thư ký (để confirm)
-                                )
+                                try:
+                                    logger.info(f"📢 Broadcasting session:start to room {defense_session_id}")
+                                    await room_manager.broadcast_to_room(
+                                        defense_session_id,
+                                        {"type": "session_started"},
+                                        exclude_ws=None  # Gửi cho tất cả, kể cả thư ký (để confirm)
+                                    )
+                                except Exception as e:
+                                    _log_suppressed_error("session:start", e, "warning")
                             elif message == "session:end":
                                 # Thư ký kết thúc phiên - broadcast cho member và save transcript
                                 nonlocal should_save_to_db
                                 should_save_to_db = True  # Mark to save transcript to DB
-                                logger.info(f"📢 Broadcasting session:end to room {defense_session_id} | will_save_db=True")
-                                await room_manager.broadcast_to_room(
-                                    defense_session_id,
-                                    {"type": "session_ended"},
-                                    exclude_ws=None
-                                )
+                                try:
+                                    logger.info(f"📢 Broadcasting session:end to room {defense_session_id} | will_save_db=True")
+                                    await room_manager.broadcast_to_room(
+                                        defense_session_id,
+                                        {"type": "session_ended"},
+                                        exclude_ws=None
+                                    )
+                                except Exception as e:
+                                    _log_suppressed_error("session:end", e, "warning")
                             elif message == "question:started":
                                 # Member bắt đầu đặt câu hỏi - broadcast cho thư ký
                                 if defense_session_id:
-                                    logger.info(f"📢 Broadcasting question:started to room {defense_session_id}")
-                                    await room_manager.broadcast_to_room(
-                                        defense_session_id,
-                                        {
-                                            "type": "broadcast_question_started",
-                                            "speaker": speaker_label or "Member",
-                                            "source_session_id": session_id,
-                                        },
-                                        exclude_ws=ws,
-                                    )
+                                    try:
+                                        logger.info(f"📢 Broadcasting question:started to room {defense_session_id}")
+                                        await room_manager.broadcast_to_room(
+                                            defense_session_id,
+                                            {
+                                                "type": "broadcast_question_started",
+                                                "speaker": speaker_label or "Member",
+                                                "source_session_id": session_id,
+                                            },
+                                            exclude_ws=ws,
+                                        )
+                                    except Exception as e:
+                                        _log_suppressed_error("question:started", e, "warning")
                             elif message == "question:processing":
                                 # Member kết thúc đặt câu hỏi, đang xử lý - broadcast cho thư ký
                                 if defense_session_id:
-                                    logger.info(f"📢 Broadcasting question:processing to room {defense_session_id}")
-                                    await room_manager.broadcast_to_room(
-                                        defense_session_id,
-                                        {
-                                            "type": "broadcast_question_processing",
-                                            "speaker": speaker_label or "Member",
-                                            "source_session_id": session_id,
-                                        },
-                                        exclude_ws=ws,
-                                    )
+                                    try:
+                                        logger.info(f"📢 Broadcasting question:processing to room {defense_session_id}")
+                                        await room_manager.broadcast_to_room(
+                                            defense_session_id,
+                                            {
+                                                "type": "broadcast_question_processing",
+                                                "speaker": speaker_label or "Member",
+                                                "source_session_id": session_id,
+                                            },
+                                            exclude_ws=ws,
+                                        )
+                                    except Exception as e:
+                                        _log_suppressed_error("question:processing", e, "warning")
                         else:
                             # Disconnect event
                             logger.debug("Received disconnect event")
@@ -690,23 +713,20 @@ class SpeechService(ISpeechService):
             logger.info(f"🚀 Starting STT session | session_id={session_id} | defense_session_id={defense_session_id}")
             logger.info(f"🔧 voice_service={self.voice_service is not None} | question_service={self.question_service is not None}")
             
-            # MUST wait for whitelist to complete - this provides display names for speakers
-            # Without this, speakers will show as UUID instead of "Tên (Role)"
+            # Wait for whitelist with SHORT timeout - needed for speaker identification
+            # This is a balance: too long delays startup, too short misses profiles
             if whitelist_fetch_task:
                 try:
-                    await asyncio.wait_for(whitelist_fetch_task, timeout=3.0)
-                    logger.info(f"✅ Whitelist loaded: {len(whitelist_user_ids) if whitelist_user_ids else 0} users")
-                    if user_info_map:
-                        for uid, info in user_info_map.items():
-                            logger.info(f"   👤 {uid}: {info.get('display_name')}")
+                    await asyncio.wait_for(whitelist_fetch_task, timeout=1.5)
+                    if whitelist_user_ids:
+                        logger.info(f"✅ Whitelist loaded: {len(whitelist_user_ids)} users")
                 except asyncio.TimeoutError:
-                    logger.warning("⚠️ Whitelist fetch timeout - speakers may show as IDs")
+                    logger.warning("⚠️ Whitelist timeout (1.5s) - continuing without profiles")
                 except Exception as e:
-                    logger.warning(f"⚠️ Whitelist fetch failed: {e}")
+                    logger.debug(f"Whitelist fetch error: {e}")
             
-            # Check queue status before starting recognition
             queue_size = audio_queue.qsize()
-            logger.info(f"📊 Audio queue status before recognition: {queue_size} items buffered")
+            logger.debug(f"Audio queue: {queue_size} items buffered")
             
             # Stream recognition results
             # Pass defense_session_id and user_info_map to enable voice profile preloading with display names
@@ -810,9 +830,12 @@ class SpeechService(ISpeechService):
                                 logger.debug(f"Broadcast failed: {broadcast_err}")
                         
                         # If question mode active, buffer this final text (stored in Redis)
-                        is_question_mode = await self._session_state.is_question_mode(session_id)
-                        if is_question_mode:
-                            await self._session_state.append_question_buffer(session_id, text)
+                        try:
+                            is_question_mode = await self._session_state.is_question_mode(session_id)
+                            if is_question_mode:
+                                await self._session_state.append_question_buffer(session_id, text)
+                        except Exception as qm_err:
+                            _log_suppressed_error("question_mode_buffer", qm_err, "debug")
                         
                         # Cache partial transcript in Redis (using defense_session_id key for resume support)
                         try:

@@ -161,32 +161,10 @@ class RecognitionStreamHandler:
         Yields:
             Recognition events
         """
-        logger.info(f"🎙️ Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
+        logger.info(f"🎙️ Starting recognition stream (speaker={speaker_label})")
         loop = asyncio.get_running_loop()
         
-        # Preload voice profiles FIRST - this is critical for correct speaker names
-        preloaded_profiles: Optional[List[Dict[str, Any]]] = None
-        
-        if defense_session_id and whitelist_user_ids and self.voice_service:
-            try:
-                preloaded_profiles = await asyncio.wait_for(
-                    self._preload_voice_profiles(
-                        defense_session_id,
-                        whitelist_user_ids,
-                        user_info_map,
-                    ),
-                    timeout=3.0  # 3 second timeout
-                )
-                if preloaded_profiles:
-                    logger.info(f"✅ Preloaded {len(preloaded_profiles)} voice profiles with display names")
-                    for p in preloaded_profiles:
-                        logger.info(f"   👤 {p.get('user_id')}: {p.get('name')}")
-            except asyncio.TimeoutError:
-                logger.warning("⚠️ Voice profile preload timeout")
-            except Exception as e:
-                logger.warning(f"⚠️ Voice profile preload failed: {e}")
-        
-        # Initialize audio buffer
+        # Initialize audio buffer FIRST (no blocking)
         buffer_config = AudioBufferConfig(
             sample_rate=self.sample_rate,
             history_seconds=self._config["history_seconds"],
@@ -195,16 +173,35 @@ class RecognitionStreamHandler:
         )
         audio_buffer = AudioBufferManager(config=buffer_config)
         
-        # Create speaker identification manager WITH preloaded profiles
+        # Create speaker identification manager (profiles will be set when ready)
         speaker_id_manager: Optional[SpeakerIdentificationManager] = None
         if self.voice_service:
             speaker_id_manager = SpeakerIdentificationManager(
                 voice_service=self.voice_service,
                 redis_service=self.redis_service,
                 config=SpeakerIdentificationConfig.from_app_config(),
-                preloaded_profiles=preloaded_profiles,  # Already loaded
+                preloaded_profiles=None,  # Will be set after loading
                 whitelist_user_ids=whitelist_user_ids,
             )
+        
+        # Load voice profiles with SHORT timeout - critical for speaker names
+        if defense_session_id and whitelist_user_ids and self.voice_service and speaker_id_manager:
+            try:
+                profiles = await asyncio.wait_for(
+                    self._preload_voice_profiles(
+                        defense_session_id,
+                        whitelist_user_ids,
+                        user_info_map,
+                    ),
+                    timeout=2.0  # Short timeout to not block recognition too long
+                )
+                if profiles:
+                    speaker_id_manager.set_preloaded_profiles(profiles)
+                    logger.info(f"✅ Loaded {len(profiles)} voice profiles")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Voice profile load timeout (2s)")
+            except Exception as e:
+                logger.debug(f"Profile preload failed: {e}")
         
         # Initialize speaker tracker
         speaker_tracker = MultiSpeakerTracker(max_speakers=4, inactivity_timeout=30.0)

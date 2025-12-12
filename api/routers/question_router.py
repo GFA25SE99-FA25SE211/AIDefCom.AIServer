@@ -1,4 +1,5 @@
 """REST API endpoints for question duplicate detection (Swagger-enhanced)."""
+import logging
 import traceback
 from fastapi import APIRouter, HTTPException, Depends
 from api.schemas.question_schemas import (
@@ -12,6 +13,8 @@ from api.schemas.question_schemas import (
 )
 from services.interfaces.i_question_service import IQuestionService
 from api.dependencies import get_question_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/questions", tags=["Questions"])
 
@@ -113,13 +116,13 @@ async def check_and_register(
 ):
     """Check duplicate then register if unique (threshold=0.85)."""
     try:
-        print(f"🔍 API: Checking duplicate for: {request.question_text[:50]}...")
+        logger.debug(f"Checking duplicate for: {request.question_text[:50]}...")
 
         is_duplicate, similar = await question_service.check_duplicate(
             session_id=request.session_id,
             question_text=request.question_text,
         )
-        print(f"✅ API: Check complete - is_duplicate={is_duplicate}, similar={len(similar)}")
+        logger.debug(f"Check complete - is_duplicate={is_duplicate}, similar={len(similar)}")
 
         similar_questions = [
             SimilarQuestion(
@@ -132,17 +135,17 @@ async def check_and_register(
         ]
 
         if is_duplicate:
-            message = "⚠️ Câu hỏi trùng lặp! Không thể đăng ký."
+            message = "Cau hoi trung lap! Khong the dang ky."
         else:
             from datetime import datetime
-            print("💾 API: Registering question...")
+            logger.debug("Registering question...")
             result = await question_service.register_question(
                 session_id=request.session_id,
                 question_text=request.question_text,
-                speaker="Khách",
+                speaker="Khach",
                 timestamp=datetime.utcnow().isoformat() + "Z",
             )
-            message = f"✅ Câu hỏi đã được lưu. Tổng: {result['total_questions']}"
+            message = f"Cau hoi da duoc luu. Tong: {result['total_questions']}"
 
         return QuestionCheckResponse(
             is_duplicate=is_duplicate,
@@ -151,8 +154,8 @@ async def check_and_register(
             message=message,
         )
     except Exception as e:
-        print(f"❌ API ERROR: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"API ERROR: {str(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 

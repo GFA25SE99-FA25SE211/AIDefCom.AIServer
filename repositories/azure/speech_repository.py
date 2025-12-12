@@ -180,13 +180,14 @@ class AzureSpeechRepository(ISpeechRepository):
         self.speech_config.speech_recognition_language = language
         self.speech_config.output_format = speechsdk.OutputFormat.Detailed
         
-        # Use DICTATION mode for Vietnamese - provides automatic punctuation!
-        # DICTATION is best for longer, natural speech with proper sentence structure
-        # CONVERSATION mode doesn't add punctuation automatically
-        self.speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
-            "DICTATION"
-        )
+        # NOTE: Do NOT set RecoMode for continuous recognition
+        # Azure Speech SDK handles mode automatically for start_continuous_recognition
+        # Setting DICTATION or CONVERSATION manually can cause unexpected session stops
+        # self.speech_config.set_property(
+        #     speechsdk.PropertyId.SpeechServiceConnection_RecoMode,
+        #     "CONVERSATION"
+        # )
+        logger.info("[Azure Config] Using default RecoMode for continuous recognition")
         
         # === ACCURACY OPTIMIZATION FOR VIETNAMESE ===
         
@@ -233,21 +234,24 @@ class AzureSpeechRepository(ISpeechRepository):
             str(max(_segmentation_silence, 1500))  # At least 1500ms for Vietnamese
         )
         
-        # Initial silence: how long to wait for speech to start
+        # === CRITICAL: Set VERY HIGH timeouts for defense session ===
+        # Defense sessions can have 15+ minute breaks (discussion, rest, etc.)
+        # We DON'T want Azure to timeout - only stop when audio stream closes
+        
+        # Initial silence: how long to wait for speech to start (15 minutes)
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-            str(_initial_silence)
+            "900000"  # 15 minutes - covers breaks during defense
         )
+        logger.info("[Azure Config] InitialSilenceTimeoutMs = 900000 (15 min)")
         
-        # End silence: time after speech ends to finalize result
-        # For continuous recognition in defense sessions, set very high
-        # to prevent session from stopping during natural pauses
-        # Azure max is around 5000ms, but we set high to indicate "don't stop"
-        # The session will only end when audio stream closes
+        # End silence: time after speech ends before finalizing (15 minutes)
+        # This prevents Azure from stopping during long pauses
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-            "5000"  # Max value - session stays open during long pauses
+            "900000"  # 15 minutes - covers breaks during defense
         )
+        logger.info("[Azure Config] EndSilenceTimeoutMs = 900000 (15 min)")
         
         # For Vietnamese: Don't use TrueText (English-optimized)
         # Request word-level timestamps for confidence analysis
@@ -321,7 +325,16 @@ class AzureSpeechRepository(ISpeechRepository):
                 with contextlib.suppress(Exception):
                     phrase_list.addPhrase(phrase)
 
+        # CRITICAL: Get the running event loop for thread-safe callback execution
+        loop = asyncio.get_running_loop()
         event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
+        
+        def _put_event_threadsafe(event: Dict[str, Any] | None) -> None:
+            """Thread-safe helper to put events into asyncio queue from SDK callbacks."""
+            try:
+                loop.call_soon_threadsafe(event_queue.put_nowait, event)
+            except Exception as e:
+                logger.warning(f"[Azure] Failed to queue event: {e}")
 
         def _extract_best_text(result: speechsdk.SpeechRecognitionResult) -> str:
             """Extract best text from recognition result.
@@ -382,27 +395,28 @@ class AzureSpeechRepository(ISpeechRepository):
             
             return fallback_text
 
+        # Callbacks - CRITICAL: Use _put_event_threadsafe() for thread safety!
         def on_recognizing(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             text = _extract_best_text(evt.result)
             if text:
-                event_queue.put_nowait({"type": "partial", "text": text})
+                _put_event_threadsafe({"type": "partial", "text": text})
 
         def on_recognized(evt: speechsdk.SpeechRecognitionEventArgs) -> None:
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
                 text = _extract_best_text(evt.result)
                 if text:
-                    event_queue.put_nowait({"type": "result", "text": text})
+                    _put_event_threadsafe({"type": "result", "text": text})
             elif evt.result.reason == speechsdk.ResultReason.NoMatch:
-                event_queue.put_nowait({"type": "nomatch"})
+                _put_event_threadsafe({"type": "nomatch"})
 
         def on_canceled(evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
             if evt.reason == speechsdk.CancellationReason.Error:
                 logger.error(f"Azure Speech error: {evt.error_details}")
-                event_queue.put_nowait({"type": "error", "error": evt.error_details})
-            event_queue.put_nowait(None)
+                _put_event_threadsafe({"type": "error", "error": evt.error_details})
+            _put_event_threadsafe(None)
 
         def on_session_stopped(evt: speechsdk.SessionEventArgs) -> None:
-            event_queue.put_nowait(None)
+            _put_event_threadsafe(None)
 
         recognizer.recognizing.connect(on_recognizing)
         recognizer.recognized.connect(on_recognized)
@@ -425,193 +439,166 @@ class AzureSpeechRepository(ISpeechRepository):
         audio_source: AsyncIterable[bytes],
         extra_phrases: Iterable[str] | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream speech recognition from an async audio source."""
+        """Stream speech recognition - SIMPLIFIED VERSION.
+        
+        Minimal implementation focused on reliability over features.
+        """
+        import queue
+        import threading
         import time
+        
         start_time = time.time()
+        logger.info("[Azure] Starting recognize_stream (simplified)")
         
-        # Shared state
-        state = {
-            "audio_ended": False,
-            "recognition_active": True,
-            "session_started": False,
-        }
+        # Use thread-safe queue for Azure SDK callbacks (they run on background threads)
+        result_queue: queue.Queue = queue.Queue()
+        stop_flag = threading.Event()
         
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
-        event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
+        # Create push stream for audio
+        fmt = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=self.sample_rate,
+            bits_per_sample=16,
+            channels=1,
+        )
+        push_stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
+        audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
         
-        async def audio_collector():
-            """Collect audio from source into queue."""
-            try:
-                async for chunk in audio_source:
-                    if chunk:
-                        try:
-                            await asyncio.wait_for(audio_queue.put(chunk), timeout=2.0)
-                        except asyncio.TimeoutError:
-                            pass
-            except asyncio.CancelledError:
-                pass
-            finally:
-                state["audio_ended"] = True
-                await audio_queue.put(None)
+        # Create recognizer
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=self.speech_config,
+            audio_config=audio_config,
+        )
         
-        def create_recognizer():
-            """Create new recognizer with push stream."""
-            fmt = speechsdk.audio.AudioStreamFormat(
-                samples_per_second=self.sample_rate,
-                bits_per_sample=16,
-                channels=1,
-            )
-            push_stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
-            audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
-            
-            recognizer = speechsdk.SpeechRecognizer(
-                speech_config=self.speech_config,
-                audio_config=audio_config,
-            )
-            
-            # Add phrase hints
-            all_hints = list(self.default_phrase_hints)
-            if extra_phrases:
-                all_hints.extend(extra_phrases)
-            if all_hints:
-                phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
-                for phrase in all_hints:
+        # Add phrase hints
+        all_hints = list(self.default_phrase_hints)
+        if extra_phrases:
+            all_hints.extend(extra_phrases)
+        if all_hints:
+            phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
+            for phrase in all_hints[:500]:  # Limit to avoid issues
+                with contextlib.suppress(Exception):
                     phrase_list.addPhrase(phrase)
-            
-            # Callbacks
-            def on_recognizing(evt):
+        
+        # Simple callbacks - just put results in thread-safe queue
+        def on_recognizing(evt):
+            text = evt.result.text.strip() if evt.result.text else ""
+            if text:
+                result_queue.put({"type": "partial", "text": text})
+        
+        def on_recognized(evt):
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
                 text = evt.result.text.strip() if evt.result.text else ""
                 if text:
-                    event_queue.put_nowait({"type": "partial", "text": text})
+                    logger.info(f"[Azure] ✓ Recognized: '{text[:60]}'")
+                    result_queue.put({"type": "result", "text": text})
+        
+        def on_canceled(evt):
+            error_details = str(evt.error_details) if evt.error_details else ""
+            logger.warning(f"[Azure] Canceled: {evt.reason} - {error_details}")
             
-            def on_recognized(evt):
-                if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                    text = evt.result.text.strip() if evt.result.text else ""
-                    if text:
-                        event_queue.put_nowait({"type": "result", "text": text})
-                elif evt.result.reason == speechsdk.ResultReason.NoMatch:
-                    event_queue.put_nowait({"type": "nomatch"})
-            
-            def on_canceled(evt):
-                if evt.reason == speechsdk.CancellationReason.Error:
-                    logger.error(f"Azure Speech error: {evt.error_details}")
-                    event_queue.put_nowait({"type": "error", "error": evt.error_details})
-                    state["recognition_active"] = False
-                    event_queue.put_nowait(None)
-            
-            def on_session_stopped(evt):
-                if state["audio_ended"]:
-                    state["recognition_active"] = False
-                    event_queue.put_nowait(None)
+            if evt.reason == speechsdk.CancellationReason.Error:
+                # Check for quota exceeded
+                if "quota" in error_details.lower() or "1007" in error_details:
+                    error_msg = "Azure Speech quota đã hết. Vui lòng kiểm tra Azure Portal hoặc đợi reset quota."
+                    logger.error(f"[Azure] QUOTA EXCEEDED: {error_details}")
+                    result_queue.put({"type": "error", "error": error_msg, "error_code": "QUOTA_EXCEEDED"})
                 else:
-                    event_queue.put_nowait({"type": "_recreate"})
+                    result_queue.put({"type": "error", "error": error_details})
             
-            def on_session_started(evt):
-                state["session_started"] = True
-            
-            recognizer.session_started.connect(on_session_started)
-            recognizer.recognizing.connect(on_recognizing)
-            recognizer.recognized.connect(on_recognized)
-            recognizer.canceled.connect(on_canceled)
-            recognizer.session_stopped.connect(on_session_stopped)
-            
-            return recognizer, push_stream
+            stop_flag.set()
+            result_queue.put(None)  # Signal end
         
-        async def pump_to_stream(push_stream, stop_event: asyncio.Event):
-            """Pump audio from queue to push stream."""
-            buffer = bytearray()
-            MIN_PUSH = 3200
-            
-            while not stop_event.is_set():
+        def on_session_stopped(evt):
+            logger.info("[Azure] Session stopped")
+            stop_flag.set()
+            result_queue.put(None)  # Signal end
+        
+        recognizer.recognizing.connect(on_recognizing)
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_session_stopped)
+        
+        # Start recognition
+        recognizer.start_continuous_recognition_async()
+        logger.info("[Azure] Recognition started")
+        
+        # Yield ready event
+        yield {"type": "ready", "startup_time": time.time() - start_time}
+        
+        # Task to pump audio to Azure
+        async def pump_audio():
+            """Read audio from source and write to push stream."""
+            chunk_count = 0
+            total_bytes = 0
+            try:
+                async for chunk in audio_source:
+                    if stop_flag.is_set():
+                        break
+                    if chunk:
+                        chunk_count += 1
+                        total_bytes += len(chunk)
+                        try:
+                            push_stream.write(chunk)
+                        except Exception as e:
+                            logger.error(f"[Azure] Write error: {e}")
+                            break
+                        
+                        if chunk_count == 1:
+                            logger.info(f"[Azure] First audio chunk: {len(chunk)} bytes")
+                        elif chunk_count % 100 == 0:
+                            logger.debug(f"[Azure] Audio progress: {chunk_count} chunks, {total_bytes} bytes")
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[Azure] Audio pump error: {e}")
+            finally:
+                logger.info(f"[Azure] Audio pump done: {chunk_count} chunks, {total_bytes} bytes")
                 try:
-                    chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.05)
-                except asyncio.TimeoutError:
-                    if len(buffer) >= MIN_PUSH // 2:
-                        push_stream.write(bytes(buffer))
-                        buffer.clear()
-                    continue
-                
-                if chunk is None:
-                    break
-                
-                buffer.extend(chunk)
-                while len(buffer) >= MIN_PUSH:
-                    push_stream.write(bytes(buffer[:MIN_PUSH]))
-                    del buffer[:MIN_PUSH]
-            
-            if buffer:
-                push_stream.write(bytes(buffer))
-            
-            with contextlib.suppress(Exception):
-                push_stream.close()
+                    push_stream.close()
+                except Exception:
+                    pass
+                stop_flag.set()
+                result_queue.put(None)
         
-        recognizer = None
-        push_stream = None
-        pump_task = None
-        collector_task = None
-        stop_pump = asyncio.Event()
+        # Start audio pump
+        pump_task = asyncio.create_task(pump_audio())
         
         try:
-            recognizer, push_stream = create_recognizer()
-            
-            # Start recognition
-            result = recognizer.start_continuous_recognition_async()
-            result.get()
-            
-            # Wait for session start
-            wait_start = time.time()
-            while not state.get("session_started") and (time.time() - wait_start) < 5.0:
-                await asyncio.sleep(0.1)
-            
-            # Start tasks
-            pump_task = asyncio.create_task(pump_to_stream(push_stream, stop_pump))
-            collector_task = asyncio.create_task(audio_collector())
-            
-            # Send ready event
-            yield {"type": "ready", "startup_time": time.time() - start_time}
-            
-            while state["recognition_active"]:
+            # Main loop - yield results from queue
+            while not stop_flag.is_set():
                 try:
-                    event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-                
-                if event is None:
-                    break
-                
-                if event.get("type") == "_recreate":
-                    # Recreate recognizer
-                    stop_pump.set()
-                    recognizer.stop_continuous_recognition_async()
-                    if pump_task and not pump_task.done():
-                        pump_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await pump_task
+                    # Non-blocking check with small timeout
+                    event = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: result_queue.get(timeout=0.1)
+                    )
                     
-                    stop_pump = asyncio.Event()
-                    recognizer, push_stream = create_recognizer()
-                    recognizer.start_continuous_recognition_async()
-                    pump_task = asyncio.create_task(pump_to_stream(push_stream, stop_pump))
+                    if event is None:
+                        break
+                    
+                    yield event
+                    
+                except queue.Empty:
                     continue
-                
-                yield event
+                except Exception as e:
+                    logger.error(f"[Azure] Queue error: {e}")
+                    break
         
         finally:
-            state["recognition_active"] = False
-            stop_pump.set()
+            # Cleanup
+            stop_flag.set()
             
-            if recognizer:
+            try:
                 recognizer.stop_continuous_recognition_async()
+            except Exception:
+                pass
             
             if pump_task and not pump_task.done():
                 pump_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await pump_task
             
-            if collector_task and not collector_task.done():
-                collector_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await collector_task
+            logger.info("[Azure] recognize_stream ended")
 
     def recognize_once(self, audio_bytes: bytes) -> str:
         """Perform one-shot speech recognition on audio bytes."""

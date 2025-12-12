@@ -31,20 +31,15 @@ class RedisService(IRedisService):
         
         self._initialized = True  # Mark as attempted to avoid retry loops
         
-        print(f"🔌 [REDIS] Config check: HOST={Config.REDIS_HOST}, PORT={Config.REDIS_PORT}, SSL={Config.REDIS_SSL}")
-        print(f"🔌 [REDIS] Password set: {bool(Config.REDIS_PASSWORD)} (len={len(Config.REDIS_PASSWORD) if Config.REDIS_PASSWORD else 0})")
-        
         if not Config.REDIS_PASSWORD:
-            print("⚠️ [REDIS] REDIS_PASSWORD not set! Running without cache.")
-            logger.warning("⚠️ REDIS_PASSWORD not set. Running without cache.")
+            logger.warning("REDIS_PASSWORD not set. Running without cache.")
             self.client = None
             return
         
         try:
             # Create client with from_url (rediss:// automatically enables SSL)
             redis_url = f"{'rediss' if Config.REDIS_SSL else 'redis'}://{Config.REDIS_HOST}:{Config.REDIS_PORT}/{Config.REDIS_DB}"
-            print(f"🔌 [REDIS] Connecting to: {redis_url}")
-            logger.info(f"🔌 Connecting to Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT} (SSL: {Config.REDIS_SSL})")
+            logger.info(f"Connecting to Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT} (SSL: {Config.REDIS_SSL})")
             
             self.client = await aioredis.from_url(
                 redis_url,
@@ -59,20 +54,16 @@ class RedisService(IRedisService):
             
             # Test connection with timeout
             await asyncio.wait_for(self.client.ping(), timeout=15)
-            print(f"✅ [REDIS] Connected successfully to {Config.REDIS_HOST}:{Config.REDIS_PORT}")
             logger.info(f"✅ Connected to Redis at {Config.REDIS_HOST}:{Config.REDIS_PORT}")
             
         except asyncio.TimeoutError:
-            print(f"❌ [REDIS] Connection TIMEOUT to {Config.REDIS_HOST}:{Config.REDIS_PORT}")
-            logger.warning(f"⚠️ Redis connection timeout. Running without cache.")
+            logger.warning(f"Redis connection timeout. Running without cache.")
             self.client = None
         except aioredis.AuthenticationError as e:
-            print(f"❌ [REDIS] Authentication FAILED: {e}")
-            logger.warning(f"⚠️ Redis authentication failed: {e}. Check REDIS_PASSWORD. Running without cache.")
+            logger.warning(f"Redis authentication failed: {e}. Check REDIS_PASSWORD.")
             self.client = None
         except Exception as e:
-            print(f"❌ [REDIS] Connection FAILED: {type(e).__name__}: {e}")
-            logger.warning(f"⚠️ Redis connection failed: {e}. Running without cache.")
+            logger.warning(f"Redis connection failed: {e}. Running without cache.")
             self.client = None
     
     async def get(self, key: str) -> Optional[Any]:
@@ -81,23 +72,19 @@ class RedisService(IRedisService):
             await self._ensure_connection()
         
         if not self.client:
-            print(f"⚠️ [REDIS] GET '{key}' - NO CLIENT (Redis not connected!)")
             return None
         
         try:
             # Add explicit timeout to prevent hanging
-            value = await asyncio.wait_for(self.client.get(key), timeout=5.0)
+            value = await asyncio.wait_for(self.client.get(key), timeout=3.0)
             if value:
-                result = json.loads(value)
-                print(f"✅ [REDIS] GET '{key}' - Found {len(result) if isinstance(result, list) else 'value'}")
-                return result
-            print(f"📭 [REDIS] GET '{key}' - Key not found (empty)")
+                return json.loads(value)
             return None
         except asyncio.TimeoutError:
-            print(f"⚠️ [REDIS] GET '{key}' - TIMEOUT")
+            logger.debug(f"Redis GET timeout: {key}")
             return None
         except Exception as e:
-            print(f"❌ [REDIS] GET '{key}' - Error: {e}")
+            logger.debug(f"Redis GET error: {e}")
             return None
     
     async def set(
@@ -111,7 +98,6 @@ class RedisService(IRedisService):
             await self._ensure_connection()
         
         if not self.client:
-            print(f"⚠️ [REDIS] SET '{key}' - NO CLIENT (Redis not connected!)")
             return False
         
         try:
@@ -122,22 +108,19 @@ class RedisService(IRedisService):
             if ttl_seconds > 0:
                 await asyncio.wait_for(
                     self.client.setex(key, ttl_seconds, serialized),
-                    timeout=5.0
+                    timeout=3.0
                 )
             else:
                 await asyncio.wait_for(
                     self.client.set(key, serialized),
-                    timeout=5.0
+                    timeout=3.0
                 )
-            
-            item_count = len(value) if isinstance(value, list) else 1
-            print(f"✅ [REDIS] SET '{key}' - Saved {item_count} items, TTL={ttl_seconds}s")
             return True
         except asyncio.TimeoutError:
-            print(f"⚠️ [REDIS] SET '{key}' - TIMEOUT")
+            logger.debug(f"Redis SET timeout: {key}")
             return False
         except Exception as e:
-            print(f"❌ [REDIS] SET '{key}' - Error: {e}")
+            logger.debug(f"Redis SET error: {e}")
             return False
     
     async def delete(self, *keys: str) -> bool:
