@@ -425,67 +425,37 @@ class AzureSpeechRepository(ISpeechRepository):
         audio_source: AsyncIterable[bytes],
         extra_phrases: Iterable[str] | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream speech recognition from an async audio source.
-        
-        This method handles Azure session timeouts by recreating the recognizer
-        when needed, ensuring continuous recognition throughout a defense session.
-        """
-        print(f"🔵 [AZURE] recognize_stream START | region={self.region} | language={self.language}")
-        print(f"🔵 [AZURE] speech_key exists: {bool(self.speech_key)} | key_len={len(self.speech_key) if self.speech_key else 0}")
-        print(f"🔵 [AZURE] Custom endpoint: {getattr(self.speech_config, 'endpoint_id', 'None')}")
-        print(f"🔵 [AZURE] Sample rate: {self.sample_rate}Hz | Audio format: 16-bit mono PCM")
+        """Stream speech recognition from an async audio source."""
+        import time
+        start_time = time.time()
         
         # Shared state
         state = {
             "audio_ended": False,
             "recognition_active": True,
-            "partial_count": 0,
-            "result_count": 0,
+            "session_started": False,
         }
         
-        # Use a smaller queue to reduce delay - drop old audio instead of blocking
-        # 100 chunks @ 640 bytes = ~4 seconds of audio buffer (sufficient for real-time)
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         event_queue: asyncio.Queue[Dict[str, Any] | None] = asyncio.Queue()
         
-        # Collect audio chunks into queue
         async def audio_collector():
             """Collect audio from source into queue."""
-            chunk_count = 0
-            dropped_count = 0
             try:
                 async for chunk in audio_source:
-                    if not chunk:
-                        continue
-                    chunk_count += 1
-                    try:
-                        audio_queue.put_nowait(chunk)
-                    except asyncio.QueueFull:
-                        # Drop oldest chunks to prevent delay buildup
-                        # This prioritizes real-time audio over historical audio
-                        dropped = 0
-                        while dropped < 10:  # Drop up to 10 old chunks
-                            try:
-                                audio_queue.get_nowait()
-                                dropped += 1
-                            except asyncio.QueueEmpty:
-                                break
-                        dropped_count += dropped
+                    if chunk:
                         try:
-                            audio_queue.put_nowait(chunk)
-                        except asyncio.QueueFull:
-                            pass  # Still full, skip this chunk
+                            await asyncio.wait_for(audio_queue.put(chunk), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
             except asyncio.CancelledError:
                 pass
             finally:
                 state["audio_ended"] = True
-                audio_queue.put_nowait(None)
-                if dropped_count > 0:
-                    print(f"⚠️ [AZURE] Audio collector: dropped {dropped_count} old chunks to prevent delay")
-                print(f"🔵 [AZURE] Audio collector ended | chunks={chunk_count}")
+                await audio_queue.put(None)
         
-        def create_recognizer_and_pump():
-            """Create new recognizer with fresh push stream."""
+        def create_recognizer():
+            """Create new recognizer with push stream."""
             fmt = speechsdk.audio.AudioStreamFormat(
                 samples_per_second=self.sample_rate,
                 bits_per_sample=16,
@@ -508,47 +478,36 @@ class AzureSpeechRepository(ISpeechRepository):
                 for phrase in all_hints:
                     phrase_list.addPhrase(phrase)
             
-            # Set up callbacks
+            # Callbacks
             def on_recognizing(evt):
                 text = evt.result.text.strip() if evt.result.text else ""
                 if text:
-                    state["partial_count"] += 1
-                    if state["partial_count"] == 1:
-                        print(f"🟢 [AZURE] First partial! text='{text[:50]}...'")
                     event_queue.put_nowait({"type": "partial", "text": text})
             
             def on_recognized(evt):
                 if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
                     text = evt.result.text.strip() if evt.result.text else ""
                     if text:
-                        state["result_count"] += 1
-                        print(f"🟢 [AZURE] Result #{state['result_count']}: '{text}'")
                         event_queue.put_nowait({"type": "result", "text": text})
                 elif evt.result.reason == speechsdk.ResultReason.NoMatch:
                     event_queue.put_nowait({"type": "nomatch"})
             
             def on_canceled(evt):
-                print(f"🔴 [AZURE] on_canceled | reason={evt.reason}")
                 if evt.reason == speechsdk.CancellationReason.Error:
                     logger.error(f"Azure Speech error: {evt.error_details}")
                     event_queue.put_nowait({"type": "error", "error": evt.error_details})
                     state["recognition_active"] = False
                     event_queue.put_nowait(None)
-                elif evt.reason == speechsdk.CancellationReason.EndOfStream:
-                    print(f"🔵 [AZURE] EndOfStream")
-                    # Don't end - let session_stopped handle it
             
             def on_session_stopped(evt):
                 if state["audio_ended"]:
-                    print(f"🔵 [AZURE] on_session_stopped - audio ended (normal)")
                     state["recognition_active"] = False
                     event_queue.put_nowait(None)
                 else:
-                    print(f"🔵 [AZURE] on_session_stopped - will recreate recognizer")
                     event_queue.put_nowait({"type": "_recreate"})
             
             def on_session_started(evt):
-                print(f"🟢 [AZURE] on_session_started! session_id={evt.session_id}")
+                state["session_started"] = True
             
             recognizer.session_started.connect(on_session_started)
             recognizer.recognizing.connect(on_recognizing)
@@ -559,74 +518,69 @@ class AzureSpeechRepository(ISpeechRepository):
             return recognizer, push_stream
         
         async def pump_to_stream(push_stream, stop_event: asyncio.Event):
-            """Pump audio from queue to push stream until stop event."""
+            """Pump audio from queue to push stream."""
             buffer = bytearray()
-            # Reduce MIN_PUSH to 3200 bytes (~100ms) for lower latency
             MIN_PUSH = 3200
-            push_count = 0
             
             while not stop_event.is_set():
                 try:
-                    # Shorter timeout for more responsive pumping
                     chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.05)
                 except asyncio.TimeoutError:
-                    # Even if no new chunk, push any buffered audio to reduce latency
                     if len(buffer) >= MIN_PUSH // 2:
-                        push_data = bytes(buffer)
+                        push_stream.write(bytes(buffer))
                         buffer.clear()
-                        push_stream.write(push_data)
-                        push_count += 1
                     continue
                 
                 if chunk is None:
-                    # End of audio
                     break
                 
                 buffer.extend(chunk)
-                
-                # Push immediately when we have enough data
                 while len(buffer) >= MIN_PUSH:
-                    push_data = bytes(buffer[:MIN_PUSH])
+                    push_stream.write(bytes(buffer[:MIN_PUSH]))
                     del buffer[:MIN_PUSH]
-                    push_stream.write(push_data)
-                    push_count += 1
-                    
-                    if push_count == 1:
-                        print(f"🔵 [AZURE] First buffer pushed | size={len(push_data)} bytes")
             
-            # Push remaining
             if buffer:
                 push_stream.write(bytes(buffer))
             
             with contextlib.suppress(Exception):
                 push_stream.close()
         
-        # Start audio collector
-        collector_task = asyncio.create_task(audio_collector())
-        
         recognizer = None
         push_stream = None
         pump_task = None
+        collector_task = None
         stop_pump = asyncio.Event()
         
         try:
-            # Create initial recognizer
-            recognizer, push_stream = create_recognizer_and_pump()
-            print(f"🔵 [AZURE] Starting continuous recognition...")
-            recognizer.start_continuous_recognition_async()
+            recognizer, push_stream = create_recognizer()
+            
+            # Start recognition
+            result = recognizer.start_continuous_recognition_async()
+            result.get()
+            
+            # Wait for session start
+            wait_start = time.time()
+            while not state.get("session_started") and (time.time() - wait_start) < 5.0:
+                await asyncio.sleep(0.1)
+            
+            # Start tasks
             pump_task = asyncio.create_task(pump_to_stream(push_stream, stop_pump))
+            collector_task = asyncio.create_task(audio_collector())
+            
+            # Send ready event
+            yield {"type": "ready", "startup_time": time.time() - start_time}
             
             while state["recognition_active"]:
-                event = await event_queue.get()
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
                 
                 if event is None:
                     break
                 
                 if event.get("type") == "_recreate":
                     # Recreate recognizer
-                    print(f"🔄 [AZURE] Recreating recognizer...")
-                    
-                    # Stop old recognizer
                     stop_pump.set()
                     recognizer.stop_continuous_recognition_async()
                     if pump_task and not pump_task.done():
@@ -634,12 +588,10 @@ class AzureSpeechRepository(ISpeechRepository):
                         with contextlib.suppress(asyncio.CancelledError):
                             await pump_task
                     
-                    # Create new
                     stop_pump = asyncio.Event()
-                    recognizer, push_stream = create_recognizer_and_pump()
+                    recognizer, push_stream = create_recognizer()
                     recognizer.start_continuous_recognition_async()
                     pump_task = asyncio.create_task(pump_to_stream(push_stream, stop_pump))
-                    print(f"🟢 [AZURE] Recognizer recreated!")
                     continue
                 
                 yield event
@@ -656,12 +608,10 @@ class AzureSpeechRepository(ISpeechRepository):
                 with contextlib.suppress(asyncio.CancelledError):
                     await pump_task
             
-            if not collector_task.done():
+            if collector_task and not collector_task.done():
                 collector_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await collector_task
-            
-            print(f"🔵 [AZURE] recognize_stream END")
 
     def recognize_once(self, audio_bytes: bytes) -> str:
         """Perform one-shot speech recognition on audio bytes."""

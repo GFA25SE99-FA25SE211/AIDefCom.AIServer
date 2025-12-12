@@ -1912,8 +1912,25 @@ class VoiceService(IVoiceService):
             score_source = "mean" if score == mean_cosine else "sample"
             angle = mean_angle if score_source == "mean" else best_sample_angle
             
-            # Use display name if available, fallback to user_id
-            display_name = profile.get("name") or profile.get("user_id") or "Unknown"
+            # Use display name if available
+            # Check if name is actually a UUID (not a real name)
+            raw_name = profile.get("name") or ""
+            user_id_str = str(profile.get("user_id", ""))
+            
+            # Detect if name looks like a UUID or is same as user_id
+            is_uuid_like = (
+                len(raw_name) >= 32 and  # UUID length
+                raw_name.replace("-", "").isalnum() and
+                len(raw_name.replace("-", "")) == 32
+            ) or raw_name == user_id_str or not raw_name.strip()
+            
+            if is_uuid_like:
+                # Use short ID prefix instead of full UUID for readability
+                # e.g. "User-e7ed" instead of "e7ed355d-aafb-4bc9-947c-73789419e220"
+                short_id = user_id_str[:8] if len(user_id_str) >= 8 else user_id_str
+                display_name = f"User-{short_id}"
+            else:
+                display_name = raw_name
             
             candidates.append({
                 "id": profile["user_id"],

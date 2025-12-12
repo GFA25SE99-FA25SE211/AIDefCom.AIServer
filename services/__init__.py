@@ -2,6 +2,7 @@
 
 This module provides the main service classes for the application:
 - SpeechService: Speech-to-text streaming with speaker identification
+- OptimizedSpeechService: Low-latency STT with long-lived connections (recommended)
 - VoiceService: Voice authentication (enroll, verify, identify)
 - QuestionService: Question duplicate detection
 - RedisService: Redis cache operations

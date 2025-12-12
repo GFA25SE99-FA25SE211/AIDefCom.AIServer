@@ -40,16 +40,16 @@ def _get_optimal_workers(task_type: str = "cpu") -> int:
     cpu_count = os.cpu_count() or 2
     
     if task_type == "cpu":
-        # CPU-bound: use fewer workers to avoid context switching overhead
-        return min(4, max(2, cpu_count))
+        # CPU-bound: use more workers to handle concurrent requests
+        return min(8, max(4, cpu_count))
     elif task_type == "voice":
-        # Voice identification: very CPU-intensive, limit to 2-4
-        return min(4, max(2, cpu_count))
+        # Voice identification: increase to handle multiple concurrent identifications
+        return min(8, max(4, cpu_count))
     elif task_type == "io":
         # I/O-bound: can use more workers
-        return min(8, max(4, cpu_count * 2))
+        return min(16, max(8, cpu_count * 2))
     else:
-        return max(2, cpu_count)
+        return max(4, cpu_count)
 
 
 def get_cpu_executor() -> ThreadPoolExecutor:
@@ -127,9 +127,16 @@ async def run_cpu_bound(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs)
     if kwargs:
         # functools.partial handles kwargs
         func_with_kwargs = partial(func, *args, **kwargs)
-        return await loop.run_in_executor(executor, func_with_kwargs)
+        future = loop.run_in_executor(executor, func_with_kwargs)
     else:
-        return await loop.run_in_executor(executor, func, *args)
+        future = loop.run_in_executor(executor, func, *args)
+    
+    # Add timeout to prevent hanging
+    try:
+        return await asyncio.wait_for(future, timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error(f"CPU-bound task {func.__name__} timed out after 30s")
+        raise
 
 
 async def run_voice_bound(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -148,9 +155,16 @@ async def run_voice_bound(func: Callable[P, T], *args: P.args, **kwargs: P.kwarg
     
     if kwargs:
         func_with_kwargs = partial(func, *args, **kwargs)
-        return await loop.run_in_executor(executor, func_with_kwargs)
+        future = loop.run_in_executor(executor, func_with_kwargs)
     else:
-        return await loop.run_in_executor(executor, func, *args)
+        future = loop.run_in_executor(executor, func, *args)
+    
+    # Add timeout to prevent hanging
+    try:
+        return await asyncio.wait_for(future, timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.error(f"Voice-bound task {func.__name__} timed out after 15s")
+        raise
 
 
 async def run_io_bound(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -169,9 +183,16 @@ async def run_io_bound(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) 
     
     if kwargs:
         func_with_kwargs = partial(func, *args, **kwargs)
-        return await loop.run_in_executor(executor, func_with_kwargs)
+        future = loop.run_in_executor(executor, func_with_kwargs)
     else:
-        return await loop.run_in_executor(executor, func, *args)
+        future = loop.run_in_executor(executor, func, *args)
+    
+    # Add timeout to prevent hanging
+    try:
+        return await asyncio.wait_for(future, timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error(f"I/O-bound task {func.__name__} timed out after 30s")
+        raise
 
 
 def shutdown_executors() -> None:

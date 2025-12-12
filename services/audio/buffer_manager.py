@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncGenerator, Optional, Callable, Awaitable
 
 import numpy as np
@@ -107,7 +107,6 @@ class AudioBufferManager:
         Yields:
             Processed audio frames (noise-filtered if enabled)
         """
-        first_chunk_logged = False
         try:
             while True:
                 audio_data = await audio_queue.get()
@@ -120,45 +119,6 @@ class AudioBufferManager:
                     continue
                 
                 self._chunks_processed += 1
-                
-                # Debug: Log first chunk info to detect sample rate issues
-                if not first_chunk_logged and len(audio_data) >= 4:
-                    import struct
-                    import numpy as np
-                    first_chunk_logged = True
-                    # Analyze audio characteristics
-                    samples = np.frombuffer(audio_data[:min(len(audio_data), 640)], dtype=np.int16)
-                    if len(samples) > 0:
-                        rms = np.sqrt(np.mean(samples.astype(np.float32)**2))
-                        max_val = np.max(np.abs(samples))
-                        min_val = np.min(samples)
-                        mean_val = np.mean(samples)
-                        
-                        # Check for common audio format issues
-                        is_silent = rms < 50
-                        is_clipping = max_val > 30000
-                        is_dc_offset = abs(mean_val) > 1000
-                        
-                        print(f"🔊 [AUDIO] First chunk analysis:")
-                        print(f"   📦 Size: {len(audio_data)} bytes | Samples: {len(samples)}")
-                        print(f"   📊 RMS: {rms:.1f} | Max: {max_val} | Min: {min_val} | Mean: {mean_val:.1f}")
-                        print(f"   ⚙️ Expected: 16kHz, 16-bit mono PCM | frame_bytes={self.config.frame_bytes}")
-                        
-                        # First 10 sample values for debugging
-                        first_samples = samples[:10].tolist()
-                        print(f"   🔢 First 10 samples: {first_samples}")
-                        
-                        if is_silent:
-                            print(f"   ⚠️ WARNING: Audio is SILENT (RMS={rms:.1f})")
-                        if is_clipping:
-                            print(f"   ⚠️ WARNING: Audio near CLIPPING (max={max_val})")
-                        if is_dc_offset:
-                            print(f"   ⚠️ WARNING: DC OFFSET detected (mean={mean_val:.1f})")
-                        
-                        # Check if samples look like valid speech (non-zero, varying)
-                        unique_vals = len(set(samples[:100]))
-                        if unique_vals < 5:
-                            print(f"   ⚠️ WARNING: Low variation ({unique_vals} unique values) - possibly wrong format?")
                 
                 # Limit chunk size to prevent buffer overflow
                 if len(audio_data) > 8192:

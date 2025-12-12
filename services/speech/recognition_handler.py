@@ -11,7 +11,6 @@ import contextlib
 import hashlib
 import logging
 import time
-import functools
 from typing import AsyncGenerator, Dict, Any, Iterable, Optional, List, TYPE_CHECKING
 
 import numpy as np
@@ -30,7 +29,6 @@ from services.voice.speaker_tracker import MultiSpeakerTracker
 
 if TYPE_CHECKING:
     from services.interfaces.i_voice_service import IVoiceService
-    from services.interfaces.i_speech_service import ISpeechService
     from repositories.interfaces import IRedisService
     from repositories.interfaces import ISpeechRepository
 
@@ -163,20 +161,32 @@ class RecognitionStreamHandler:
         Yields:
             Recognition events
         """
-        print(f"🔵 [STT] handle_stream START | speaker={speaker_label} | filter={apply_noise_filter} | defense_session_id={defense_session_id}")
         logger.info(f"🎙️ Starting recognition stream (speaker={speaker_label}, filter={apply_noise_filter})")
         loop = asyncio.get_running_loop()
         
-        # Preload voice profiles if session provided
+        # Preload voice profiles FIRST - this is critical for correct speaker names
         preloaded_profiles: Optional[List[Dict[str, Any]]] = None
-        if defense_session_id and whitelist_user_ids:
-            preloaded_profiles = await self._preload_voice_profiles(
-                defense_session_id,
-                whitelist_user_ids,
-                user_info_map,
-            )
         
-        # Initialize managers
+        if defense_session_id and whitelist_user_ids and self.voice_service:
+            try:
+                preloaded_profiles = await asyncio.wait_for(
+                    self._preload_voice_profiles(
+                        defense_session_id,
+                        whitelist_user_ids,
+                        user_info_map,
+                    ),
+                    timeout=3.0  # 3 second timeout
+                )
+                if preloaded_profiles:
+                    logger.info(f"✅ Preloaded {len(preloaded_profiles)} voice profiles with display names")
+                    for p in preloaded_profiles:
+                        logger.info(f"   👤 {p.get('user_id')}: {p.get('name')}")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Voice profile preload timeout")
+            except Exception as e:
+                logger.warning(f"⚠️ Voice profile preload failed: {e}")
+        
+        # Initialize audio buffer
         buffer_config = AudioBufferConfig(
             sample_rate=self.sample_rate,
             history_seconds=self._config["history_seconds"],
@@ -185,13 +195,14 @@ class RecognitionStreamHandler:
         )
         audio_buffer = AudioBufferManager(config=buffer_config)
         
+        # Create speaker identification manager WITH preloaded profiles
         speaker_id_manager: Optional[SpeakerIdentificationManager] = None
         if self.voice_service:
             speaker_id_manager = SpeakerIdentificationManager(
                 voice_service=self.voice_service,
                 redis_service=self.redis_service,
                 config=SpeakerIdentificationConfig.from_app_config(),
-                preloaded_profiles=preloaded_profiles,
+                preloaded_profiles=preloaded_profiles,  # Already loaded
                 whitelist_user_ids=whitelist_user_ids,
             )
         
@@ -246,8 +257,14 @@ class RecognitionStreamHandler:
             
             if identify_task and not identify_task.done():
                 if blocking:
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await identify_task
+                    # Add timeout to prevent hanging
+                    try:
+                        await asyncio.wait_for(identify_task, timeout=3.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Identification task timeout, continuing...")
+                        identify_task.cancel()
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 else:
                     return
             
@@ -320,30 +337,19 @@ class RecognitionStreamHandler:
         
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
             """Stream audio chunks from buffer manager."""
-            chunk_count = 0
-            print(f"🔵 [STT] audio_chunk_stream starting...")
             async for chunk in audio_buffer.process_audio_stream(
                 audio_queue,
                 on_interruption_detected=on_interruption_detected,
                 on_sufficient_audio=on_sufficient_audio,
             ):
-                chunk_count += 1
-                if chunk_count == 1:
-                    print(f"🔵 [STT] First audio chunk yielded! size={len(chunk)} bytes")
-                elif chunk_count % 50 == 0:
-                    print(f"🔵 [STT] Audio chunks yielded: {chunk_count}")
                 yield chunk
-            print(f"🔵 [STT] audio_chunk_stream ended | total_chunks={chunk_count}")
         
         async def process_azure_events(azure_events: AsyncGenerator) -> None:
             """Process Azure recognition events."""
             result_count = 0
-            print(f"🔵 [STT] process_azure_events starting...")
             try:
                 async for event in azure_events:
                     event_type = event.get("type")
-                    if result_count == 0:
-                        print(f"🔵 [STT] First Azure event received! type={event_type}")
                     result_count += 1
                     
                     # Get current speaker info
@@ -355,9 +361,12 @@ class RecognitionStreamHandler:
                         current_user_id = None
                     
                     if event_type == "result":
-                        # Schedule identification on final results
-                        await schedule_identification(force=True, blocking=True)
-                        # Re-fetch speaker info AFTER identification completes
+                        # Schedule identification on final results (non-blocking to avoid hang)
+                        self._create_tracked_task(
+                            background_tasks,
+                            schedule_identification(force=True, blocking=False)
+                        )
+                        # Re-fetch speaker info (may not be updated yet, but that's ok)
                         if speaker_id_manager:
                             current_speaker = speaker_id_manager.current_speaker
                             current_user_id = speaker_id_manager.current_user_id
@@ -379,16 +388,8 @@ class RecognitionStreamHandler:
                     if event.get("text"):
                         raw_text = event["text"]
                         
-                        # DEBUG: Log raw Azure response
-                        if event_type == "result":
-                            print(f"🎯 [RAW AZURE] type={event_type} | raw_text='{raw_text}'")
-                        
                         if event_type == "result":
                             filtered_text = normalize_vietnamese_text(raw_text)
-                            
-                            # DEBUG: Log normalized text
-                            if filtered_text != raw_text:
-                                print(f"🔄 [NORMALIZE] '{raw_text}' → '{filtered_text}'")
                             
                             if not filtered_text.strip():
                                 event["type"] = "noise"

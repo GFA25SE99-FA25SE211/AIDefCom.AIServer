@@ -336,6 +336,9 @@ class SpeechService(ISpeechService):
             logger.info(f"🏠 Joined room {defense_session_id} | room_size={room_size}")
         
         # Send immediate connected confirmation to client (before any blocking operations)
+        import time
+        ws_connect_time = time.time()
+        
         try:
             await ws.send_json({
                 "type": "connected",
@@ -418,8 +421,10 @@ class SpeechService(ISpeechService):
         # This prevents saving incomplete transcripts when user reloads page
         should_save_to_db = False
         
-        # Audio queue and control (300 items = ~6s buffer at 50fps)
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=300)
+        # Audio queue - LARGE buffer to prevent audio loss during startup
+        # 1000 items @ 20ms chunks = 20 seconds of buffer
+        # This ensures no audio is lost while recognizer is initializing
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=1000)
         stop_event = asyncio.Event()
         
         # Ping task to keep connection alive
@@ -460,19 +465,18 @@ class SpeechService(ISpeechService):
                             if audio_chunk_count == 1:
                                 logger.info(f"🎤 First audio chunk received! size={len(data['bytes'])} bytes")
                             elif audio_chunk_count % 100 == 0:
-                                logger.info(f"🎤 Audio chunks received: {audio_chunk_count}")
+                                logger.debug(f"🎤 Audio chunks received: {audio_chunk_count}")
+                            
+                            # CRITICAL: Don't drop audio - use blocking put with timeout
+                            # This ensures we don't lose the first sentences
                             try:
-                                audio_queue.put_nowait(data["bytes"])
-                            except asyncio.QueueFull:
-                                # Drop oldest frame
-                                try:
-                                    _ = audio_queue.get_nowait()
-                                    audio_queue.put_nowait(data["bytes"])
-                                except asyncio.QueueEmpty:
-                                    try:
-                                        audio_queue.put_nowait(data["bytes"])
-                                    except asyncio.QueueFull:
-                                        logger.warning("Audio queue full, dropping frame")
+                                await asyncio.wait_for(
+                                    audio_queue.put(data["bytes"]),
+                                    timeout=1.0  # Wait up to 1s for queue space
+                                )
+                            except asyncio.TimeoutError:
+                                # Queue is really stuck - this shouldn't happen with 1000 item queue
+                                logger.warning(f"⚠️ Audio queue blocked for 1s, queue_size={audio_queue.qsize()}")
                         
                         elif "text" in data:
                             # Text command (e.g., control messages: stop, q:start, q:end)
@@ -686,18 +690,27 @@ class SpeechService(ISpeechService):
             logger.info(f"🚀 Starting STT session | session_id={session_id} | defense_session_id={defense_session_id}")
             logger.info(f"🔧 voice_service={self.voice_service is not None} | question_service={self.question_service is not None}")
             
-            # Wait for whitelist fetch (with short timeout) - important for speaker identification!
-            if whitelist_fetch_task and not whitelist_fetch_task.done():
+            # MUST wait for whitelist to complete - this provides display names for speakers
+            # Without this, speakers will show as UUID instead of "Tên (Role)"
+            if whitelist_fetch_task:
                 try:
                     await asyncio.wait_for(whitelist_fetch_task, timeout=3.0)
-                    logger.info(f"✅ Whitelist ready: {len(whitelist_user_ids) if whitelist_user_ids else 0} users | IDs={whitelist_user_ids}")
+                    logger.info(f"✅ Whitelist loaded: {len(whitelist_user_ids) if whitelist_user_ids else 0} users")
+                    if user_info_map:
+                        for uid, info in user_info_map.items():
+                            logger.info(f"   👤 {uid}: {info.get('display_name')}")
                 except asyncio.TimeoutError:
-                    logger.warning("⚠️ Whitelist fetch timeout, proceeding without whitelist")
-            else:
-                logger.info(f"📋 Whitelist status: task={whitelist_fetch_task} | user_ids={whitelist_user_ids}")
+                    logger.warning("⚠️ Whitelist fetch timeout - speakers may show as IDs")
+                except Exception as e:
+                    logger.warning(f"⚠️ Whitelist fetch failed: {e}")
+            
+            # Check queue status before starting recognition
+            queue_size = audio_queue.qsize()
+            logger.info(f"📊 Audio queue status before recognition: {queue_size} items buffered")
             
             # Stream recognition results
             # Pass defense_session_id and user_info_map to enable voice profile preloading with display names
+            event_count = 0
             async for event in self.recognize_stream_from_queue(
                 audio_queue,
                 speaker_label=speaker_label,
@@ -706,6 +719,12 @@ class SpeechService(ISpeechService):
                 defense_session_id=defense_session_id,
                 user_info_map=user_info_map,
             ):
+                event_count += 1
+                if event_count == 1:
+                    logger.info(f"🎉 First recognition event received! type={event.get('type')}")
+                elif event_count % 50 == 0:
+                    logger.debug(f"📊 Recognition events: {event_count}")
+                    
                 # Check stop condition
                 if stop_event.is_set():
                     logger.debug("Stop event set, breaking recognition loop")
@@ -717,6 +736,20 @@ class SpeechService(ISpeechService):
                     break
                 
                 try:
+                    # Handle "ready" event - log timing and notify client
+                    if event.get("type") == "ready":
+                        ready_time = time.time() - ws_connect_time
+                        logger.info(f"🟢 STT ready! | total_startup={ready_time:.2f}s | azure_startup={event.get('startup_time', 0):.2f}s")
+                        # Send ready event to client so UI can show "listening..."
+                        if ws.application_state == WebSocketState.CONNECTED:
+                            await ws.send_json({
+                                "type": "ready",
+                                "session_id": session_id,
+                                "startup_time": ready_time,
+                                "message": "Ready to receive audio"
+                            })
+                        continue
+                    
                     # Check WS state before sending
                     if ws.application_state == WebSocketState.CONNECTED:
                         await ws.send_json(event)
