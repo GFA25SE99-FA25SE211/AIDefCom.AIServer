@@ -246,7 +246,7 @@ class RecognitionStreamHandler:
             
             if identify_task and not identify_task.done():
                 if blocking:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await identify_task
                 else:
                     return
@@ -315,7 +315,7 @@ class RecognitionStreamHandler:
             
             identify_task = asyncio.create_task(_run_identification())
             if blocking:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await identify_task
         
         async def audio_chunk_stream() -> AsyncGenerator[bytes, None]:
@@ -379,8 +379,16 @@ class RecognitionStreamHandler:
                     if event.get("text"):
                         raw_text = event["text"]
                         
+                        # DEBUG: Log raw Azure response
+                        if event_type == "result":
+                            print(f"🎯 [RAW AZURE] type={event_type} | raw_text='{raw_text}'")
+                        
                         if event_type == "result":
                             filtered_text = normalize_vietnamese_text(raw_text)
+                            
+                            # DEBUG: Log normalized text
+                            if filtered_text != raw_text:
+                                print(f"🔄 [NORMALIZE] '{raw_text}' → '{filtered_text}'")
                             
                             if not filtered_text.strip():
                                 event["type"] = "noise"
@@ -473,12 +481,12 @@ class RecognitionStreamHandler:
                 with contextlib.suppress(asyncio.CancelledError):
                     await azure_task
             
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await audio_stream.aclose()
             
             if identify_task and not identify_task.done():
                 identify_task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await identify_task
             
             for task in background_tasks:

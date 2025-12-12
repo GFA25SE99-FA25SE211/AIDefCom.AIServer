@@ -113,6 +113,92 @@ def normalize_vietnamese_text(text: str) -> str:
     # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text)
     
+    # === SYMBOL TO WORD CONVERSION ===
+    # Azure Speech sometimes outputs symbols instead of words
+    symbol_replacements = {
+        # Math/comparison symbols
+        "=": " bằng ",
+        " = ": " bằng ",
+        "+": " cộng ",
+        " + ": " cộng ",
+        "-": " trừ ",  # Be careful with hyphen in compound words
+        " - ": " trừ ",
+        "*": " nhân ",
+        " * ": " nhân ",
+        "/": " chia ",
+        " / ": " hoặc ",  # Context dependent
+        "%": " phần trăm ",
+        " % ": " phần trăm ",
+        ">": " lớn hơn ",
+        " > ": " lớn hơn ",
+        "<": " nhỏ hơn ",
+        " < ": " nhỏ hơn ",
+        ">=": " lớn hơn hoặc bằng ",
+        "<=": " nhỏ hơn hoặc bằng ",
+        "!=": " khác ",
+        "==": " bằng ",
+        "&": " và ",
+        " & ": " và ",
+    }
+    
+    for symbol, word in symbol_replacements.items():
+        if symbol in text:
+            text = text.replace(symbol, word)
+    
+    # === VIETNAMESE SLANG/ABBREVIATION TO FORMAL ===
+    # Common internet slang that Azure might transcribe
+    slang_replacements = {
+        # Internet slang
+        " hok ": " không ",
+        " hông ": " không ",
+        " hok bít ": " không biết ",
+        " hông bít ": " không biết ",
+        " bít ": " biết ",
+        " bit ": " biết ",
+        " z ": " vậy ",
+        " zậy ": " vậy ",
+        " j ": " gì ",
+        " gj ": " gì ",
+        " r ": " rồi ",
+        " ròi ": " rồi ",
+        " dc ": " được ",
+        " đc ": " được ",
+        " ko ": " không ",
+        " k ": " không ",
+        " kg ": " không ",
+        " hem ": " không ",
+        " hum ": " hôm ",
+        " nc ": " nói chuyện ",
+        " ns ": " nói ",
+        " ck ": " chồng ",
+        " vk ": " vợ ",
+        " iu ": " yêu ",
+        " lun ": " luôn ",
+        " trc ": " trước ",
+        " sau nay ": " sau này ",
+        " ntn ": " như thế nào ",
+        " sn ": " sinh nhật ",
+        " oke ": " được ",
+        " ok ": " được ",
+        " okie ": " được ",
+        
+        # Common typos/shortcuts
+        " bn ": " bạn ",
+        " mk ": " mình ",
+        " mik ": " mình ",
+        " m ": " mày ",  # Careful - context dependent
+        " t ": " tao ",  # Careful - context dependent
+        " nt ": " nhắn tin ",
+        " đt ": " điện thoại ",
+        " dt ": " điện thoại ",
+    }
+    
+    text_with_spaces = f" {text} "
+    for slang, formal in slang_replacements.items():
+        if slang in text_with_spaces.lower():
+            text_with_spaces = re.sub(re.escape(slang), formal, text_with_spaces, flags=re.IGNORECASE)
+    text = text_with_spaces.strip()
+    
     # === VIETNAMESE STT COMMON ERRORS ===
     # Words often misrecognized by Azure Speech
     replacements = {

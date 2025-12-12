@@ -115,5 +115,38 @@
     "clarification", "feedback", "recommendation",
     "điểm số", "chấm điểm", "nhận xét", "đề xuất cải thiện",
     "final score", "grade sheet"
+  ],
+  "vietnamese_academic": [
+    "nghiên cứu", "phân tích", "đánh giá", "khảo sát", "thực nghiệm",
+    "phương pháp nghiên cứu", "cơ sở lý thuyết", "kết quả nghiên cứu",
+    "kết luận", "kiến nghị", "hạn chế", "hướng phát triển",
+    "tối ưu hóa", "tự động hóa", "chuyển đổi số", "số hóa",
+    "dữ liệu", "thời gian thực", "độ chính xác", "hiệu suất",
+    "mô hình", "thuật toán", "hệ thống", "ứng dụng",
+    "doanh nghiệp", "khách hàng", "người dùng", "đối tượng",
+    "chỉ số", "KPI", "phạm vi", "mục tiêu", "yêu cầu",
+    "thiết kế", "triển khai", "kiểm thử", "bảo trì",
+    "giao diện", "chức năng", "tính năng", "module",
+    "lưu trữ", "xử lý", "truyền tải", "đồng bộ",
+    "bảo mật", "xác thực", "phân quyền", "mã hóa"
+  ],
+  "vietnamese_connectors": [
+    "trong bối cảnh", "với mục đích", "nhằm mục đích",
+    "đề tài này", "nghiên cứu này", "hệ thống này",
+    "tập trung vào", "hướng tới", "đáp ứng",
+    "bao gồm", "cụ thể là", "ví dụ như",
+    "ngoài ra", "bên cạnh đó", "hơn nữa",
+    "tuy nhiên", "mặc dù vậy", "ngược lại",
+    "do đó", "vì vậy", "kết quả là",
+    "cuối cùng", "tóm lại", "nhìn chung"
+  ],
+  "common_business_terms": [
+    "doanh nghiệp nhỏ", "doanh nghiệp vừa", "doanh nghiệp lớn",
+    "chi phí thấp", "hiệu quả cao", "thời gian ngắn",
+    "giải pháp", "công cụ", "nền tảng", "dịch vụ",
+    "phân tích dữ liệu", "báo cáo", "thống kê",
+    "thu thập dữ liệu", "xử lý dữ liệu", "hiển thị dữ liệu",
+    "cloud", "on-premise", "hybrid", "SaaS",
+    "API", "microservice", "REST", "GraphQL"
   ]
 }
