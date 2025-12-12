@@ -175,6 +175,15 @@ class SpeakerIdentificationManager:
         self._identify_task: Optional[asyncio.Task] = None
         self._last_identify_ts: float = 0.0
     
+    def set_preloaded_profiles(self, profiles: List[Dict[str, Any]]) -> None:
+        """Set preloaded profiles after async loading.
+        
+        This allows profiles to be loaded in background while recognition
+        starts immediately, reducing startup delay.
+        """
+        self.preloaded_profiles = profiles
+        logger.debug(f"Set {len(profiles)} preloaded profiles")
+    
     def _score_to_confidence(self, score: Optional[float]) -> Optional[str]:
         """Map cosine similarity score to confidence level."""
         if score is None:
@@ -317,31 +326,37 @@ class SpeakerIdentificationManager:
         """Run voice identification in thread pool.
         
         Uses shared voice executor from core.executors to avoid blocking event loop.
-        
-        NOTE: pre_filtered=False because AudioBufferManager no longer applies
-        noise filtering (to preserve audio quality for Azure Speech).
-        VoiceService will apply its own noise filter for embedding extraction.
         """
         try:
-            if self.preloaded_profiles is not None:
-                # Fast path: use preloaded profiles
-                result = await run_voice_bound(
-                    self.voice_service.identify_speaker_with_cache,
-                    wav_bytes,
-                    preloaded_profiles=self.preloaded_profiles,
-                    pre_filtered=False,  # Let VoiceService filter for embedding extraction
+            if self.preloaded_profiles is not None and len(self.preloaded_profiles) > 0:
+                # Fast path: use preloaded profiles (has correct display names)
+                result = await asyncio.wait_for(
+                    run_voice_bound(
+                        self.voice_service.identify_speaker_with_cache,
+                        wav_bytes,
+                        preloaded_profiles=self.preloaded_profiles,
+                        pre_filtered=False,
+                    ),
+                    timeout=5.0
                 )
             else:
-                # Slow path: load profiles on-demand
-                result = await run_voice_bound(
-                    self.voice_service.identify_speaker,
-                    wav_bytes,
-                    whitelist_user_ids=self.whitelist_user_ids,
-                    pre_filtered=False,  # Let VoiceService filter for embedding extraction
+                # Slow path: load profiles on-demand (may not have display names)
+                logger.warning("⚠️ No preloaded profiles - using slow identification path")
+                result = await asyncio.wait_for(
+                    run_voice_bound(
+                        self.voice_service.identify_speaker,
+                        wav_bytes,
+                        whitelist_user_ids=self.whitelist_user_ids,
+                        pre_filtered=False,
+                    ),
+                    timeout=8.0
                 )
             
             return result
         
+        except asyncio.TimeoutError:
+            logger.warning("Voice identification timed out")
+            return None
         except Exception as exc:
             logger.warning(f"Voice identification failed: {exc}")
             return None

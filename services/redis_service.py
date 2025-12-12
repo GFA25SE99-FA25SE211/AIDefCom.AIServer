@@ -85,12 +85,16 @@ class RedisService(IRedisService):
             return None
         
         try:
-            value = await self.client.get(key)
+            # Add explicit timeout to prevent hanging
+            value = await asyncio.wait_for(self.client.get(key), timeout=5.0)
             if value:
                 result = json.loads(value)
                 print(f"✅ [REDIS] GET '{key}' - Found {len(result) if isinstance(result, list) else 'value'}")
                 return result
             print(f"📭 [REDIS] GET '{key}' - Key not found (empty)")
+            return None
+        except asyncio.TimeoutError:
+            print(f"⚠️ [REDIS] GET '{key}' - TIMEOUT")
             return None
         except Exception as e:
             print(f"❌ [REDIS] GET '{key}' - Error: {e}")
@@ -114,14 +118,24 @@ class RedisService(IRedisService):
             serialized = json.dumps(value, ensure_ascii=False)
             ttl_seconds = ttl if ttl is not None else Config.REDIS_TTL_SECONDS
             
+            # Add explicit timeout to prevent hanging
             if ttl_seconds > 0:
-                await self.client.setex(key, ttl_seconds, serialized)
+                await asyncio.wait_for(
+                    self.client.setex(key, ttl_seconds, serialized),
+                    timeout=5.0
+                )
             else:
-                await self.client.set(key, serialized)
+                await asyncio.wait_for(
+                    self.client.set(key, serialized),
+                    timeout=5.0
+                )
             
             item_count = len(value) if isinstance(value, list) else 1
             print(f"✅ [REDIS] SET '{key}' - Saved {item_count} items, TTL={ttl_seconds}s")
             return True
+        except asyncio.TimeoutError:
+            print(f"⚠️ [REDIS] SET '{key}' - TIMEOUT")
+            return False
         except Exception as e:
             print(f"❌ [REDIS] SET '{key}' - Error: {e}")
             return False
