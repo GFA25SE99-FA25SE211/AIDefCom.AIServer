@@ -23,13 +23,16 @@ class AudioBufferConfig:
     
     sample_rate: int = 16000
     frame_duration_ms: int = 20  # 20ms frames
-    history_seconds: float = 5.0  # Keep 5s of audio history
+    history_seconds: float = 3.0  # Reduced from 5s to save memory
     min_identify_seconds: float = 2.0  # Minimum audio for speaker ID
     apply_noise_filter: bool = True
     
     # Interruption detection
     energy_spike_threshold: float = 1.5
     acoustic_change_threshold: float = 0.3
+    
+    # Memory limits
+    max_frame_buffer_bytes: int = 32000  # ~1 second max frame buffer
     
     @property
     def frame_samples(self) -> int:
