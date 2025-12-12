@@ -283,15 +283,11 @@ class QuestionService(IQuestionService):
         key = self._get_session_key(session_id)
         questions = await self.redis_service.get(key)
         
-        print(f"🔍 [Q] check_duplicate | session={session_id} | key={key} | existing_count={len(questions) if questions else 0}")
+        logger.debug(f"check_duplicate | session={session_id} | existing_count={len(questions) if questions else 0}")
         
         if not questions:
-            print(f"⚠️ [Q] No existing questions in Redis for session={session_id}")
+            logger.debug(f"No existing questions in Redis for session={session_id}")
             return False, []
-        
-        # Log existing questions for debugging
-        for i, q in enumerate(questions):
-            print(f"  📋 [Q] Existing[{i}]: '{q.get('text', '')[:50]}...'")
         
         # Get cached embeddings for this session (with timestamp)
         cached_entry = self._embedding_cache.get(session_id)
@@ -408,7 +404,7 @@ class QuestionService(IQuestionService):
             
             is_dup, similar = await self.check_duplicate(session_id, question_text, threshold, semantic_threshold)
             
-            print(f"🔍 [Q] Duplicate check result: is_dup={is_dup}, similar_count={len(similar)}")
+            logger.debug(f"Duplicate check: is_dup={is_dup}, similar_count={len(similar)}")
             
             registered = False
             question_id = None
@@ -417,9 +413,9 @@ class QuestionService(IQuestionService):
                 reg = await self.register_question(session_id, question_text, speaker=speaker, timestamp=timestamp)
                 registered = reg.get("success", False)
                 question_id = reg.get("question_id")
-                print(f"✅ [Q] Registered question #{question_id} | total now: {reg.get('total_questions')}")
+                logger.info(f"Registered question #{question_id} | total: {reg.get('total_questions')}")
             else:
-                print(f"⚠️ [Q] NOT registering duplicate question | similar: {[s['text'][:30] for s in similar]}")
+                logger.debug(f"Not registering duplicate | similar_count={len(similar)}")
             
             existing = await self.get_questions(session_id)
             

@@ -4,8 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
+import sys
 import warnings
 from contextlib import asynccontextmanager
+
+# Configure logging FIRST - before any other imports
+# This ensures all loggers inherit this configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+# Set specific loggers to appropriate levels
+logging.getLogger("azure").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # Suppress torchcodec warnings before any pyannote imports
 warnings.filterwarnings("ignore", message=".*torchcodec.*", category=UserWarning)
@@ -22,6 +40,8 @@ from app.config import Config
 from api.routers import speech_router, voice_router, question_router
 from core.health import get_comprehensive_health
 from core.metrics import websocket_connections
+
+logger = logging.getLogger(__name__)
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -60,21 +80,21 @@ async def background_warmup():
         
         # Stage 1.5: Pre-connect Redis (avoid delay on first request)
         _warmup_status = {"stage": "connecting_redis", "progress": 15, "error": None}
-        print("🔌 [Warmup] Connecting to Redis...")
+        logger.info("[Warmup] Connecting to Redis...")
         try:
             from api.dependencies import get_redis_service
             redis_svc = get_redis_service()
             await asyncio.wait_for(redis_svc._ensure_connection(), timeout=10.0)
             if redis_svc.client:
-                print("✅ [Warmup] Redis connected")
+                logger.info("[Warmup] Redis connected")
             else:
-                print("⚠️ [Warmup] Redis not available, continuing without cache")
+                logger.warning("[Warmup] Redis not available, continuing without cache")
         except Exception as e:
-            print(f"⚠️ [Warmup] Redis warmup skipped: {e}")
+            logger.warning(f"[Warmup] Redis warmup skipped: {e}")
         
         # Stage 2: Load embedding model (Pyannote/WeSpeaker) - IN THREAD POOL
         _warmup_status = {"stage": "loading_voice_model", "progress": 20, "error": None}
-        print("🔄 [Warmup] Loading voice model...")
+        logger.info("[Warmup] Loading voice model...")
         start = time.time()
         
         def _load_voice_model():
@@ -84,38 +104,38 @@ async def background_warmup():
         await asyncio.wait_for(_run_sync(_load_voice_model), timeout=120.0)
         gc.collect()
         
-        print(f"✅ [Warmup] Voice model loaded in {time.time() - start:.1f}s")
+        logger.info(f"[Warmup] Voice model loaded in {time.time() - start:.1f}s")
         
         # Stage 3: Load voice service (uses model from stage 2) - IN THREAD POOL
         _warmup_status = {"stage": "loading_voice_service", "progress": 50, "error": None}
-        print("🔄 [Warmup] Initializing voice service...")
+        logger.info("[Warmup] Initializing voice service...")
         
         def _load_voice_service():
             from api.dependencies import get_voice_service
             return get_voice_service()
         
         voice_service = await asyncio.wait_for(_run_sync(_load_voice_service), timeout=30.0)
-        print("✅ [Warmup] Voice service initialized")
+        logger.info("[Warmup] Voice service initialized")
         
         # Stage 4: Preload voice profiles - IN THREAD POOL (has blocking blob I/O)
         _warmup_status = {"stage": "preloading_profiles", "progress": 60, "error": None}
-        print("🔄 [Warmup] Preloading voice profiles...")
+        logger.info("[Warmup] Preloading voice profiles...")
         try:
             def _preload_profiles():
                 return voice_service.preload_enrolled_profiles()
             
             profile_count = await asyncio.wait_for(_run_sync(_preload_profiles), timeout=60.0)
-            print(f"✅ [Warmup] Preloaded {profile_count} voice profiles")
+            logger.info(f"[Warmup] Preloaded {profile_count} voice profiles")
         except asyncio.TimeoutError:
-            print("⚠️ [Warmup] Profile preload timeout (60s), skipping")
+            logger.warning("[Warmup] Profile preload timeout (60s), skipping")
         except Exception as e:
-            print(f"⚠️ [Warmup] Profile preload skipped: {e}")
+            logger.warning(f"[Warmup] Profile preload skipped: {e}")
         
         gc.collect()
         
         # Stage 5: Load semantic model for question service (~500MB) - IN THREAD POOL
         _warmup_status = {"stage": "loading_semantic_model", "progress": 75, "error": None}
-        print("🔄 [Warmup] Loading semantic model...")
+        logger.info("[Warmup] Loading semantic model...")
         start = time.time()
         
         def _load_semantic_model():
@@ -127,31 +147,31 @@ async def background_warmup():
         await asyncio.wait_for(_run_sync(_load_semantic_model), timeout=120.0)
         
         gc.collect()
-        print(f"✅ [Warmup] Semantic model loaded in {time.time() - start:.1f}s")
+        logger.info(f"[Warmup] Semantic model loaded in {time.time() - start:.1f}s")
         
         # Stage 6: Initialize speech service - IN THREAD POOL
         _warmup_status = {"stage": "loading_speech_service", "progress": 90, "error": None}
-        print("🔄 [Warmup] Initializing speech service...")
+        logger.info("[Warmup] Initializing speech service...")
         
         def _load_speech_service():
             from api.dependencies import get_speech_service
             return get_speech_service()
         
         await asyncio.wait_for(_run_sync(_load_speech_service), timeout=30.0)
-        print("✅ [Warmup] Speech service initialized")
+        logger.info("[Warmup] Speech service initialized")
         
         # Done!
         _warmup_status = {"stage": "complete", "progress": 100, "error": None}
         _warmup_complete.set()
-        print("🎉 [Warmup] All services ready!")
+        logger.info("[Warmup] All services ready!")
         
     except asyncio.TimeoutError as e:
         _warmup_status = {"stage": "timeout", "progress": _warmup_status.get("progress", 0), "error": str(e)}
-        print(f"⚠️ [Warmup] Timeout during warmup, continuing with partial initialization")
+        logger.warning("[Warmup] Timeout during warmup, continuing with partial initialization")
         _warmup_complete.set()
     except Exception as e:
         _warmup_status = {"stage": "error", "progress": 0, "error": str(e)}
-        print(f"❌ [Warmup] Failed: {e}")
+        logger.error(f"[Warmup] Failed: {e}")
         import traceback
         traceback.print_exc()
         # Still mark complete so requests don't hang forever
@@ -163,15 +183,15 @@ async def background_warmup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager with non-blocking warmup for ACA compatibility."""
-    print("🚀 Starting AIDefCom AI Service...")
+    logger.info("Starting AIDefCom AI Service...")
     
     # Initialize database connection pool (non-blocking, just creates the pool)
     try:
         from repositories.database import DatabasePool
         DatabasePool.initialize()
-        print("✅ Database connection pool initialized")
+        logger.info("Database connection pool initialized")
     except Exception as e:
-        print(f"⚠️ Database pool initialization skipped: {e}")
+        logger.warning(f"Database pool initialization skipped: {e}")
     
     # Start background warmup (non-blocking - allows health check to pass immediately)
     warmup_task = asyncio.create_task(background_warmup())
@@ -180,21 +200,21 @@ async def lifespan(app: FastAPI):
     
     # Cleanup
     warmup_task.cancel()
-    print("👋 Shutting down...")
+    logger.info("Shutting down...")
     
     # Shutdown database connection pool
     try:
         from repositories.database import DatabasePool
         DatabasePool.shutdown()
     except Exception as e:
-        print(f"⚠️ Error shutting down database pool: {e}")
+        logger.warning(f"Error shutting down database pool: {e}")
     
     # Shutdown all thread pool executors
     try:
         from core.executors import shutdown_executors
         shutdown_executors()
     except Exception as e:
-        print(f"⚠️ Error shutting down executors: {e}")
+        logger.warning(f"Error shutting down executors: {e}")
 
 
 # Create FastAPI app with lifespan manager

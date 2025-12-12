@@ -155,9 +155,6 @@ class AudioBufferManager:
                         if on_sufficient_audio and len(self._audio_history) >= self.config.min_identify_bytes:
                             await on_sufficient_audio()
                     
-                    # Yield control to event loop
-                    await asyncio.sleep(0)
-                    
                     yield chunk
             
             # Process remaining buffer
