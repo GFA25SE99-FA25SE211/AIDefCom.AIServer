@@ -209,13 +209,23 @@ class VoiceService(IVoiceService):
         
         # Override profile names with display_name from user_info_map (if provided)
         if user_info_map:
+            logger.info(f"🏷️ Applying display names from user_info_map: {list(user_info_map.keys())}")
             for profile in profiles:
                 user_id = profile.get("user_id")
                 if user_id and user_id in user_info_map:
                     info = user_info_map[user_id]
+                    old_name = profile.get("name")
+                    new_name = info.get("display_name") or info.get("name") or profile.get("name")
                     # Use display_name: "Tên (Vai trò)" for speaker identification
-                    profile["name"] = info.get("display_name") or info.get("name") or profile.get("name")
+                    profile["name"] = new_name
                     profile["role"] = info.get("role", "")
+                    logger.info(f"🏷️ Profile {user_id}: '{old_name}' -> '{new_name}' (role={profile['role']})")
+                else:
+                    logger.warning(f"⚠️ Profile {user_id} not in user_info_map, keeping name='{profile.get('name')}'")
+        else:
+            logger.warning("⚠️ No user_info_map provided, using profile names as-is")
+            for profile in profiles:
+                logger.info(f"📋 Profile: user_id={profile.get('user_id')}, name='{profile.get('name')}'")
         
         # Cache for this session
         self._session_profiles_cache[cache_key] = profiles
@@ -1758,9 +1768,12 @@ class VoiceService(IVoiceService):
             score_source = "mean" if score == mean_cosine else "sample"
             angle = mean_angle if score_source == "mean" else best_sample_angle
             
+            # Use display name if available, fallback to user_id
+            display_name = profile.get("name") or profile.get("user_id") or "Unknown"
+            
             candidates.append({
                 "id": profile["user_id"],
-                "name": profile.get("name", profile["user_id"]),
+                "name": display_name,
                 "user_id": profile.get("user_id"),
                 "cosine": score,
                 "angle": angle,
