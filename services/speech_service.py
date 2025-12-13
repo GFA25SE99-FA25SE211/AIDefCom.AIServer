@@ -328,6 +328,8 @@ class SpeechService(ISpeechService):
         
         # === USE defense_session_id FOR TRANSCRIPT CACHE (enables resume after reload) ===
         transcript_cache_key = f"transcript:defense:{defense_session_id}" if defense_session_id else f"transcript:session:{session_id}"
+        # Key to track if transcript has been saved to DB (prevents duplicate saves)
+        transcript_saved_key = f"transcript:saved:{defense_session_id}" if defense_session_id else None
         
         # Join room for this defense session (enables broadcast)
         if defense_session_id:
@@ -935,9 +937,10 @@ class SpeechService(ISpeechService):
                         f"Transcript collected | session_id={session_id} | lines={len(transcript_lines)} | duration={duration_seconds:.1f}s"
                     )
 
-                    # Save to external API endpoint: POST /api/transcripts with retry (diagnostic logging)
+                    # Save to external API endpoint: PUT /api/transcripts/{sessionId} (UPSERT - unique per session)
                     # IMPORTANT: Requires valid numeric defense_session_id (FK to DefenseSession table)
                     # IMPORTANT: Only save when should_save_to_db=True (session:end or save:transcript command)
+                    # IMPORTANT: Uses PUT for upsert to ensure only ONE transcript per defense_session_id
                     if not should_save_to_db:
                         logger.info(
                             f"💡 Skip DB save: no save command received (user may have reloaded) | "
@@ -951,65 +954,110 @@ class SpeechService(ISpeechService):
                         )
                         logger.info("💡 Transcript cached in Redis only (no database save)")
                     else:
-                        try:
-                            from app.config import Config
-                            import httpx
+                        # Check if transcript was already saved for this defense session (prevents duplicate saves)
+                        already_saved = False
+                        if transcript_saved_key and self.redis_service:
+                            try:
+                                saved_flag = await self.redis_service.get(transcript_saved_key)
+                                if saved_flag:
+                                    already_saved = True
+                                    logger.info(
+                                        f"💡 Skip DB save: transcript already saved for defense_session_id={defense_session_id} | "
+                                        f"saved_at={saved_flag.get('saved_at') if isinstance(saved_flag, dict) else saved_flag}"
+                                    )
+                            except Exception as check_err:
+                                logger.warning(f"Failed to check saved flag: {check_err}")
+                        
+                        if not already_saved:
+                            try:
+                                from app.config import Config
+                                import httpx
 
-                            api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts"
-                            session_id_int = int(defense_session_id)
+                                session_id_int = int(defense_session_id)
+                                # Use PUT for upsert - ensures only ONE transcript per session (no duplicates/drafts)
+                                api_url = f"{Config.AUTH_SERVICE_BASE_URL}/api/transcripts/{session_id_int}"
 
-                            payload = {
-                                "sessionId": session_id_int,
-                                "transcriptText": full_text,
-                                "isApproved": True,
-                            }
+                                # Payload matches PUT /api/transcripts/{id} spec
+                                # id is in URL path, body only needs: transcriptText, isApproved, status
+                                payload = {
+                                    "transcriptText": full_text,
+                                    "isApproved": True,
+                                    "status": "Approved",
+                                }
 
-                            logger.info(
-                                f"📤 Attempting transcript save | defense_session_id={session_id_int} | chars={len(full_text)}"
-                            )
+                                logger.info(
+                                    f"📤 Attempting transcript UPSERT (PUT) | defense_session_id={session_id_int} | chars={len(full_text)}"
+                                )
 
-                            saved = False
-                            last_error = None
-                            for attempt in range(3):
-                                try:
-                                    async with httpx.AsyncClient(
-                                        verify=Config.AUTH_SERVICE_VERIFY_SSL,
-                                        timeout=Config.AUTH_SERVICE_TIMEOUT,
-                                    ) as client:
-                                        response = await client.post(api_url, json=payload)
-                                    if response.status_code in (200, 201):
-                                        logger.info(
-                                            f"✅ Saved transcript | attempt={attempt+1} status={response.status_code}"
-                                        )
-                                        saved = True
-                                        break
-                                    else:
-                                        last_error = f"HTTP {response.status_code}: {response.text}"
+                                saved = False
+                                last_error = None
+                                for attempt in range(3):
+                                    try:
+                                        async with httpx.AsyncClient(
+                                            verify=Config.AUTH_SERVICE_VERIFY_SSL,
+                                            timeout=Config.AUTH_SERVICE_TIMEOUT,
+                                        ) as client:
+                                            # PUT for upsert - update if exists, create if not
+                                            response = await client.put(api_url, json=payload)
+                                        if response.status_code in (200, 201, 204):
+                                            logger.info(
+                                                f"✅ Saved transcript (UPSERT) | attempt={attempt+1} status={response.status_code}"
+                                            )
+                                            saved = True
+                                            break
+                                        else:
+                                            last_error = f"HTTP {response.status_code}: {response.text}"
+                                            if attempt < 2:
+                                                logger.warning(
+                                                    f"⚠️ Retry {attempt+1}/3 saving transcript | status={response.status_code}"
+                                                )
+                                                await asyncio.sleep(2 ** attempt)
+                                    except Exception as req_err:
+                                        last_error = str(req_err)
                                         if attempt < 2:
                                             logger.warning(
-                                                f"⚠️ Retry {attempt+1}/3 saving transcript | status={response.status_code}"
+                                                f"⚠️ Retry {attempt+1}/3 error: {req_err}"
                                             )
                                             await asyncio.sleep(2 ** attempt)
-                                except Exception as req_err:
-                                    last_error = str(req_err)
-                                    if attempt < 2:
-                                        logger.warning(
-                                            f"⚠️ Retry {attempt+1}/3 error: {req_err}"
-                                        )
-                                        await asyncio.sleep(2 ** attempt)
 
-                            if not saved:
-                                logger.error(
-                                    f"❌ Failed to save transcript after retries | defense_session_id={session_id_int} | error={last_error}"
-                                )
-                        except Exception as api_err:
-                            logger.exception(f"Critical error saving transcript: {api_err}")
+                                if saved:
+                                    # Mark transcript as saved in Redis (prevents duplicate saves on reconnect)
+                                    if transcript_saved_key and self.redis_service:
+                                        try:
+                                            await self.redis_service.set(
+                                                transcript_saved_key,
+                                                {
+                                                    "saved_at": datetime.utcnow().isoformat(),
+                                                    "defense_session_id": defense_session_id,
+                                                    "lines_count": len(transcript_lines),
+                                                    "chars_count": len(full_text),
+                                                },
+                                                ttl=86400 * 7,  # Keep flag for 7 days
+                                            )
+                                            logger.info(f"🔒 Marked transcript as saved in Redis | key={transcript_saved_key}")
+                                        except Exception as flag_err:
+                                            logger.warning(f"Failed to set saved flag: {flag_err}")
+                                else:
+                                    logger.error(
+                                        f"❌ Failed to save transcript after retries | defense_session_id={session_id_int} | error={last_error}"
+                                    )
+                            except Exception as api_err:
+                                logger.exception(f"Critical error saving transcript: {api_err}")
 
                     # Cache final transcript (only if we had valid content)
                     try:
-                        await self.redis_service.set(transcript_cache_key, transcript_data, ttl=86400)
-                        # Also cache with :final suffix for explicit final version
+                        # Only keep :final version after session ends (remove draft to prevent confusion)
                         await self.redis_service.set(f"{transcript_cache_key}:final", transcript_data, ttl=86400)
+                        # Clear the draft/partial cache to avoid duplicate processing
+                        if should_save_to_db:
+                            try:
+                                await self.redis_service.delete(transcript_cache_key)
+                                logger.info(f"🗑️ Cleared draft transcript cache | key={transcript_cache_key}")
+                            except Exception:
+                                pass  # Non-critical
+                        else:
+                            # Keep draft for potential resume if not saved to DB
+                            await self.redis_service.set(transcript_cache_key, transcript_data, ttl=86400)
                     except Exception as cache_err:
                         logger.warning(f"Failed to cache final transcript: {cache_err}")
 
