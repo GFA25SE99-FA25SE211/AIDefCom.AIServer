@@ -408,7 +408,11 @@ ws.send("stop");
 ws.close();
 ```
 
-**Note:** Khi kết thúc session, backend sẽ cố gắng lưu transcript vào external API `/api/transcripts` với tối đa 3 lần thử nội tuyến (best-effort). Nếu vẫn thất bại, lỗi sẽ được ghi log; không có cơ chế retry nền.
+**Note:** 
+- Khi kết thúc session (`session:end`), backend sẽ gọi **PUT** `/api/transcripts/{sessionId}` để **upsert** transcript (update nếu đã có, create nếu chưa).
+- Đảm bảo **chỉ có 1 bản transcript duy nhất** cho mỗi defense session - không tạo draft hay duplicate.
+- Có tối đa 3 lần retry nội tuyến. Nếu thất bại, lỗi sẽ được ghi log.
+- Trạng thái "đã lưu" được cache trong Redis để tránh lưu trùng khi user reconnect.
 
 #### Audio Requirements
 - **Format:** PCM 16-bit, mono
