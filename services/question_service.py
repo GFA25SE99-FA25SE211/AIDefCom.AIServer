@@ -1,10 +1,12 @@
 """Question duplicate detection service using Redis and fuzzy matching."""
 import asyncio
 import gc
+import json
 import logging
 import string
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -23,11 +25,61 @@ MAX_EMBEDDING_CACHE_SESSIONS = 30  # Max sessions to cache embeddings
 LOCK_TTL_SECONDS = 3600  # 1 hour TTL for session locks
 
 
+def _load_opposite_keywords() -> List[Tuple[str, str]]:
+    """Load opposite keywords from JSON config file."""
+    config_path = Path(__file__).parent.parent / "data" / "opposite_keywords.json"
+    
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        keywords = []
+        for category in ["vietnamese", "technical", "technologies"]:
+            if category in data:
+                keywords.extend([tuple(pair) for pair in data[category]])
+        
+        logger.info(f"Loaded {len(keywords)} opposite keyword pairs from {config_path}")
+        return keywords
+    except Exception as e:
+        logger.warning(f"Failed to load opposite keywords from {config_path}: {e}")
+        return []
+
+
+# Load keywords at module level (cached)
+OPPOSITE_KEYWORDS: List[Tuple[str, str]] = _load_opposite_keywords()
+
+
 def _normalize_text_sync(text: str) -> str:
     """Normalize text for comparison (sync, CPU-bound)."""
     text = text.lower().strip()
     text = text.translate(str.maketrans('', '', string.punctuation))
     return ' '.join(text.split())
+
+
+def _has_opposite_keywords(text1: str, text2: str) -> bool:
+    """Check if two texts contain opposite/different keywords.
+    
+    Returns True if the texts have keywords that indicate different questions,
+    even if they have similar structure.
+    """
+    t1_lower = text1.lower()
+    t2_lower = text2.lower()
+    
+    for kw1, kw2 in OPPOSITE_KEYWORDS:
+        # Check if one text has kw1 and the other has kw2
+        t1_has_kw1 = kw1 in t1_lower
+        t1_has_kw2 = kw2 in t1_lower
+        t2_has_kw1 = kw1 in t2_lower
+        t2_has_kw2 = kw2 in t2_lower
+        
+        # If text1 has kw1 but not kw2, and text2 has kw2 but not kw1 -> different
+        if (t1_has_kw1 and not t1_has_kw2) and (t2_has_kw2 and not t2_has_kw1):
+            return True
+        # Vice versa
+        if (t1_has_kw2 and not t1_has_kw1) and (t2_has_kw1 and not t2_has_kw2):
+            return True
+    
+    return False
 
 
 def _calculate_fuzzy_similarity_sync(text1: str, text2: str) -> float:
@@ -115,13 +167,30 @@ def _check_duplicates_with_index_sync(
         # Debug logging
         logger.info(f"🔍 Q: '{question_text[:40]}' vs '{text[:40]}' | fuzzy={fuzzy_score:.2f} | sem={cos:.2f}")
         
+        # Check for opposite keywords first (fast rejection)
+        has_opposite = _has_opposite_keywords(question_text, text)
+        if has_opposite:
+            logger.info(f"⚠️ Opposite keywords detected, skipping")
+            continue
+        
         # Vietnamese-optimized duplicate detection:
-        # - Use PASSED thresholds, not hardcoded values
-        # - Lower thresholds for Vietnamese (shorter sentences, similar words)
+        # Problem: Vietnamese questions often have similar structure but different keywords
+        # e.g., "Tại sao chọn React?" vs "Tại sao chọn Python?" have high fuzzy but low semantic
+        # 
+        # Solution: Require BOTH fuzzy AND semantic to be reasonably high
+        # - Fuzzy alone can miss paraphrases (different words, same meaning)
+        # - Semantic alone can miss keyword differences (same structure, different topic)
+        #
+        # Logic:
+        # 1. Very high semantic (>=0.83) = definitely same meaning, regardless of wording
+        # 2. High fuzzy (>=0.90) AND decent semantic (>=0.70) = nearly identical
+        # 3. Good fuzzy (>=0.55) AND good semantic (>=0.78) = same question rephrased
+        # 4. Moderate fuzzy (>=0.45) AND high semantic (>=0.82) = paraphrase with different words
         is_duplicate = (
-            (fuzzy_score >= 0.55 and cos >= semantic_threshold) or  # Both moderately high
-            fuzzy_score >= fuzzy_threshold or                        # Nearly identical wording
-            cos >= semantic_threshold + 0.10                         # Strong semantic similarity
+            cos >= 0.83 or                                           # Very high semantic = same meaning
+            (fuzzy_score >= 0.90 and cos >= 0.70) or                # Nearly identical wording + decent meaning
+            (fuzzy_score >= 0.55 and cos >= 0.78) or                # Good fuzzy + good semantic
+            (fuzzy_score >= 0.45 and cos >= 0.82)                   # Moderate fuzzy + high semantic
         )
         
         if is_duplicate:
