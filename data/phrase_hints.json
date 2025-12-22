@@ -1,5 +1,19 @@
 {
   "_comment": "Vietnamese phrase hints for Azure Speech recognition. Add domain-specific vocabulary here.",
+  "brand_names_acronyms": [
+    "AIDefCom", "AI Def Com", "AI Defense Committee",
+    "AI", "A.I.", "Artificial Intelligence",
+    "ML", "M.L.", "Machine Learning",
+    "NLP", "N.L.P.", "Natural Language Processing",
+    "STT", "S.T.T.", "Speech to Text",
+    "TTS", "T.T.S.", "Text to Speech",
+    "VAD", "V.A.D.", "Voice Activity Detection",
+    "ASR", "A.S.R.", "Automatic Speech Recognition",
+    "LLM", "L.L.M.", "Large Language Model",
+    "GPT", "G.P.T.", "ChatGPT", "OpenAI",
+    "Azure AI", "Azure Speech", "Azure Cognitive Services",
+    "trí tuệ nhân tạo", "học máy", "xử lý ngôn ngữ tự nhiên"
+  ],
   "common_words": [
     "xin chào", "cảm ơn", "vâng ạ", "dạ vâng", "được ạ", "không ạ",
     "vâng", "dạ", "ạ", "nhé", "nha", "à", "ừ", "ờ",
