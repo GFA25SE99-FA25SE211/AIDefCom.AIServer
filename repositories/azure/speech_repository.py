@@ -260,7 +260,7 @@ class AzureSpeechRepository(ISpeechRepository):
         except Exception:
             pass
         
-        self.speech_config.set_profanity(speechsdk.ProfanityOption.Raw)  # Don't mask - academic context
+        self.speech_config.set_profanity(speechsdk.ProfanityOption.Masked)
         
         self.speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold,
