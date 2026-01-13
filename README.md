@@ -1,41 +1,283 @@
-# API Documentation - AIDefCom AI Service
+# AIDefCom AI Service
 
-**Base URL:** `https://<your-app>.azurewebsites.net`  
-**Version:** 2.3.3  
-**Swagger UI:** `https://<your-app>.azurewebsites.net/docs`
+<div align="center">
+
+**Real-time Speech-to-Text + Voice Authentication + Question Duplicate Detection**
+
+[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](https://github.com/AIDefCom/AIServer)
+[![Python](https://img.shields.io/badge/python-3.11-green.svg)](https://www.python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-teal.svg)](https://fastapi.tiangolo.com)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
+</div>
 
 ---
 
 ## 📋 Table of Contents
-1. [Voice Authentication APIs](#voice-authentication-apis)
-2. [Speech-to-Text WebSocket](#speech-to-text-websocket)
-3. [Question Management APIs](#question-management-apis)
-4. [Health Check](#health-check)
-5. [Response Format Standards](#response-format-standards)
-6. [Error Codes](#error-codes)
+
+1. [Overview](#-overview)
+2. [Architecture](#-architecture)
+3. [Features](#-features)
+4. [Technology Stack](#-technology-stack)
+5. [Installation](#-installation)
+6. [Configuration](#-configuration)
+7. [API Reference](#-api-reference)
+   - [Voice Authentication APIs](#-voice-authentication-apis)
+   - [Speech-to-Text WebSocket](#-speech-to-text-websocket)
+   - [Question Management APIs](#-question-management-apis)
+   - [System Endpoints](#-system-endpoints)
+8. [Integration Examples](#-integration-examples)
+9. [Deployment](#-deployment)
+10. [Development](#-development)
 
 ---
 
-## 🎤 Voice Authentication APIs
+## 🎯 Overview
 
-### 1. Enroll Voice Sample
+**AIDefCom AI Service** là một microservice AI cung cấp 3 tính năng chính:
+
+| Feature | Description |
+|---------|-------------|
+| **🎤 Voice Authentication** | Đăng ký và xác thực người dùng qua giọng nói (Pyannote/WeSpeaker) |
+| **🎙️ Speech-to-Text** | Streaming STT real-time với Azure Cognitive Services + auto speaker identification |
+| **❓ Question Detection** | Phát hiện câu hỏi trùng lặp bằng fuzzy matching + semantic similarity |
+
+**Base URL:** `https://<your-app>.azurewebsites.net`  
+**Swagger UI:** `https://<your-app>.azurewebsites.net/docs`  
+**ReDoc:** `https://<your-app>.azurewebsites.net/redoc`
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         AIDefCom AI Service                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                │
+│  │   FastAPI   │  │  WebSocket  │  │  Prometheus │                │
+│  │   Router    │  │   Handler   │  │   Metrics   │                │
+│  └──────┬──────┘  └──────┬──────┘  └─────────────┘                │
+│         │                │                                         │
+│  ┌──────┴────────────────┴──────┐                                 │
+│  │         Service Layer        │                                 │
+│  │  ┌────────────────────────┐  │                                 │
+│  │  │ VoiceService           │  │  Pyannote/WeSpeaker Embeddings │
+│  │  │ SpeechService          │  │  Azure Speech SDK              │
+│  │  │ QuestionService        │  │  Sentence-Transformers         │
+│  │  │ RedisService           │  │  Caching & Session State       │
+│  │  └────────────────────────┘  │                                 │
+│  └──────────────────────────────┘                                 │
+│                │                                                   │
+│  ┌─────────────┴─────────────┐                                    │
+│  │      Repository Layer     │                                    │
+│  │  ┌──────────────────────┐ │                                    │
+│  │  │ AzureBlobRepository  │ │  Voice Profiles Storage           │
+│  │  │ SQLServerRepository  │ │  User Data                        │
+│  │  │ AzureSpeechRepository│ │  Speech Recognition               │
+│  │  └──────────────────────┘ │                                    │
+│  └───────────────────────────┘                                    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+        │                    │                    │
+        ▼                    ▼                    ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│  Azure Blob   │   │ Azure Cache   │   │  SQL Server   │
+│   Storage     │   │  for Redis    │   │               │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+---
+
+## ✨ Features
+
+### 🔐 Voice Authentication
+- **Enrollment**: Đăng ký mẫu giọng nói (tối thiểu 3 mẫu)
+- **Identification**: Nhận diện người nói 1:N (so sánh với tất cả users)
+- **Verification**: Xác thực giọng nói 1:1 (kiểm tra match với user cụ thể)
+- **Auto Speaker Detection**: Tự động nhận diện trong streaming STT
+
+### 🎙️ Speech-to-Text
+- **Real-time Streaming**: WebSocket với Azure Cognitive Services
+- **Vietnamese Optimized**: Tuned timeouts cho tiếng Việt
+- **Custom Speech Model**: Hỗ trợ Azure Custom Speech endpoint
+- **Multi-speaker Support**: Tự động detect và label speakers
+- **Transcript Caching**: Redis-backed transcript với auto-resume
+
+### ❓ Question Detection
+- **Fuzzy Matching**: RapidFuzz (ratio, token_sort, token_set)
+- **Semantic Similarity**: Sentence-Transformers embeddings
+- **Vietnamese Support**: Opposite keywords detection
+- **Session-based**: Questions grouped by session ID
+
+### ⚡ Performance & Scalability
+- **Lazy Model Loading**: Background warmup cho ACA health probes
+- **LRU Caching**: Memory-efficient embedding cache với TTL
+- **Connection Pooling**: SQL Server, Redis connection pools
+- **Rate Limiting**: SlowAPI với per-IP limits
+- **Prometheus Metrics**: Built-in observability
+
+---
+
+## 🛠️ Technology Stack
+
+| Category | Technology |
+|----------|------------|
+| **Framework** | FastAPI 0.100+, Uvicorn |
+| **Speech** | Azure Cognitive Services Speech SDK |
+| **Voice AI** | Pyannote.audio, WeSpeaker, PyTorch |
+| **NLP** | Sentence-Transformers, RapidFuzz |
+| **Cache** | Azure Cache for Redis (async) |
+| **Storage** | Azure Blob Storage, SQL Server |
+| **Monitoring** | Prometheus, Structlog |
+| **Container** | Docker (Python 3.11-slim) |
+
+---
+
+## 📦 Installation
+
+### Prerequisites
+- Python 3.11+
+- Redis (optional, for caching)
+- Azure Cognitive Services subscription
+- Azure Blob Storage account
+
+### Local Development
+
+```bash
+# Clone repository
+git clone https://github.com/AIDefCom/AIServer.git
+cd AIServer
+
+# Create virtual environment
+python -m venv venv
+venv\Scripts\activate  # Windows
+source venv/bin/activate  # Linux/Mac
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Copy environment template
+copy .env.example .env  # Windows
+cp .env.example .env    # Linux/Mac
+
+# Edit .env with your credentials
+notepad .env
+
+# Run server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Docker
+
+```bash
+# Build image
+docker build -t aidefcom-ai-service .
+
+# Run container
+docker run -p 8000:8000 --env-file .env aidefcom-ai-service
+```
+
+---
+
+## ⚙️ Configuration
+
+### Environment Variables
+
+Tạo file `.env` với các biến sau:
+
+#### Azure Speech Service (Required)
+```env
+AZURE_SPEECH_KEY=your_speech_key
+AZURE_SPEECH_REGION=southeastasia
+AZURE_SPEECH_CUSTOM_ENDPOINT_ID=  # Optional: Custom Speech model
+```
+
+#### Azure Cache for Redis (Optional)
+```env
+REDIS_HOST=your-cache.redis.cache.windows.net
+REDIS_PORT=6380
+REDIS_PASSWORD=your_redis_key
+REDIS_SSL=true
+REDIS_DB=0
+REDIS_TTL_SECONDS=3600
+```
+
+#### Azure Blob Storage (Required for voice profiles)
+```env
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;...
+AZURE_BLOB_CONTAINER_NAME=voice-sample
+```
+
+#### SQL Server (Optional)
+```env
+# Option 1: Connection string
+SQL_SERVER_CONNECTION_STRING=Server=...;Database=...;
+
+# Option 2: Individual parameters
+SQL_SERVER_HOST=your-server.database.windows.net
+SQL_SERVER_PORT=1433
+SQL_SERVER_DATABASE=your_database
+SQL_SERVER_USERNAME=your_user
+SQL_SERVER_PASSWORD=your_password
+```
+
+#### Auth Service Integration (Optional)
+```env
+AUTH_SERVICE_BASE_URL=https://your-auth-service.com/api
+AUTH_SERVICE_VERIFY_SSL=true
+AUTH_SERVICE_TIMEOUT=10
+```
+
+#### Voice Authentication Tuning
+```env
+# Thresholds
+VOICE_COSINE_THRESHOLD=0.50          # Main identification threshold
+VOICE_SPEAKER_LOCK_DECAY_SECONDS=8.0 # Speaker lock duration
+VOICE_SPEAKER_SWITCH_MARGIN=0.10     # Margin to switch speaker
+VOICE_SPEAKER_SWITCH_HITS_REQUIRED=4 # Confirmations before switch
+
+# Audio quality
+VOICE_MIN_DURATION=1.5               # Min audio duration (seconds)
+VOICE_MIN_ENROLL_DURATION=10.0       # Min enrollment audio
+VOICE_RMS_FLOOR=0.005                # Min RMS level
+VOICE_SNR_FLOOR_DB=8.0               # Min SNR (dB)
+```
+
+#### Azure Speech Timeouts (Vietnamese optimized)
+```env
+AZURE_SPEECH_SEGMENTATION_SILENCE_MS=1200  # Segmentation pause
+AZURE_SPEECH_INITIAL_SILENCE_MS=8000       # Wait for speech start
+AZURE_SPEECH_END_SILENCE_MS=800            # End of utterance
+```
+
+---
+
+## 📚 API Reference
+
+### 🔐 Voice Authentication APIs
+
+#### 1. Enroll Voice Sample
+
 **Endpoint:** `POST /voice/users/{user_id}/enroll`
 
-Đăng ký mẫu giọng nói cho một user. Cần tối thiểu **3 mẫu** để hoàn tất enrollment.
+Đăng ký mẫu giọng nói. Cần **tối thiểu 3 mẫu** để hoàn tất enrollment.
 
-#### Request
+**Request:**
 ```http
-POST /voice/users/{user_id}/enroll
+POST /voice/users/USR001/enroll
 Content-Type: multipart/form-data
 
 audio_file: <binary audio file>
 ```
 
-**Parameters:**
-- `user_id` (path, required): User ID cần enroll
-- `audio_file` (form-data, required): File audio (WAV/MP3/FLAC, max 10MB, khuyến nghị 3-5 giây)
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `user_id` | path | ✅ | User ID cần enroll |
+| `audio_file` | file | ✅ | Audio file (WAV/MP3/FLAC, max 6MB, ~3-5s) |
 
-#### Response
+**Response:**
 ```json
 {
   "type": "enrollment",
@@ -48,27 +290,21 @@ audio_file: <binary audio file>
 }
 ```
 
-**Response Fields:**
-- `success` (boolean): Thành công hay không.
-- `user_id` (string): User ID đã enroll
-- `enrollment_count` (int): Số mẫu đã có
-- `min_required` (int): Số mẫu tối thiểu cần (3)
-- `is_complete` (boolean): Đã đủ 3 mẫu chưa
-- `message` (string): Thông báo chi tiết
-
-#### Status Codes
-- `200`: Enrollment thành công
-- `400`: Audio không hợp lệ hoặc chất lượng kém
-- `500`: Lỗi server
+| Status | Description |
+|--------|-------------|
+| `200` | Enrollment successful |
+| `400` | Invalid audio, quality too low |
+| `504` | Processing timeout |
 
 ---
 
-### 2. Identify Speaker
+#### 2. Identify Speaker
+
 **Endpoint:** `POST /voice/identify`
 
-Nhận diện người nói từ mẫu giọng nói (so sánh với tất cả users đã enroll).
+Nhận diện người nói từ tất cả users đã enroll (1:N comparison).
 
-#### Request
+**Request:**
 ```http
 POST /voice/identify
 Content-Type: multipart/form-data
@@ -76,24 +312,21 @@ Content-Type: multipart/form-data
 audio_file: <binary audio file>
 ```
 
-**Parameters:**
-- `audio_file` (form-data, required): File audio cần nhận diện (WAV/MP3/FLAC, max 10MB)
-
-#### Response (Success - Identified)
+**Response (Match Found):**
 ```json
 {
   "type": "identification",
   "success": true,
   "identified": true,
   "speaker_id": "USR001",
-  "speaker_name": "Nguyen Van A",
-  "confidence": 0.92,
-  "score": 0.92,
+  "speaker_name": "Nguyễn Văn A",
+  "score": 0.88,
+  "confidence": 0.90,
   "message": "Speaker identified successfully"
 }
 ```
 
-#### Response (No Match)
+**Response (No Match):**
 ```json
 {
   "type": "identification",
@@ -101,47 +334,35 @@ audio_file: <binary audio file>
   "identified": false,
   "speaker_id": null,
   "speaker_name": null,
+  "score": 0.45,
   "confidence": 0.0,
-  "score": 0.58,
   "message": "No matching speaker found"
 }
 ```
 
-**Response Fields:**
-- `identified` (boolean): Có nhận diện được hay không
-- `speaker_id` (string|null): User ID của người được nhận diện
-- `speaker_name` (string|null): Tên hiển thị
-- `confidence` (float): Độ tin cậy (0-1)
-- `score` (float): Điểm tương đồng thực tế (0-1)
-- `message` (string): Thông báo
-
-**Threshold:** Score >= 0.7 mới được coi là match
-
-#### Status Codes
-- `200`: Process thành công (check `identified` field)
-- `400`: Audio không hợp lệ hoặc không có users nào đã enroll
-- `500`: Lỗi server
+| Field | Description |
+|-------|-------------|
+| `identified` | Whether speaker was found |
+| `score` | Cosine similarity (0-1) |
+| `confidence` | Derived confidence level |
 
 ---
 
-### 3. Verify Voice
+#### 3. Verify Voice
+
 **Endpoint:** `POST /voice/users/{user_id}/verify`
 
-Xác thực xem mẫu giọng có khớp với user ID đã claim hay không (1:1 verification).
+Xác thực audio có khớp với user cụ thể (1:1 verification).
 
-#### Request
+**Request:**
 ```http
-POST /voice/users/{user_id}/verify
+POST /voice/users/USR001/verify
 Content-Type: multipart/form-data
 
 audio_file: <binary audio file>
 ```
 
-**Parameters:**
-- `user_id` (path, required): User ID cần verify
-- `audio_file` (form-data, required): File audio để verify (WAV/MP3/FLAC, max 10MB)
-
-#### Response (Verified - Match)
+**Response:**
 ```json
 {
   "type": "verification",
@@ -150,286 +371,208 @@ audio_file: <binary audio file>
   "claimed_id": "USR001",
   "speaker_id": "USR001",
   "match": true,
-  "confidence": 0.89,
-  "score": 0.89,
+  "score": 0.91,
+  "confidence": 0.94,
   "message": "Voice verified successfully"
 }
 ```
 
-#### Response (Not Verified - No Match)
+---
+
+#### 4. Get Enrollment Status
+
+**Endpoint:** `GET /voice/users/{user_id}/enrollment-status`
+
+Kiểm tra trạng thái enrollment của user.
+
+**Response:**
 ```json
 {
-  "type": "verification",
-  "success": false,
-  "verified": false,
-  "claimed_id": "USR001",
-  "speaker_id": "USR002",
-  "match": false,
-  "confidence": 0.65,
-  "score": 0.65,
-  "message": "Voice verification failed - speaker mismatch"
+  "user_id": "USR001",
+  "name": "Nguyễn Văn A",
+  "enrollment_status": "partial",
+  "enrollment_count": 2,
+  "min_required": 3,
+  "is_complete": false,
+  "message": "User has 2/3 enrollment samples"
 }
 ```
 
-#### Response (User Not Enrolled)
-```json
-{
-  "type": "verification",
-  "success": false,
-  "verified": false,
-  "claimed_id": "USR999",
-  "speaker_id": null,
-  "match": false,
-  "confidence": 0.0,
-  "score": 0.0,
-  "message": "User not enrolled or insufficient samples"
-}
-```
-
-**Response Fields:**
-- `verified` (boolean): Có verify thành công không
-- `claimed_id` (string): User ID được claim
-- `speaker_id` (string|null): User ID thực sự nhận diện được
-- `match` (boolean): `claimed_id == speaker_id`
-- `confidence` (float): Độ tin cậy (0-1)
-- `score` (float): Điểm tương đồng (0-1)
-- `message` (string): Thông báo
-
-**Use Cases:**
-- Authentication: Xác thực user qua giọng nói
-- Access Control: Cấp quyền truy cập nếu voice khớp
-- Security: Phát hiện giả mạo giọng nói
-
-#### Status Codes
-- `200`: Process thành công (check `verified` field)
-- `400`: Audio không hợp lệ hoặc user chưa enroll đủ
-- `500`: Lỗi server
+| Status | Description |
+|--------|-------------|
+| `not_enrolled` | Chưa có mẫu nào |
+| `partial` | Có 1-2 mẫu |
+| `enrolled` | Đã đủ ≥3 mẫu |
 
 ---
 
-## 🎙️ Speech-to-Text WebSocket
+#### 5. Reset Enrollment
 
-### WebSocket Endpoint
-**Endpoint:** `wss://<host>/ws/stt`
+**Endpoint:** `DELETE /voice/users/{user_id}/enrollment`
 
-Real-time speech-to-text streaming với Azure Cognitive Services.
+Xóa toàn bộ enrollment của user (cần enroll lại từ đầu).
 
-Operational notes:
-- Không sử dụng background workers. Các lỗi lưu transcript (sau 3 lần thử) sẽ chỉ được ghi log, không có retry nền.
-
-#### Connection
-```javascript
-const ws = new WebSocket('wss://<your-app>.azurewebsites.net/ws/stt');
-
-ws.onopen = () => {
-  console.log('Connected to STT WebSocket');
-  
-  // Send initialization (optional)
-  ws.send(JSON.stringify({
-    session_id: "session_123",
-    lang: "vi-VN"
-  }));
-  
-  // Backend sẽ TỰ ĐỘNG nhận diện người nói từ audio
-  // Không cần gửi user_id hay speaker name
-};
-```
-
-#### Initialization Message (Optional)
-Sau khi connect, FE có thể gửi JSON message để config:
-
+**Response:**
 ```json
 {
-  "session_id": "session_123",
-  "lang": "vi-VN",
-  "phrases": "AI,Machine Learning,Deep Learning"
+  "success": true,
+  "user_id": "USR001",
+  "message": "Enrollment reset successful for user USR001",
+  "details": {
+    "blob_deleted": true,
+    "db_cleared": true,
+    "cache_cleared": true
+  }
 }
 ```
 
-**Query Parameters (URL):**
-- `defense_session_id` (string, optional): ID của defense session để filter speaker identification
+---
 
-**Example with defense session:**
+### 🎙️ Speech-to-Text WebSocket
+
+#### WebSocket Endpoint
+
+**URL:** `wss://<host>/ws/stt`
+
+Real-time streaming speech-to-text với tự động speaker identification.
+
+#### Connection
+
 ```javascript
+// Connect with optional defense session
 const defenseSessionId = "550e8400-e29b-41d4-a716-446655440000";
-const ws = new WebSocket(`wss://<your-app>.azurewebsites.net/ws/stt?defense_session_id=${defenseSessionId}`);
+const ws = new WebSocket(`wss://your-app.azurewebsites.net/ws/stt?defense_session_id=${defenseSessionId}`);
+
+ws.onopen = () => {
+  console.log('Connected to STT WebSocket');
+};
 ```
 
-**Fields:**
-- `session_id` (string, optional): Session ID để group transcripts
-- `lang` (string, optional): Language code (default: "vi-VN")
-- `phrases` (string, optional): Phrase hints phân cách bằng dấu phẩy
+**Query Parameters:**
 
-**⚠️ Lưu ý quan trọng:**
-- **KHÔNG cần gửi `user_id` hay `speaker`** - Backend sẽ tự động nhận diện người nói từ audio bằng voice identification
-- **Nếu có `defense_session_id`**: Backend chỉ identify trong danh sách users của defense session đó (gọi `/api/defense-sessions/{id}/users`)
-- **Nếu không có `defense_session_id`**: Backend identify trong TẤT CẢ users đã enroll
-- Speaker name và user_id sẽ được trả về trong events `recognized`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `speaker` | string | Initial speaker label (default: "Đang xác định") |
+| `phrases` | string | Phrase hints (comma or pipe separated) |
+| `defense_session_id` | string | Filter speakers to this session's users |
+
+> **⚠️ Lưu ý:** Không cần gửi `user_id` - backend tự động identify speaker từ audio.
 
 #### Sending Audio
-```javascript
-// Send audio chunks as binary data
-const audioBlob = new Blob([audioData], { type: 'audio/wav' });
-ws.send(audioBlob);
 
-// Or send raw audio buffer
-ws.send(audioBuffer);
+```javascript
+// Send audio chunks as binary
+const audioChunk = new Uint8Array(audioBuffer);
+ws.send(audioChunk);
+
+// Audio requirements:
+// - Format: PCM 16-bit, mono
+// - Sample rate: 16000 Hz
+// - Chunk size: 3200-6400 bytes (0.1-0.2s)
 ```
 
-#### Automatic Speaker Identification
-**Backend tự động nhận diện người nói:**
+#### Commands
 
-1. **Trong quá trình stream**, backend sẽ:
-   - Thu thập audio chunks từ FE
-   - Định kỳ (mỗi 0.6s) chạy voice identification
-   - So sánh với database users đã enroll (≥3 samples)
-   - Tự động gán `speaker` và `user_id` vào events
-
-2. **FE nhận kết quả qua events:**
-   ```json
-   {
-     "event": "recognized",
-     "text": "Xin chào các bạn",
-     "speaker": "Nguyen Van A",
-     "user_id": "USR001",
-     "timestamp": "2025-11-16T10:30:05Z"
-   }
-   ```
-
-3. **Nếu không nhận diện được:**
-   ```json
-   {
-     "event": "recognized",
-     "text": "Xin chào các bạn",
-     "speaker": "Khách",
-     "timestamp": "2025-11-16T10:30:05Z"
-   }
-   ```
-
-**Ưu điểm:**
-- FE không cần biết trước user_id
-- Tự động phát hiện khi người nói thay đổi
-- Support multi-speaker trong cùng session
-
-#### Receiving Events
 ```javascript
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  
-  switch(data.event) {
-    case 'recognizing':
-      // Interim result (real-time)
-      console.log('Recognizing:', data.text);
-      break;
-      
-    case 'recognized':
-      // Final result for segment
-      console.log('Recognized:', data.text);
-      console.log('Speaker:', data.speaker);
-      break;
-      
-    case 'session_started':
-      console.log('Session ID:', data.session_id);
-      break;
-      
-    case 'session_stopped':
-      console.log('Total lines:', data.total_lines);
-      break;
-      
-    case 'error':
-      console.error('Error:', data.message);
-      break;
-  }
-};
+// End session (triggers transcript save)
+ws.send("stop");
+
+// Start question capture mode
+ws.send("q:start");
+
+// End question capture (triggers duplicate check)
+ws.send("q:end");
 ```
 
 #### Event Types
 
-**1. session_started**
+**1. connected** - Initial connection confirmation
 ```json
 {
-  "event": "session_started",
+  "type": "connected",
   "session_id": "abc123",
-  "timestamp": "2025-11-16T10:30:00Z"
+  "defense_session_id": "550e8400-...",
+  "room_size": 2,
+  "message": "WebSocket connected, starting recognition..."
 }
 ```
 
-**2. recognizing** (real-time interim results)
+**2. partial** - Real-time interim result
 ```json
 {
-  "event": "recognizing",
-  "text": "Xin chào các bạn",
-  "speaker": "Nguyen Van A",
-  "timestamp": "2025-11-16T10:30:05Z"
+  "type": "partial",
+  "text": "Xin chào các",
+  "speaker": "Nguyễn Văn A",
+  "display": "<span style=\"color:#3498db\">Xin chào các</span>"
 }
 ```
 
-**3. recognized** (final segment result)
+**3. result** - Final recognized segment
 ```json
 {
-  "event": "recognized",
+  "type": "result",
   "text": "Xin chào các bạn, hôm nay chúng ta sẽ học về AI.",
-  "speaker": "Nguyen Van A",
+  "speaker": "Nguyễn Văn A",
   "user_id": "USR001",
-  "timestamp": "2025-11-16T10:30:08Z"
+  "display": "<span style=\"color:#2ecc71\">...</span>"
 }
 ```
 
-**Fields:**
-- `speaker` (string): Tên người nói (tự động identify)
-- `user_id` (string, optional): User ID nếu nhận diện được
-- Nếu không nhận diện được: `speaker="Khách"`, không có `user_id`
-
-**4. session_stopped**
+**4. question_mode_started**
 ```json
 {
-  "event": "session_stopped",
+  "type": "question_mode_started",
+  "session_id": "abc123"
+}
+```
+
+**5. question_mode_result** - After q:end
+```json
+{
+  "type": "question_mode_result",
   "session_id": "abc123",
-  "total_lines": 15,
-  "message": "Session ended; transcript save attempted"
+  "is_duplicate": false,
+  "question_text": "AI là gì?",
+  "similar_questions": []
 }
 ```
 
-**5. error**
+**6. cached_transcript** - On reconnect
 ```json
 {
-  "event": "error",
-  "message": "Audio stream interrupted",
-  "code": "AUDIO_ERROR"
+  "type": "cached_transcript",
+  "defense_session_id": "550e8400-...",
+  "lines": [...],
+  "message": "Loaded 15 lines"
 }
 ```
 
-#### Ending Session
-```javascript
-// Send "stop" command
-ws.send("stop");
-
-// Or close connection
-ws.close();
+**7. ping** - Keepalive (every 25s)
+```json
+{
+  "type": "ping"
+}
 ```
 
-**Note:** 
-- Khi kết thúc session (`session:end`), backend sẽ gọi **PUT** `/api/transcripts/{sessionId}` để **upsert** transcript (update nếu đã có, create nếu chưa).
-- Đảm bảo **chỉ có 1 bản transcript duy nhất** cho mỗi defense session - không tạo draft hay duplicate.
-- Có tối đa 3 lần retry nội tuyến. Nếu thất bại, lỗi sẽ được ghi log.
-- Trạng thái "đã lưu" được cache trong Redis để tránh lưu trùng khi user reconnect.
-
-#### Audio Requirements
-- **Format:** PCM 16-bit, mono
-- **Sample Rate:** 16000 Hz
-- **Chunk Size:** 3200-6400 bytes (0.1-0.2s)
-- **Max Total Size:** No limit (streaming)
+**8. error**
+```json
+{
+  "type": "error",
+  "error": "Audio stream interrupted"
+}
+```
 
 ---
 
-## ❓ Question Management APIs
+### ❓ Question Management APIs
 
-### 1. Check Duplicate Question
+#### 1. Check Duplicate
+
 **Endpoint:** `POST /questions/check-duplicate`
 
-Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
+Kiểm tra câu hỏi có trùng lặp không (threshold 0.85).
 
-#### Request
+**Request:**
 ```json
 {
   "session_id": "session_123",
@@ -437,21 +580,7 @@ Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
 }
 ```
 
-**Fields:**
-- `session_id` (string, required): Session ID
-- `question_text` (string, required): Nội dung câu hỏi
-
-#### Response (Not Duplicate)
-```json
-{
-  "is_duplicate": false,
-  "question_text": "AI là gì?",
-  "similar_questions": [],
-  "message": "✅ Câu hỏi hợp lệ, chưa bị trùng."
-}
-```
-
-#### Response (Duplicate Found)
+**Response:**
 ```json
 {
   "is_duplicate": true,
@@ -468,14 +597,13 @@ Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
 }
 ```
 
----
+#### 2. Register Question
 
-### 2. Register Question
 **Endpoint:** `POST /questions/register`
 
-Đăng ký câu hỏi mới vào session (không check duplicate).
+Đăng ký câu hỏi mới (không check duplicate).
 
-#### Request
+**Request:**
 ```json
 {
   "session_id": "session_123",
@@ -483,117 +611,48 @@ Kiểm tra xem câu hỏi có bị trùng lặp trong session hay không.
 }
 ```
 
-**Fields:**
-- `session_id` (string, required): Session ID
-- `question_text` (string, required): Nội dung câu hỏi
-
-**Note:** `speaker` và `timestamp` sẽ được backend tự động generate.
-
-#### Response
+**Response:**
 ```json
 {
   "success": true,
-  "question_id": "q_abc123",
+  "question_id": 5,
   "total_questions": 5,
   "message": "✅ Câu hỏi đã được lưu. Tổng: 5"
 }
 ```
 
----
+#### 3. Check and Register (Combo)
 
-### 3. Check and Register (Combo)
 **Endpoint:** `POST /questions/check-and-register`
 
-Check duplicate + register nếu không trùng (một bước).
+Check duplicate + register nếu không trùng.
 
-#### Request
+**Request:**
 ```json
 {
   "session_id": "session_123",
-  "question_text": "Deep Learning khác gì Machine Learning?"
+  "question_text": "Deep Learning khác gì ML?"
 }
 ```
 
-**Fields:**
-- `session_id` (string, required): Session ID
-- `question_text` (string, required): Nội dung câu hỏi
+#### 4. Get Session Questions
 
-**Note:** Backend tự động set `threshold=0.85`, `speaker="Khách"`, và `timestamp=current_time`.
-
-#### Response (Registered)
-```json
-{
-  "is_duplicate": false,
-  "question_text": "Deep Learning khác gì Machine Learning?",
-  "similar_questions": [],
-  "message": "✅ Câu hỏi đã được lưu. Tổng: 6"
-}
-```
-
-#### Response (Duplicate - Not Registered)
-```json
-{
-  "is_duplicate": true,
-  "question_text": "Deep Learning khác gì Machine Learning?",
-  "similar_questions": [
-    {
-      "text": "Sự khác biệt giữa Deep Learning và ML?",
-      "score": 0.89,
-      "fuzzy_score": 0.82,
-      "semantic_score": 0.89
-    }
-  ],
-  "message": "⚠️ Câu hỏi trùng lặp! Không thể đăng ký."
-}
-```
-
----
-
-### 4. Get Session Questions
 **Endpoint:** `GET /questions/session/{session_id}`
 
-Lấy tất cả câu hỏi trong một session.
-
-#### Request
-```http
-GET /questions/session/session_123
-```
-
-#### Response
+**Response:**
 ```json
 {
   "session_id": "session_123",
-  "questions": [
-    {
-      "id": "q_001",
-      "text": "AI là gì?",
-      "speaker": "Nguyen Van A",
-      "timestamp": "2025-11-16T10:30:00Z"
-    },
-    {
-      "id": "q_002",
-      "text": "Machine Learning hoạt động thế nào?",
-      "speaker": "Nguyen Van A",
-      "timestamp": "2025-11-16T10:32:00Z"
-    }
-  ],
+  "questions": ["AI là gì?", "ML hoạt động thế nào?"],
   "total": 2
 }
 ```
 
----
+#### 5. Clear Session Questions
 
-### 5. Clear Session Questions
 **Endpoint:** `DELETE /questions/session/{session_id}`
 
-Xóa tất cả câu hỏi trong session.
-
-#### Request
-```http
-DELETE /questions/session/session_123
-```
-
-#### Response
+**Response:**
 ```json
 {
   "success": true,
@@ -605,115 +664,41 @@ DELETE /questions/session/session_123
 
 ---
 
-## ❤️ Health Check
+### 🔧 System Endpoints
 
-### Health Endpoint
-**Endpoint:** `GET /health`
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Service info + warmup status |
+| `GET /health` | Liveness probe (always 200 for ACA) |
+| `GET /ready` | Readiness probe (200 after warmup) |
+| `GET /healthz` | Legacy health check |
+| `GET /docs` | Swagger UI |
+| `GET /redoc` | ReDoc documentation |
+| `GET /openapi.json` | OpenAPI schema |
+| `GET /metrics` | Prometheus metrics |
+| `GET /memory` | Memory statistics |
+| `POST /gc` | Force garbage collection |
 
-Kiểm tra trạng thái server.
+#### Health Check Response
 
-#### Request
-```http
-GET /health
-```
-
-#### Response
 ```json
 {
-  "status": "ok"
+  "status": "healthy",
+  "warmup": {
+    "stage": "complete",
+    "progress": 100,
+    "error": null
+  },
+  "redis": { "status": "healthy" },
+  "sql": { "status": "healthy" },
+  "blob": { "status": "healthy" },
+  "speech": { "status": "healthy" },
+  "database_pool": {
+    "pool_size": 5,
+    "checked_out": 1,
+    "overflow": 0
+  }
 }
-```
-
-**Legacy Endpoint:** `GET /healthz` (giữ để tương thích)
-
----
-
-## 📦 Response Format Standards
-
-### Success Response (Voice Auth)
-```json
-{
-  "type": "enrollment|identification|verification",
-  "success": true,
-  "user_id": "USR001",
-  "speaker_id": "USR001",
-  "confidence": 0.92,
-  "score": 0.92,
-  "message": "Success message"
-}
-```
-
-### Error Response
-```json
-{
-  "error": "Error message description",
-  "detail": "Technical detail (optional)"
-}
-```
-
-### Question Response
-```json
-{
-  "is_duplicate": false,
-  "question_text": "Question content",
-  "similar_questions": [],
-  "message": "Status message"
-}
-```
-
----
-
-## ⚠️ Error Codes
-
-| Status Code | Description | Common Causes |
-|-------------|-------------|---------------|
-| 200 | Success | Request processed successfully |
-| 400 | Bad Request | Invalid audio, missing parameters, validation failed |
-| 404 | Not Found | Endpoint không tồn tại |
-| 500 | Internal Server Error | Server error, service unavailable |
-
-### Common Error Messages
-
-#### Voice Authentication
-- `"Empty audio data"` - File audio rỗng
-- `"Audio too large (>10MB)"` - File quá lớn
-- `"User not enrolled or insufficient samples"` - User chưa enroll đủ 3 mẫu
-- `"No enrolled users found"` - Không có user nào đã enroll (identify)
-- `"Audio quality too low"` - Chất lượng audio không đủ (quá nhỏ, nhiễu, v.v.)
-
-#### WebSocket
-- `"Audio stream interrupted"` - Kết nối audio bị gián đoạn
-- `"Session initialization failed"` - Không thể khởi tạo session
-- `"Recognition error"` - Lỗi nhận dạng giọng nói
-
-#### Questions
-- `"Invalid session_id"` - Session ID không hợp lệ
-- `"Question text is required"` - Thiếu nội dung câu hỏi
-- `"Service unavailable"` - Redis hoặc semantic service không khả dụng
-
----
-
-## 🔐 Authentication & Security
-
-**Current Status:** No authentication required (internal/trusted network)
-
-**Production Recommendations:**
-1. Add API Key authentication
-2. Implement rate limiting
-3. Enable CORS restrictions (currently `*`)
-4. Use HTTPS only
-5. Add request signing for voice samples
-
----
-
-## 🌐 Environment Variables (FE cần biết)
-
-Frontend nên config các URL sau:
-
-```javascript
-// Production
-const API_BASE_URL = 'https://<your-app>.azurewebsites.net';
-const WS_BASE_URL = 'wss://<your-app>.azurewebsites.net';
 ```
 
 ---
@@ -723,85 +708,325 @@ const WS_BASE_URL = 'wss://<your-app>.azurewebsites.net';
 ### Voice Authentication Flow
 
 ```javascript
-// 1. Enroll user (3 samples)
-for (let i = 0; i < 3; i++) {
+const API_BASE = 'https://your-app.azurewebsites.net';
+
+// 1. Enroll 3 samples
+async function enrollUser(userId, audioBlobs) {
+  for (let i = 0; i < audioBlobs.length; i++) {
+    const formData = new FormData();
+    formData.append('audio_file', audioBlobs[i]);
+    
+    const response = await fetch(`${API_BASE}/voice/users/${userId}/enroll`, {
+      method: 'POST',
+      body: formData
+    });
+    
+    const result = await response.json();
+    console.log(`Sample ${i + 1}/3:`, result.message);
+    
+    if (result.is_complete) {
+      console.log('Enrollment complete!');
+      break;
+    }
+  }
+}
+
+// 2. Verify user identity
+async function verifyUser(userId, audioBlob) {
   const formData = new FormData();
   formData.append('audio_file', audioBlob);
   
-  const response = await fetch(`${API_BASE_URL}/voice/users/USR001/enroll`, {
+  const response = await fetch(`${API_BASE}/voice/users/${userId}/verify`, {
     method: 'POST',
     body: formData
   });
   
   const result = await response.json();
-  console.log(`Sample ${i+1}/3:`, result.message);
-}
-
-// 2. Verify user
-const formData = new FormData();
-formData.append('audio_file', audioBlob);
-
-const verifyResponse = await fetch(`${API_BASE_URL}/voice/users/USR001/verify`, {
-  method: 'POST',
-  body: formData
-});
-
-const verifyResult = await verifyResponse.json();
-if (verifyResult.verified) {
-  console.log('Authentication successful!');
-} else {
-  console.log('Authentication failed:', verifyResult.message);
+  
+  if (result.verified) {
+    console.log('✅ Voice verified! Confidence:', result.confidence);
+    return true;
+  } else {
+    console.log('❌ Verification failed:', result.message);
+    return false;
+  }
 }
 ```
 
-### Question Management Flow
+### Real-time STT with Speaker Identification
 
 ```javascript
-// Check and register question
-const checkResponse = await fetch(`${API_BASE_URL}/questions/check-and-register`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    session_id: 'session_123',
-    question_text: 'AI là gì?',
-    speaker: 'Nguyen Van A',
-    timestamp: new Date().toISOString()
-  })
-});
+class STTClient {
+  constructor(defenseSessionId) {
+    this.defenseSessionId = defenseSessionId;
+    this.ws = null;
+    this.transcriptLines = [];
+  }
+  
+  connect() {
+    const url = `wss://your-app.azurewebsites.net/ws/stt?defense_session_id=${this.defenseSessionId}`;
+    this.ws = new WebSocket(url);
+    
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      switch (data.type) {
+        case 'connected':
+          console.log('Connected to STT');
+          break;
+          
+        case 'partial':
+          // Update UI with interim result
+          this.updatePartial(data.text, data.speaker);
+          break;
+          
+        case 'result':
+          // Final result - add to transcript
+          this.transcriptLines.push({
+            text: data.text,
+            speaker: data.speaker,
+            user_id: data.user_id
+          });
+          this.updateFinal(data.text, data.speaker);
+          break;
+          
+        case 'cached_transcript':
+          // Resume from cache
+          this.transcriptLines = data.lines;
+          this.restoreTranscript(data.lines);
+          break;
+          
+        case 'ping':
+          // Keepalive - ignore
+          break;
+      }
+    };
+    
+    this.ws.onerror = (error) => console.error('WebSocket error:', error);
+    this.ws.onclose = () => console.log('WebSocket closed');
+  }
+  
+  sendAudio(audioChunk) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(audioChunk);
+    }
+  }
+  
+  startQuestion() {
+    this.ws.send('q:start');
+  }
+  
+  endQuestion() {
+    this.ws.send('q:end');
+  }
+  
+  stop() {
+    this.ws.send('stop');
+  }
+}
 
-const result = await checkResponse.json();
-if (result.is_duplicate) {
-  alert('Câu hỏi bị trùng!');
-  console.log('Similar:', result.similar_questions);
-} else {
-  alert('Câu hỏi đã được lưu!');
+// Usage
+const stt = new STTClient('defense-session-uuid');
+stt.connect();
+
+// When recording audio
+mediaRecorder.ondataavailable = (event) => {
+  stt.sendAudio(event.data);
+};
+```
+
+### Question Duplicate Detection
+
+```javascript
+async function checkQuestion(sessionId, questionText) {
+  const response = await fetch(`${API_BASE}/questions/check-and-register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId,
+      question_text: questionText
+    })
+  });
+  
+  const result = await response.json();
+  
+  if (result.is_duplicate) {
+    console.log('⚠️ Duplicate found!');
+    console.log('Similar questions:', result.similar_questions);
+    return false;
+  }
+  
+  console.log('✅ Question registered');
+  return true;
 }
 ```
 
 ---
 
-## 🚀 Quick Start Guide
+## 🚀 Deployment
 
-### Step 1: Health Check
-```bash
-curl https://<your-app>.azurewebsites.net/health
+### Azure Container Apps
+
+```yaml
+# azure-container-apps.yaml
+name: aidefcom-ai-service
+properties:
+  configuration:
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: http
+    secrets:
+      - name: azure-speech-key
+        value: ${AZURE_SPEECH_KEY}
+  template:
+    containers:
+      - name: ai-service
+        image: your-registry.azurecr.io/aidefcom-ai-service:latest
+        resources:
+          cpu: 2.0
+          memory: 4Gi
+        env:
+          - name: AZURE_SPEECH_KEY
+            secretRef: azure-speech-key
+        probes:
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          - type: Readiness
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
 ```
 
-### Step 2: View API Docs
-Open browser: `https://<your-app>.azurewebsites.net/docs`
+### Docker Compose
 
-### Step 3: Test Voice Enroll
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  ai-service:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+---
+
+## 💻 Development
+
+### Project Structure
+
+```
+AIDefCom.AIServer/
+├── main.py                 # Entry point (delegates to app.main)
+├── app/
+│   ├── main.py            # FastAPI app with lifespan, routers
+│   └── config.py          # Configuration from environment
+├── api/
+│   ├── dependencies.py    # Dependency injection
+│   ├── routers/
+│   │   ├── voice_router.py     # Voice auth endpoints
+│   │   ├── speech_router.py    # WebSocket STT
+│   │   └── question_router.py  # Question management
+│   └── schemas/           # Pydantic models
+├── services/
+│   ├── voice_service.py   # Voice authentication logic
+│   ├── speech_service.py  # STT with speaker identification
+│   ├── question_service.py # Duplicate detection
+│   └── redis_service.py   # Redis client
+├── repositories/
+│   ├── azure/             # Azure Blob, Speech
+│   ├── sql/               # SQL Server
+│   └── voice/             # Voice profile storage
+├── core/
+│   ├── health.py          # Health check utilities
+│   ├── metrics.py         # Prometheus metrics
+│   └── exceptions.py      # Custom exceptions
+├── data/
+│   ├── opposite_keywords.json  # Vietnamese opposites
+│   └── phrase_hints.json       # Speech recognition hints
+├── tests/                 # Test files
+├── Dockerfile
+└── requirements.txt
+```
+
+### Running Tests
+
 ```bash
-curl -X POST "https://<your-app>.azurewebsites.net/voice/users/USR001/enroll" \
+# Run all tests
+pytest tests/ -v
+
+# Run specific test
+pytest tests/test_voice_auth.py -v
+
+# With coverage
+pytest tests/ --cov=services --cov-report=html
+```
+
+### Local Development Tips
+
+```bash
+# Watch logs
+uvicorn main:app --reload --log-level debug
+
+# Test voice enrollment
+curl -X POST "http://localhost:8000/voice/users/test_user/enroll" \
   -F "audio_file=@sample.wav"
+
+# Test STT WebSocket (using wscat)
+wscat -c "ws://localhost:8000/ws/stt?defense_session_id=test"
 ```
 
-### Step 4: Test Question Check
-```bash
-curl -X POST "https://<your-app>.azurewebsites.net/questions/check-duplicate" \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"test","question_text":"AI là gì?"}'
-```
+---
+
+## ⚠️ Error Codes
+
+| Code | Description |
+|------|-------------|
+| `200` | Success |
+| `400` | Bad Request (invalid audio, missing params) |
+| `404` | Not Found |
+| `408` | Request Timeout |
+| `429` | Rate Limited |
+| `500` | Internal Server Error |
+| `503` | Service Unavailable (warmup incomplete) |
+| `504` | Gateway Timeout |
+
+### Common Error Messages
+
+| Error | Cause |
+|-------|-------|
+| `"Empty audio data"` | File audio rỗng |
+| `"Audio too large"` | Vượt quá 6MB |
+| `"User not enrolled or insufficient samples"` | User chưa đủ 3 mẫu |
+| `"No enrolled users found"` | Không có ai để identify |
+| `"Audio quality too low"` | RMS/SNR thấp |
+
+---
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) file.
 
 ---
 
@@ -809,6 +1034,10 @@ curl -X POST "https://<your-app>.azurewebsites.net/questions/check-duplicate" \
 
 - **Swagger UI:** `/docs`
 - **Health Check:** `/health`
-- **Base Info:** `GET /` (root endpoint)
+- **Metrics:** `/metrics`
 
-**Note:** Tất cả endpoints đều support CORS `*` (hiện tại). Production nên restrict lại.
+---
+
+<div align="center">
+Made with ❤️ by AIDefCom Team
+</div>
