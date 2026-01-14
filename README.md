@@ -34,13 +34,13 @@
 
 ## 🎯 Overview
 
-**AIDefCom AI Service** là một microservice AI cung cấp 3 tính năng chính:
+**AIDefCom AI Service** is an AI microservice providing 3 main features:
 
 | Feature | Description |
 |---------|-------------|
-| **🎤 Voice Authentication** | Đăng ký và xác thực người dùng qua giọng nói (Pyannote/WeSpeaker) |
-| **🎙️ Speech-to-Text** | Streaming STT real-time với Azure Cognitive Services + auto speaker identification |
-| **❓ Question Detection** | Phát hiện câu hỏi trùng lặp bằng fuzzy matching + semantic similarity |
+| **🎤 Voice Authentication** | Register and authenticate users via voice (Pyannote/WeSpeaker) |
+| **🎙️ Speech-to-Text** | Real-time streaming STT with Azure Cognitive Services + auto speaker identification |
+| **❓ Question Detection** | Detect duplicate questions using fuzzy matching + semantic similarity |
 
 **Base URL:** `https://<your-app>.azurewebsites.net`  
 **Swagger UI:** `https://<your-app>.azurewebsites.net/docs`  
@@ -93,22 +93,22 @@
 ## ✨ Features
 
 ### 🔐 Voice Authentication
-- **Enrollment**: Đăng ký mẫu giọng nói (tối thiểu 3 mẫu)
-- **Identification**: Nhận diện người nói 1:N (so sánh với tất cả users)
-- **Verification**: Xác thực giọng nói 1:1 (kiểm tra match với user cụ thể)
-- **Auto Speaker Detection**: Tự động nhận diện trong streaming STT
+- **Enrollment**: Register voice samples (minimum 3 samples required)
+- **Identification**: 1:N speaker identification (compare with all enrolled users)
+- **Verification**: 1:1 voice verification (check match with specific user)
+- **Auto Speaker Detection**: Automatic speaker recognition during streaming STT
 
 ### 🎙️ Speech-to-Text
-- **Real-time Streaming**: WebSocket với Azure Cognitive Services
-- **Vietnamese Optimized**: Tuned timeouts cho tiếng Việt
-- **Custom Speech Model**: Hỗ trợ Azure Custom Speech endpoint
-- **Multi-speaker Support**: Tự động detect và label speakers
-- **Transcript Caching**: Redis-backed transcript với auto-resume
+- **Real-time Streaming**: WebSocket with Azure Cognitive Services
+- **Vietnamese Optimized**: Tuned timeouts for Vietnamese language
+- **Custom Speech Model**: Support for Azure Custom Speech endpoint
+- **Multi-speaker Support**: Automatic speaker detection and labeling
+- **Transcript Caching**: Redis-backed transcript with auto-resume
 
 ### ❓ Question Detection
 - **Fuzzy Matching**: RapidFuzz (ratio, token_sort, token_set)
 - **Semantic Similarity**: Sentence-Transformers embeddings
-- **Vietnamese Support**: Opposite keywords detection
+- **Vietnamese Support**: Vietnamese opposite keywords detection
 - **Session-based**: Questions grouped by session ID
 
 ### ⚡ Performance & Scalability
@@ -185,7 +185,7 @@ docker run -p 8000:8000 --env-file .env aidefcom-ai-service
 
 ### Environment Variables
 
-Tạo file `.env` với các biến sau:
+Create a `.env` file with the following variables:
 
 #### Azure Speech Service (Required)
 ```env
@@ -245,7 +245,7 @@ VOICE_RMS_FLOOR=0.005                # Min RMS level
 VOICE_SNR_FLOOR_DB=8.0               # Min SNR (dB)
 ```
 
-#### Azure Speech Timeouts (Vietnamese optimized)
+#### Azure Speech Timeouts (Vietnamese Optimized)
 ```env
 AZURE_SPEECH_SEGMENTATION_SILENCE_MS=1200  # Segmentation pause
 AZURE_SPEECH_INITIAL_SILENCE_MS=8000       # Wait for speech start
@@ -262,7 +262,7 @@ AZURE_SPEECH_END_SILENCE_MS=800            # End of utterance
 
 **Endpoint:** `POST /voice/users/{user_id}/enroll`
 
-Đăng ký mẫu giọng nói. Cần **tối thiểu 3 mẫu** để hoàn tất enrollment.
+Register a voice sample. **Minimum 3 samples** are required to complete enrollment.
 
 **Request:**
 ```http
@@ -274,7 +274,7 @@ audio_file: <binary audio file>
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `user_id` | path | ✅ | User ID cần enroll |
+| `user_id` | path | ✅ | User ID to enroll |
 | `audio_file` | file | ✅ | Audio file (WAV/MP3/FLAC, max 6MB, ~3-5s) |
 
 **Response:**
@@ -302,7 +302,7 @@ audio_file: <binary audio file>
 
 **Endpoint:** `POST /voice/identify`
 
-Nhận diện người nói từ tất cả users đã enroll (1:N comparison).
+Identify speaker from all enrolled users (1:N comparison).
 
 **Request:**
 ```http
@@ -352,7 +352,7 @@ audio_file: <binary audio file>
 
 **Endpoint:** `POST /voice/users/{user_id}/verify`
 
-Xác thực audio có khớp với user cụ thể (1:1 verification).
+Verify if audio matches a specific user (1:1 verification).
 
 **Request:**
 ```http
@@ -383,7 +383,7 @@ audio_file: <binary audio file>
 
 **Endpoint:** `GET /voice/users/{user_id}/enrollment-status`
 
-Kiểm tra trạng thái enrollment của user.
+Check enrollment status of a user.
 
 **Response:**
 ```json
@@ -400,9 +400,9 @@ Kiểm tra trạng thái enrollment của user.
 
 | Status | Description |
 |--------|-------------|
-| `not_enrolled` | Chưa có mẫu nào |
-| `partial` | Có 1-2 mẫu |
-| `enrolled` | Đã đủ ≥3 mẫu |
+| `not_enrolled` | No samples registered yet |
+| `partial` | Has 1-2 samples |
+| `enrolled` | Has ≥3 samples (complete) |
 
 ---
 
@@ -410,7 +410,7 @@ Kiểm tra trạng thái enrollment của user.
 
 **Endpoint:** `DELETE /voice/users/{user_id}/enrollment`
 
-Xóa toàn bộ enrollment của user (cần enroll lại từ đầu).
+Delete all enrollment data for a user (requires re-enrollment from scratch).
 
 **Response:**
 ```json
@@ -452,11 +452,11 @@ ws.onopen = () => {
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `speaker` | string | Initial speaker label (default: "Đang xác định") |
+| `speaker` | string | Initial speaker label (default: "Identifying...") |
 | `phrases` | string | Phrase hints (comma or pipe separated) |
 | `defense_session_id` | string | Filter speakers to this session's users |
 
-> **⚠️ Lưu ý:** Không cần gửi `user_id` - backend tự động identify speaker từ audio.
+> **⚠️ Note:** No need to send `user_id` - backend automatically identifies speaker from audio.
 
 #### Sending Audio
 
@@ -570,7 +570,7 @@ ws.send("q:end");
 
 **Endpoint:** `POST /questions/check-duplicate`
 
-Kiểm tra câu hỏi có trùng lặp không (threshold 0.85).
+Check if a question is duplicate (threshold 0.85).
 
 **Request:**
 ```json
@@ -593,7 +593,7 @@ Kiểm tra câu hỏi có trùng lặp không (threshold 0.85).
       "semantic_score": 0.92
     }
   ],
-  "message": "⚠️ Câu hỏi trùng lặp! Tìm thấy 1 câu tương tự."
+  "message": "⚠️ Duplicate question! Found 1 similar question."
 }
 ```
 
@@ -601,7 +601,7 @@ Kiểm tra câu hỏi có trùng lặp không (threshold 0.85).
 
 **Endpoint:** `POST /questions/register`
 
-Đăng ký câu hỏi mới (không check duplicate).
+Register a new question (without duplicate check).
 
 **Request:**
 ```json
@@ -617,7 +617,7 @@ Kiểm tra câu hỏi có trùng lặp không (threshold 0.85).
   "success": true,
   "question_id": 5,
   "total_questions": 5,
-  "message": "✅ Câu hỏi đã được lưu. Tổng: 5"
+  "message": "✅ Question saved. Total: 5"
 }
 ```
 
@@ -658,7 +658,7 @@ Check duplicate + register nếu không trùng.
   "success": true,
   "session_id": "session_123",
   "deleted": 5,
-  "message": "✅ Đã xóa 5 câu hỏi."
+  "message": "✅ Deleted 5 questions."
 }
 ```
 
@@ -669,8 +669,8 @@ Check duplicate + register nếu không trùng.
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | Service info + warmup status |
-| `GET /health` | Liveness probe (always 200 for ACA) |
-| `GET /ready` | Readiness probe (200 after warmup) |
+| `GET /health` | Liveness probe (always returns 200 for ACA) |
+| `GET /ready` | Readiness probe (returns 200 after warmup) |
 | `GET /healthz` | Legacy health check |
 | `GET /docs` | Swagger UI |
 | `GET /redoc` | ReDoc documentation |
@@ -963,7 +963,7 @@ AIDefCom.AIServer/
 │   ├── metrics.py         # Prometheus metrics
 │   └── exceptions.py      # Custom exceptions
 ├── data/
-│   ├── opposite_keywords.json  # Vietnamese opposites
+│   ├── opposite_keywords.json  # Vietnamese opposite keywords
 │   └── phrase_hints.json       # Speech recognition hints
 ├── tests/                 # Test files
 ├── Dockerfile
@@ -1016,11 +1016,11 @@ wscat -c "ws://localhost:8000/ws/stt?defense_session_id=test"
 
 | Error | Cause |
 |-------|-------|
-| `"Empty audio data"` | File audio rỗng |
-| `"Audio too large"` | Vượt quá 6MB |
-| `"User not enrolled or insufficient samples"` | User chưa đủ 3 mẫu |
-| `"No enrolled users found"` | Không có ai để identify |
-| `"Audio quality too low"` | RMS/SNR thấp |
+| `"Empty audio data"` | Audio file is empty |
+| `"Audio too large"` | Exceeds 6MB limit |
+| `"User not enrolled or insufficient samples"` | User doesn't have 3 required samples |
+| `"No enrolled users found"` | No users available for identification |
+| `"Audio quality too low"` | RMS/SNR too low |
 
 ---
 
